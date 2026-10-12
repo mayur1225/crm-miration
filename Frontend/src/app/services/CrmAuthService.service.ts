@@ -15,6 +15,8 @@ export interface CrmConnection {
   api_domain?: string;
   accounts_server?: string;
   environment?: string;
+  token_expired?: boolean;
+  status?: 'connected' | 'expired';
 }
 
 @Injectable({

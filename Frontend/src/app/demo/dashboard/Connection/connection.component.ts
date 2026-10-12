@@ -54,17 +54,29 @@ export class ConnectionComponent implements OnInit, OnDestroy {
   isPageLoading: boolean = true;
   isSourceConnecting: boolean = false;
   isTargetConnecting: boolean = false;
+
+  // True when this side's saved login is dead: shown as "session expired" + login button, never "Connected".
+  sourceSessionExpired: boolean = false;
+  targetSessionExpired: boolean = false;
+
   private expiredToastShown = false;
+  // CRM the user had on a side when the api-mapping page bounced them here (so we can offer "Login" again).
+  private forcedExpired: Partial<Record<'source' | 'target', string>> = {};
 
   ngOnInit() {
     this.isPageLoading = true;
 
     // Sides the API-mapping page told us have an expired session (consumed once, so a refresh won't repeat it).
-    const expiredSides: Array<'source' | 'target'> = history.state?.expiredSides || [];
+    const expiredSides: Array<'source' | 'target'> = [...(history.state?.expiredSides || [])];
     if (expiredSides.length) {
+      expiredSides.forEach((side) => {
+        const crm = localStorage.getItem(`${side}_crm_slot`);
+        if (crm && crm !== 'csv') this.forcedExpired[side] = crm;
+      });
       history.replaceState({ ...history.state, expiredSides: undefined }, '');
       this.showExpiredToast();
     }
+    let alreadyCleared = false; // only wipe the expired sides on the first emission, not on every query-param change
 
     this.authSubscription = this.route.queryParams.pipe(
       switchMap(params => {
@@ -80,10 +92,10 @@ export class ConnectionComponent implements OnInit, OnDestroy {
         }
 
         // Drop the expired connection(s) first so the page starts clean, then load what is still valid.
-        const clear$: Observable<unknown> = expiredSides.length
+        const clear$: Observable<unknown> = !alreadyCleared && expiredSides.length
           ? forkJoin(expiredSides.map((side) => this.crmAuthService.disconnectCrm(side).pipe(catchError(() => of(null)))))
           : of(null);
-        expiredSides.length = 0; // only clear once, even if query params change again
+        alreadyCleared = true;
 
         return clear$.pipe(switchMap(() => this.crmAuthService.getUserConnections()));
       }),
@@ -127,59 +139,57 @@ export class ConnectionComponent implements OnInit, OnDestroy {
     let nextSelectedTarget = '';
     let nextSourceUrl = '';
     let nextTargetUrl = '';
+    let nextSourceExpired = false;
+    let nextTargetExpired = false;
 
-    const expiredRoles: string[] = [];
+    const expiredRows: CrmConnection[] = [];
 
-    connections.forEach(conn => {
-      // Expired token => treat as not connected (no "Connected" badge, no pre-selected CRM).
+    connections.forEach((conn) => {
+      const side = conn.connection_role;
+      if (side !== 'source' && side !== 'target') return;
+
+      const url = this.applyConnectionDetails(side, conn);
+
+      // Expired token => NOT "Connected". Keep the CRM selected (so the Login button is right there),
+      // clear the connected state + URL, and remember to purge the dead row from the server.
       if (isConnectionExpired(conn)) {
-        expiredRoles.push(conn.connection_role);
+        expiredRows.push(conn);
+        if (side === 'source') {
+          nextSelectedSource = conn.crm_type;
+          nextSourceExpired = true;
+        } else {
+          nextSelectedTarget = conn.crm_type;
+          nextTargetExpired = true;
+        }
         return;
       }
 
-      if (conn.connection_role === 'source') {
+      if (side === 'source') {
         nextSelectedSource = conn.crm_type;
         nextSourceConnected = true;
-        
-        if (conn.crm_type === 'salesforce') {
-          nextSourceUrl = conn.instance_url || '';
-          if (conn.environment) this.sourceSalesforceEnv = conn.environment;
-        } else if (conn.crm_type === 'zoho') {
-          nextSourceUrl = conn.api_domain || '';
-          if (conn.region) this.sourceZohoRegion = conn.region;
-        } else if (conn.crm_type === 'zendesk') {
-          nextSourceUrl = conn.subdomain ? `https://${conn.subdomain}.zendesk.com` : '';
-          if (conn.subdomain) this.sourceZendeskSubdomain = conn.subdomain;
-        }
-      } 
-      else if (conn.connection_role === 'target') {
+        nextSourceUrl = url;
+      } else {
         nextSelectedTarget = conn.crm_type;
         nextTargetConnected = true;
-        
-        if (conn.crm_type === 'salesforce') {
-          nextTargetUrl = conn.instance_url || '';
-          if (conn.environment) this.targetSalesforceEnv = conn.environment;
-        } else if (conn.crm_type === 'zoho') {
-          nextTargetUrl = conn.api_domain || '';
-          if (conn.region) this.targetZohoRegion = conn.region;
-        } else if (conn.crm_type === 'zendesk') {
-          nextTargetUrl = conn.subdomain ? `https://${conn.subdomain}.zendesk.com` : '';
-          if (conn.subdomain) this.targetZendeskSubdomain = conn.subdomain;
-        }
+        nextTargetUrl = url;
       }
     });
 
-    if (expiredRoles.includes('source')) {
-      this.sourceZendeskSubdomain = '';
-      this.sourceZohoRegion = 'IN';
-      this.sourceSalesforceEnv = 'production';
+    // api-mapping told us this side expired and we already deleted its row: still show "log in again" for that CRM.
+    if (!nextSelectedSource && this.forcedExpired.source) {
+      nextSelectedSource = this.forcedExpired.source;
+      nextSourceExpired = true;
     }
-    if (expiredRoles.includes('target')) {
-      this.targetZendeskSubdomain = '';
-      this.targetZohoRegion = 'IN';
-      this.targetSalesforceEnv = 'production';
+    if (!nextSelectedTarget && this.forcedExpired.target) {
+      nextSelectedTarget = this.forcedExpired.target;
+      nextTargetExpired = true;
     }
-    if (expiredRoles.length) this.showExpiredToast();
+    this.forcedExpired = {};
+
+    if (expiredRows.length) {
+      this.showExpiredToast();
+      this.purgeExpiredConnections(expiredRows.map((c) => c.connection_role as 'source' | 'target'));
+    }
 
     this.selectedSource = nextSelectedSource;
     this.selectedTarget = nextSelectedTarget;
@@ -187,23 +197,56 @@ export class ConnectionComponent implements OnInit, OnDestroy {
     this.isTargetConnected = nextTargetConnected;
     this.sourceInstanceUrl = nextSourceUrl;
     this.targetInstanceUrl = nextTargetUrl;
+    this.sourceSessionExpired = nextSourceExpired;
+    this.targetSessionExpired = nextTargetExpired;
 
-    if (this.selectedSource) {
-      localStorage.setItem('source_crm_slot', this.selectedSource);
-    } else {
-      localStorage.removeItem('source_crm_slot');
-    }
-
-    if (this.selectedTarget) {
-      localStorage.setItem('target_crm_slot', this.selectedTarget);
-    } else {
-      localStorage.removeItem('target_crm_slot');
-    }
+    // The slots drive the api-mapping page: only a LIVE connection may keep one.
+    this.syncSlot('source_crm_slot', nextSourceConnected ? nextSelectedSource : '');
+    this.syncSlot('target_crm_slot', nextTargetConnected ? nextSelectedTarget : '');
 
     this.isSourceConnecting = false;
     this.isTargetConnecting = false;
 
     this.cdr.detectChanges();
+  }
+
+  /** Copies the saved login parameters (env / region / subdomain) into the form; returns the display URL. */
+  private applyConnectionDetails(side: 'source' | 'target', conn: CrmConnection): string {
+    const isSource = side === 'source';
+    let url = '';
+
+    if (conn.crm_type === 'salesforce') {
+      url = conn.instance_url || '';
+      if (conn.environment) {
+        if (isSource) this.sourceSalesforceEnv = conn.environment;
+        else this.targetSalesforceEnv = conn.environment;
+      }
+    } else if (conn.crm_type === 'zoho') {
+      url = conn.api_domain || '';
+      if (conn.region) {
+        if (isSource) this.sourceZohoRegion = conn.region;
+        else this.targetZohoRegion = conn.region;
+      }
+    } else if (conn.crm_type === 'zendesk') {
+      url = conn.subdomain ? `https://${conn.subdomain}.zendesk.com` : '';
+      if (conn.subdomain) {
+        if (isSource) this.sourceZendeskSubdomain = conn.subdomain;
+        else this.targetZendeskSubdomain = conn.subdomain;
+      }
+    }
+    return url;
+  }
+
+  private syncSlot(key: string, value: string) {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  }
+
+  /** Fire-and-forget: delete dead connection rows so they stop reappearing (and stop re-toasting) on every visit. */
+  private purgeExpiredConnections(sides: Array<'source' | 'target'>) {
+    forkJoin(sides.map((side) => this.crmAuthService.disconnectCrm(side).pipe(catchError(() => of(null))))).subscribe(() =>
+      window.dispatchEvent(new Event('connections-updated'))
+    );
   }
 
   private showExpiredToast() {
@@ -219,8 +262,12 @@ export class ConnectionComponent implements OnInit, OnDestroy {
   onCrmChange(side: 'source' | 'target') {
     if (side === 'source') {
       this.isSourceConnected = false;
+      this.sourceSessionExpired = false;
+      this.sourceInstanceUrl = '';
     } else {
       this.isTargetConnected = false;
+      this.targetSessionExpired = false;
+      this.targetInstanceUrl = '';
     }
   }
 
@@ -259,15 +306,17 @@ export class ConnectionComponent implements OnInit, OnDestroy {
         
         if (side === 'source') {
           this.isSourceConnected = false;
+          this.sourceSessionExpired = false;
           this.selectedSource = '';
           this.sourceInstanceUrl = '';
 
           localStorage.removeItem('source_crm_slot');
         } else {
           this.isTargetConnected = false;
+          this.targetSessionExpired = false;
           this.selectedTarget = '';
           this.targetInstanceUrl = '';
-          
+
           localStorage.removeItem('target_crm_slot');
         }
         
@@ -285,6 +334,9 @@ export class ConnectionComponent implements OnInit, OnDestroy {
   }
 
   goToMappingPage(method: 'api' | 'csv') {
+    if (method === 'api' && (!this.isSourceConnected || !this.isTargetConnected)) return;
+    if (method === 'csv' && !this.isTargetConnected) return;
+
     localStorage.setItem('target_crm_slot', this.selectedTarget);
 
     if (method === 'api') {
