@@ -198,7 +198,7 @@
     font-size: 0.8rem;
   }
 
-  .action-slot {
+    .action-slot {
     width: 26px;
     height: 26px;
     display: flex;
@@ -233,13 +233,8 @@
   }
 
   @keyframes sync-spin {
-    from {
-      transform: rotate(0deg);
-    }
-
-    to {
-      transform: rotate(360deg);
-    }
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
   }
 
   .preview-table thead th {
@@ -824,9 +819,19 @@
           </div>
         </div>
 
-        <div class="border rounded shadow-sm overflow-hidden"
+        <div class="d-flex justify-content-end mb-1">
+          <button type="button" class="btn btn-sm btn-link text-muted p-0 text-decoration-none"
+            style="font-size: 0.75rem;" (click)="toggleQueryEditorSize()"
+            [title]="isQueryEditorExpanded ? 'Collapse editor' : 'Expand editor'">
+            <i class="feather" [ngClass]="isQueryEditorExpanded ? 'icon-minimize-2' : 'icon-maximize-2'"></i>
+            {{ isQueryEditorExpanded ? 'Collapse' : 'Expand' }}
+          </button>
+        </div>
+
+        <div class="border rounded shadow-sm"
           [style.border-color]="queryError ? '#dc3545' : 'var(--line)'"
-          style="height: 120px; border-width: 2px !important;">
+          [style.height.px]="queryEditorHeight"
+          style="min-height: 80px; max-height: 80vh; border-width: 2px !important; resize: vertical; overflow: hidden;">
           <ngx-monaco-editor [options]="editorOptions" [(ngModel)]="customQuery" (ngModelChange)="onQueryEdited()"
             (onInit)="onEditorInit($event)" style="height: 100%; width: 100%;">
           </ngx-monaco-editor>
@@ -1044,11 +1049,7 @@
                       <div class="migration-filter-clear-row">
                         <button type="button" class="btn btn-sm migration-filter-clear-btn" (click)="clearDateRange()"
                           title="Clear date range">
-                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                            stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                            <line x1="6" y1="6" x2="18" y2="18"></line>
-                          </svg>
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                         </button>
                       </div>
                     </div>
@@ -1210,44 +1211,43 @@
           </div>
 
           @if (migrateAttachments || migrateFiles) {
-          <div class="mt-2">
-            @if (isCheckingFileMigrationBudget) {
-            <div class="small text-muted d-flex align-items-center gap-2">
-              <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
-              Checking today's API limit for this file migration...
+            <div class="mt-2">
+              @if (isCheckingFileMigrationBudget) {
+                <div class="small text-muted d-flex align-items-center gap-2">
+                  <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+                  Checking today's API limit for this file migration...
+                </div>
+              } @else if (fileMigrationBudgetPreviewError) {
+                <div class="small text-muted">
+                  <i class="feather icon-info"></i> {{ fileMigrationBudgetPreviewError }}
+                </div>
+              } @else if (fileMigrationBudgetPreview && !fileMigrationBudgetPreview.fitsInBudget) {
+                <div class="alert alert-warning py-2 px-3 small mb-0">
+                  <div class="fw-bold mb-1"><i class="feather icon-alert-triangle"></i> API limit may be hit</div>
+                  <div>
+                    ~{{ fileMigrationBudgetPreview.totalFileCount | number }} file(s) across
+                    {{ fileMigrationBudgetPreview.totalRecordCount | number }} record(s) need
+                    ~{{ fileMigrationBudgetPreview.estimatedTotalCalls | number }} API call(s), but the
+                    <strong>{{ fileMigrationBudgetPreview.bindingOrg }}</strong> org only has
+                    {{ fileMigrationBudgetPreview.bindingOrg === 'target' ? (fileMigrationBudgetPreview.targetAvailable | number) : (fileMigrationBudgetPreview.sourceAvailable | number) }}
+                    call(s) left today.
+                  </div>
+                  <div class="mt-1">
+                    Recommended: files for ~{{ fileMigrationBudgetPreview.safeRecordCount | number }} of
+                    {{ fileMigrationBudgetPreview.totalRecordCount | number }} record(s) now; the rest can
+                    run once the daily allowance resets. You'll get a final confirmation with live numbers
+                    when the migration reaches the file transfer step.
+                  </div>
+                </div>
+              } @else if (fileMigrationBudgetPreview && fileMigrationBudgetPreview.fitsInBudget) {
+                <div class="alert alert-success py-2 px-3 small mb-0">
+                  <i class="feather icon-check-circle"></i>
+                  API limit check passed — ~{{ fileMigrationBudgetPreview.estimatedTotalCalls | number }}
+                  call(s) needed for ~{{ fileMigrationBudgetPreview.totalFileCount | number }} file(s),
+                  well within today's allowance.
+                </div>
+              }
             </div>
-            } @else if (fileMigrationBudgetPreviewError) {
-            <div class="small text-muted">
-              <i class="feather icon-info"></i> {{ fileMigrationBudgetPreviewError }}
-            </div>
-            } @else if (fileMigrationBudgetPreview && !fileMigrationBudgetPreview.fitsInBudget) {
-            <div class="alert alert-warning py-2 px-3 small mb-0">
-              <div class="fw-bold mb-1"><i class="feather icon-alert-triangle"></i> API limit may be hit</div>
-              <div>
-                ~{{ fileMigrationBudgetPreview.totalFileCount | number }} file(s) across
-                {{ fileMigrationBudgetPreview.totalRecordCount | number }} record(s) need
-                ~{{ fileMigrationBudgetPreview.estimatedTotalCalls | number }} API call(s), but the
-                <strong>{{ fileMigrationBudgetPreview.bindingOrg }}</strong> org only has
-                {{ fileMigrationBudgetPreview.bindingOrg === 'target' ? (fileMigrationBudgetPreview.targetAvailable |
-                number) : (fileMigrationBudgetPreview.sourceAvailable | number) }}
-                call(s) left today.
-              </div>
-              <div class="mt-1">
-                Recommended: files for ~{{ fileMigrationBudgetPreview.safeRecordCount | number }} of
-                {{ fileMigrationBudgetPreview.totalRecordCount | number }} record(s) now; the rest can
-                run once the daily allowance resets. You'll get a final confirmation with live numbers
-                when the migration reaches the file transfer step.
-              </div>
-            </div>
-            } @else if (fileMigrationBudgetPreview && fileMigrationBudgetPreview.fitsInBudget) {
-            <div class="alert alert-success py-2 px-3 small mb-0">
-              <i class="feather icon-check-circle"></i>
-              API limit check passed — ~{{ fileMigrationBudgetPreview.estimatedTotalCalls | number }}
-              call(s) needed for ~{{ fileMigrationBudgetPreview.totalFileCount | number }} file(s),
-              well within today's allowance.
-            </div>
-            }
-          </div>
           }
           }
         </div>
@@ -1351,14 +1351,7 @@
                       <button
                         class="btn btn-light border-secondary-subtle text-muted d-flex align-items-center px-1 py-1 btn-hover-lift"
                         (click)="mappingSearchQuery = ''" title="Clear Filter">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <path
-                            d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21">
-                          </path>
-                          <path d="M22 21H7"></path>
-                          <path d="m5 11 9 9"></path>
-                        </svg>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"></path><path d="M22 21H7"></path><path d="m5 11 9 9"></path></svg>
                       </button>
                       }
                     </div>
@@ -1377,8 +1370,7 @@
             <tbody>
               @for (mapping of visibleMappings; track mapping.sourceField; let i = $index) {
               <tr class="animate__animated animate__fadeIn">
-                <td
-                  title="{{ mapping.sourceLabel }}{{ isLookupField(mapping.sourceField, 'source') ? ' (Lookup / Relationship field)' : '' }}">
+                <td title="{{ mapping.sourceLabel }}{{ isLookupField(mapping.sourceField, 'source') ? ' (Lookup / Relationship field)' : '' }}">
                   <div
                     class="form-control form-control-sm bg-light text-truncate cursor-not-allowed d-flex justify-content-between align-items-center"
                     [class.border-secondary]="!isLookupField(mapping.sourceField, 'source')"
@@ -1418,8 +1410,7 @@
        'bg-success-subtle border-success text-dark': !isTypeMismatch(mapping) && mapping._mappedBy === 'rule',
        'bg-info-subtle border-info text-dark': !isTypeMismatch(mapping) && mapping._mappedBy === 'ai',
        'bg-white border-info': !isTypeMismatch(mapping) && !mapping._mappedBy
-     }" [class.lookup-select-box]="isLookupField(mapping.targetField, 'target')"
-                      (click)="toggleDropdown(mapping, $event)">
+     }" [class.lookup-select-box]="isLookupField(mapping.targetField, 'target')" (click)="toggleDropdown(mapping, $event)">
 
                       <div class="d-flex align-items-center gap-2 text-truncate">
                         @if (isLookupField(mapping.targetField, 'target')) {
@@ -1494,7 +1485,8 @@
                         <span class="input-group-text bg-warning-subtle border-warning-subtle text-warning-emphasis"
                           style="font-size: 0.7rem;">Parent</span>
                         <select class="form-select form-select-sm border-warning-subtle"
-                          [(ngModel)]="mapping.parentObjectName" (ngModelChange)="onParentObjectChange(mapping)">
+                          [(ngModel)]="mapping.parentObjectName"
+                          (ngModelChange)="onParentObjectChange(mapping)">
                           @for (candidate of getReferenceParentCandidates(mapping); track candidate) {
                           <option [value]="candidate">{{ candidate }}</option>
                           }
@@ -1510,7 +1502,8 @@
                         </span>
                         <select class="form-select form-select-sm border-warning-subtle"
                           [(ngModel)]="mapping.relationalExtIdField"
-                          (ngModelChange)="onRelationalExtIdFieldChange(mapping)" [disabled]="isLoadingParentFields">
+                          (ngModelChange)="onRelationalExtIdFieldChange(mapping)"
+                          [disabled]="isLoadingParentFields">
                           @for (f of getParentExternalIdOptions(mapping); track f.name) {
                           <option [value]="f.name">{{ f.label }}</option>
                           }
@@ -1519,14 +1512,12 @@
 
                       @if (isLoadingParentFields) {
                       <small class="text-muted" style="font-size: 0.65rem;">
-                        <i class="feather icon-loader"></i> Loading {{ getReferenceParentObjectName(mapping) }}
-                        fields...
+                        <i class="feather icon-loader"></i> Loading {{ getReferenceParentObjectName(mapping) }} fields...
                       </small>
                       } @else if (getParentExternalIdFields(mapping).length === 0) {
                       <small class="text-warning-emphasis" style="font-size: 0.65rem;">
                         No External ID field found on {{ getReferenceParentObjectName(mapping) }} -- matching by Id
-                        requires {{ getReferenceParentObjectName(mapping) }} to already be migrated in the same
-                        run/session.
+                        requires {{ getReferenceParentObjectName(mapping) }} to already be migrated in the same run/session.
                       </small>
                       }
                     </div>
@@ -1551,7 +1542,8 @@
                       field.name) {
                       <div
                         class="dropdown-item cursor-pointer py-2 text-wrap d-flex justify-content-between align-items-start"
-                        (click)="selectField(mapping, field.name)" [class.bg-light]="mapping.targetField === field.name"
+                        (click)="selectField(mapping, field.name)"
+                        [class.bg-light]="mapping.targetField === field.name"
                         [class.lookup-dropdown-item]="isLookupFieldMeta(field)">
                         <div>
                           <span class="fw-bold text-dark d-flex align-items-center gap-1">
@@ -1577,44 +1569,34 @@
                 <td class="text-center" style="width: 14%;">
                   <div class="d-flex align-items-center justify-content-center gap-1">
                     <div class="action-slot">
-                      @if (canSyncPicklist(mapping)) {
-                      <button type="button"
-                        class="btn btn-sm border-0 p-1 rounded m-0 d-flex align-items-center justify-content-center btn-hover-lift sync-picklist-btn"
-                        [class.sync-active]="!!mapping.syncPicklistValues"
-                        [attr.aria-pressed]="!!mapping.syncPicklistValues" (click)="toggleSyncPicklist(mapping)"
-                        [title]="mapping.syncPicklistValues
+  @if (canSyncPicklist(mapping)) {
+  <button type="button"
+    class="btn btn-sm border-0 p-1 rounded m-0 d-flex align-items-center justify-content-center btn-hover-lift sync-picklist-btn"
+    [class.sync-active]="!!mapping.syncPicklistValues"
+    [attr.aria-pressed]="!!mapping.syncPicklistValues"
+    (click)="toggleSyncPicklist(mapping)"
+    [title]="mapping.syncPicklistValues
       ? 'Sync picklist values: ON. Missing values will be created in the destination picklist. Click to turn off.'
       : 'Sync picklist values: compare source and destination picklists and create missing values in the destination. Click to turn on.'">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                          <path d="M21 3v5h-5"></path>
-                          <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                          <path d="M8 16H3v5"></path>
-                        </svg>
-                      </button>
-                      }
-                    </div>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+      <path d="M21 3v5h-5"></path>
+      <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+      <path d="M8 16H3v5"></path>
+    </svg>
+  </button>
+  }
+</div>
                     <button
                       class="btn btn-sm btn-light border-0 text-danger p-1 rounded hover-danger btn-hover-lift m-0 d-flex align-items-center justify-content-center"
                       (click)="clearMapping(mapping)" title="Clear target field">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" stroke-linejoin="round">
-                        <path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21">
-                        </path>
-                        <path d="M22 21H7"></path>
-                        <path d="m5 11 9 9"></path>
-                      </svg>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"></path><path d="M22 21H7"></path><path d="m5 11 9 9"></path></svg>
                     </button>
                     <button
                       class="btn btn-sm btn-light border-0 text-danger p-1 rounded hover-danger btn-hover-lift m-0 d-flex align-items-center justify-content-center"
                       (click)="removeMapping(mapping)" title="Cancel: remove this field from mapping entirely">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="10"></circle>
-                        <line x1="15" y1="9" x2="9" y2="15"></line>
-                        <line x1="9" y1="9" x2="15" y2="15"></line>
-                      </svg>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
                     </button>
                   </div>
                 </td>
@@ -1642,12 +1624,7 @@
               class="btn btn-light border-secondary-subtle text-danger shadow-sm btn-hover-lift px-3 py-2 fw-bold d-flex align-items-center gap-2 flex-shrink-0 text-nowrap"
               (click)="resetAllMappings()" [disabled]="!selectedTargetObject || mappings.length === 0 || isAutoMapping"
               title="Clear All">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0;">
-                <path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"></path>
-                <path d="M22 21H7"></path>
-                <path d="m5 11 9 9"></path>
-              </svg>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0;"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"></path><path d="M22 21H7"></path><path d="m5 11 9 9"></path></svg>
               <span>Clear All</span>
             </button>
 
@@ -1776,7 +1753,8 @@
                   <th class="py-2 px-3 align-middle transition-all" style="min-width: 180px;"
                     [class.bg-danger-subtle]="hasErrorsInColumn(mapping.sourceField)"
                     [class.bg-white]="!hasErrorsInColumn(mapping.sourceField)"
-                    [class.border-end]="i === errorColumnCount - 1" [class.border-3]="i === errorColumnCount - 1"
+                    [class.border-end]="i === errorColumnCount - 1"
+                    [class.border-3]="i === errorColumnCount - 1"
                     [class.border-warning]="i === errorColumnCount - 1"
                     [title]="i === errorColumnCount - 1 ? 'Error columns end here — everything to the right is already clean.' : ''">
 
@@ -1822,8 +1800,9 @@
                     {{ record.errors }}
                   </td>
                   @for (mapping of sortedErrorTableFields; track mapping.sourceField; let i = $index) {
-                  <td class="p-2 align-middle" style="min-width: 180px;" [class.border-end]="i === errorColumnCount - 1"
-                    [class.border-3]="i === errorColumnCount - 1" [class.border-warning]="i === errorColumnCount - 1">
+                  <td class="p-2 align-middle" style="min-width: 180px;"
+                    [class.border-end]="i === errorColumnCount - 1" [class.border-3]="i === errorColumnCount - 1"
+                    [class.border-warning]="i === errorColumnCount - 1">
                     <div class="position-relative">
                       <input type="text"
                         class="form-control form-control-sm border-secondary-subtle transition-all w-100 shadow-none"
@@ -1899,9 +1878,8 @@
           <button
             class="btn action-card-btn validate-btn d-flex flex-column align-items-center justify-content-center p-2 rounded"
             style="background: var(--surface); border: 1.5px solid var(--line); box-shadow: 0 1px 2px rgba(16,19,26,0.04);"
-            [class.opacity-50]="validateBlockReason !== null"
-            [style.cursor]="validateBlockReason !== null ? 'not-allowed' : 'pointer'" (click)="onValidateClick()"
-            [title]="validateBlockReason || 'Validate Mapping'">
+            [class.opacity-50]="validateBlockReason !== null" [style.cursor]="validateBlockReason !== null ? 'not-allowed' : 'pointer'"
+            (click)="onValidateClick()" [title]="validateBlockReason || 'Validate Mapping'">
             <div class="rounded-circle d-flex align-items-center justify-content-center mb-1"
               style="width: 38px; height: 38px; background: var(--paper); border: 1px solid var(--line);">
               <i class="feather icon-check-square fs-5" style="color: var(--muted);"></i>
@@ -1912,9 +1890,9 @@
             class="btn shadow-sm action-card-btn run-btn d-flex flex-column align-items-center justify-content-center p-2 rounded position-relative"
             style="background: linear-gradient(90deg, var(--source), var(--target)); color: #fff; border: none; box-shadow: 0 6px 16px -6px rgba(47,93,158,0.5);"
             [ngClass]="{'pulse-primary': aggregateStats.valid > 0 && aggregateStats.invalid === 0 && !hasPendingEdits}"
-            [class.opacity-50]="runJobBlockReason !== null"
-            [style.cursor]="runJobBlockReason !== null ? 'not-allowed' : 'pointer'"
-            [title]="runJobBlockReason || 'Execute Migration'" (click)="onRunJobClick()">
+            [class.opacity-50]="runJobBlockReason !== null" [style.cursor]="runJobBlockReason !== null ? 'not-allowed' : 'pointer'"
+            [title]="runJobBlockReason || 'Execute Migration'"
+            (click)="onRunJobClick()">
             @if (hasPendingEdits) {
             <span
               class="position-absolute top-0 start-100 translate-middle p-1 bg-warning border border-light rounded-circle"
@@ -2033,11 +2011,7 @@
       <button
         class="btn btn-sm btn-link p-0 btn-hover-lift panel-close-btn rounded-circle d-flex align-items-center justify-content-center"
         style="width: 22px; height: 22px;" (click)="showReviewPanel = false; $event.stopPropagation()" title="Close">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-          stroke-linecap="round" stroke-linejoin="round">
-          <line x1="18" y1="6" x2="6" y2="18"></line>
-          <line x1="6" y1="6" x2="18" y2="18"></line>
-        </svg>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
       </button>
       } @else {
       <button class="btn btn-sm btn-link text-white-50 p-0 btn-hover-lift"
@@ -2047,11 +2021,7 @@
       <button
         class="btn btn-sm btn-link p-0 btn-hover-lift panel-close-btn rounded-circle d-flex align-items-center justify-content-center"
         style="width: 22px; height: 22px;" (click)="showReviewPanel = false; $event.stopPropagation()" title="Close">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-          stroke-linecap="round" stroke-linejoin="round">
-          <line x1="18" y1="6" x2="6" y2="18"></line>
-          <line x1="6" y1="6" x2="18" y2="18"></line>
-        </svg>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
       </button>
       }
     </div>
@@ -2118,8 +2088,7 @@
        'bg-success-subtle border-success text-dark': !isTypeMismatch(mapping) && mapping._mappedBy === 'rule',
        'bg-info-subtle border-info text-dark': !isTypeMismatch(mapping) && mapping._mappedBy === 'ai',
        'bg-white border-info': !isTypeMismatch(mapping) && !mapping._mappedBy
-     }" [class.lookup-select-box]="isLookupField(mapping.targetField, 'target')"
-                (click)="toggleDropdown(mapping, $event)">
+     }" [class.lookup-select-box]="isLookupField(mapping.targetField, 'target')" (click)="toggleDropdown(mapping, $event)">
 
                 <div class="d-flex align-items-center gap-2 text-truncate">
                   @if (isLookupField(mapping.targetField, 'target')) {
@@ -2200,7 +2169,8 @@
                 @for (field of getFilteredTargetFields(mapping.searchQuery, mapping.sourceField); track field.name) {
                 <div
                   class="dropdown-item cursor-pointer py-1 text-wrap d-flex justify-content-between align-items-center"
-                  (click)="selectField(mapping, field.name)" [class.lookup-dropdown-item]="isLookupFieldMeta(field)">
+                  (click)="selectField(mapping, field.name)"
+                  [class.lookup-dropdown-item]="isLookupFieldMeta(field)">
                   <span class="fw-bold text-dark small d-flex align-items-center gap-1">
                     @if (isLookupFieldMeta(field)) {
                     <i class="feather icon-link lookup-icon" style="font-size: 0.65rem;"></i>
@@ -2215,27 +2185,28 @@
               }
             </div>
           </td>
-                    <td class="px-2 text-center align-middle" style="width: 14%;">
+          <td class="px-2 text-center align-middle" style="width: 14%;">
             <div class="d-flex align-items-center justify-content-center gap-1 flex-nowrap">
               <div class="action-slot">
-                @if (canSyncPicklist(mapping)) {
-                <button type="button"
-                  class="btn btn-sm border-0 p-1 rounded m-0 d-flex align-items-center justify-content-center btn-hover-lift sync-picklist-btn"
-                  [class.sync-active]="!!mapping.syncPicklistValues" [attr.aria-pressed]="!!mapping.syncPicklistValues"
-                  (click)="toggleSyncPicklist(mapping)"
-                  [title]="mapping.syncPicklistValues
+  @if (canSyncPicklist(mapping)) {
+  <button type="button"
+    class="btn btn-sm border-0 p-1 rounded m-0 d-flex align-items-center justify-content-center btn-hover-lift sync-picklist-btn"
+    [class.sync-active]="!!mapping.syncPicklistValues"
+    [attr.aria-pressed]="!!mapping.syncPicklistValues"
+    (click)="toggleSyncPicklist(mapping)"
+    [title]="mapping.syncPicklistValues
       ? 'Sync picklist values: ON. Missing values will be created in the destination picklist. Click to turn off.'
       : 'Sync picklist values: compare source and destination picklists and create missing values in the destination. Click to turn on.'">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                    stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                    <path d="M21 3v5h-5"></path>
-                    <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                    <path d="M8 16H3v5"></path>
-                  </svg>
-                </button>
-                }
-              </div>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+      <path d="M21 3v5h-5"></path>
+      <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+      <path d="M8 16H3v5"></path>
+    </svg>
+  </button>
+  }
+</div>
               <button
                 class="btn btn-sm btn-light border-0 text-danger p-1 rounded hover-danger btn-hover-lift m-0 d-flex align-items-center justify-content-center flex-shrink-0"
                 (click)="clearMapping(mapping)" title="Clear target field">

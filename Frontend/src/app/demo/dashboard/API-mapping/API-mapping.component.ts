@@ -12,7 +12,14 @@ import { environment } from 'src/environments/environment';
 import { HttpClient } from '@angular/common/http';
 import { AuthService } from 'src/app/demo/Services/auth.service';
 import { CrmAuthService } from 'src/app/services/CrmAuthService.service';
-import { isAuthExpiredError, isConnectionExpired, isSocketAuthExpired } from 'src/app/services/crm-session.util';
+import {
+  CrmSide,
+  getExpiredSidesFromError,
+  getSocketExpiredSides,
+  isAuthExpiredError,
+  isConnectionExpired,
+  isSocketAuthExpired
+} from 'src/app/services/crm-session.util';
 declare const monaco: any;
 interface FieldMeta {
   name: string;
@@ -336,46 +343,41 @@ get fileMigrationNotes(): string[] {
 
   monacoEditorInstance: any;
   completionProvider: any;
+  hoverProvider: any;
 
   recoverableSessions: any[] = [];
   isSessionsLoading = false;
 
   ngOnInit(): void {
-  this.getUserData();
+    this.getUserData();
+// this.fetchRecoverableSessions();
+// this.preloadEntirePage();
+    const navState = history.state;
+    this.sourceCrmId = navState?.sourceCrm || localStorage.getItem('source_crm_slot');
+    this.targetCrmId = navState?.targetCrm || localStorage.getItem('target_crm_slot');
 
-  const navState = history.state;
-  this.sourceCrmId = navState?.sourceCrm || localStorage.getItem('source_crm_slot');
-  this.targetCrmId = navState?.targetCrm || localStorage.getItem('target_crm_slot');
+    if (!this.sourceCrmId || !this.targetCrmId) {
+      this.toastr.warning('Please connect your Source and Target systems first.', 'Connections Required');
+      this.router.navigate(['/connection']);
+      return;
+    }
 
-  if (!this.sourceCrmId || !this.targetCrmId) {
-    this.toastr.warning('Please connect your Source and Target systems first.', 'Connections Required');
-    this.router.navigate(['/connection']);
-    return;
+    this.sourceSystem = this.sourceCrmId;
+    this.targetSystem = this.targetCrmId;
+    this.migrationTimeFilter.field = this.timeFilterFieldOptions[0]?.value || '';
+    this.batchSize = this.batchConfig.default;
+
+    localStorage.setItem('source_crm_slot', this.sourceCrmId);
+    localStorage.setItem('target_crm_slot', this.targetCrmId);
+
+    this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
+
+    // Verify both CRM tokens are still valid before loading anything; expired => straight back to login.
+    this.verifyCrmSessions(() => {
+      this.fetchRecoverableSessions();
+      this.preloadEntirePage();
+    });
   }
-
-  this.sourceSystem = this.sourceCrmId;
-  this.targetSystem = this.targetCrmId;
-  this.migrationTimeFilter.field = this.timeFilterFieldOptions[0]?.value || '';
-  this.batchSize = this.batchConfig.default;
-
-  localStorage.setItem('source_crm_slot', this.sourceCrmId);
-  localStorage.setItem('target_crm_slot', this.targetCrmId);
-
-  this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
-
-  // Show the loader on the very first change-detection pass, then run session
-  // verification and schema preload concurrently instead of sequentially.
-  this.showSchemaLoader();
-  this.verifyCrmSessions(() => this.fetchRecoverableSessions());
-  this.preloadEntirePage();
-}
-
-private showSchemaLoader(): void {
-  this.isLoading = true;
-  this.isGlobalLoading = true;
-  this.globalLoadingText = 'Fetching Live Schemas...';
-  this.globalLoadingSubText = 'Please wait while we sync the CRM engines';
-}
 
   // ==========================================
   //  CRM SESSION EXPIRY
@@ -395,17 +397,19 @@ private showSchemaLoader(): void {
       },
       error: (err) => {
         if (isAuthExpiredError(err)) {
-          this.handleSessionExpired();
+          this.handleSessionExpired(getExpiredSidesFromError(err));
         } else {
-          onValid(); // network hiccup etc. -- don't block the page
+          onValid(); 
         }
       }
     });
   }
 
-  handleSessionExpired(sides: Array<'source' | 'target'> = ['source', 'target']): void {
+  handleSessionExpired(sides?: CrmSide[]): void {
     if (this.isRedirectingToLogin) return;
     this.isRedirectingToLogin = true;
+
+    const expiredSides: CrmSide[] = sides && sides.length ? sides : ['source', 'target'];
 
     this.mappingCancel$.next();
     this.closeSocket(this.validationSocket);
@@ -415,12 +419,14 @@ private showSchemaLoader(): void {
     this.isLoading = false;
     this.isGlobalLoading = false;
     this.isValidating = false;
+    this.pendingFileMigrationBudget = null;
+
+    Swal.close();
 
     window.dispatchEvent(new Event('connections-updated'));
 
-    // The connection page clears these sides and shows the "session expired" message.
     this.zone.run(() => {
-      this.router.navigate(['/connection'], { state: { expiredSides: sides } });
+      this.router.navigate(['/connection'], { replaceUrl: true, state: { expiredSides } });
     });
   }
 
@@ -428,7 +434,7 @@ private showSchemaLoader(): void {
     this.mappingCancel$.next();
     this.mappingCancel$.complete();
 
-    if (this.pendingFileMigrationBudget && this.migrationSocket) {
+    if (this.pendingFileMigrationBudget && this.migrationSocket && this.migrationSocket.readyState === WebSocket.OPEN) {
       this.sendFileMigrationDecision(this.migrationSocket, this.pendingFileMigrationBudget.jobRef, 'skip');
       this.pendingFileMigrationBudget = null;
     }
@@ -442,6 +448,10 @@ private showSchemaLoader(): void {
     if (this.completionProvider) {
       this.completionProvider.dispose();
       this.completionProvider = null;
+    }
+    if (this.hoverProvider) {
+      this.hoverProvider.dispose();
+      this.hoverProvider = null;
     }
     this.monacoEditorInstance = null;
   }
@@ -461,32 +471,22 @@ private showSchemaLoader(): void {
     }
   }
 
-  async fetchRecoverableSessions(): Promise<void> {
-  this.isSessionsLoading = true;
-  try {
-    const response = await fetch(`${environment.apiUrl}/api/validation/sessions`, {
+  fetchRecoverableSessions() {
+    this.isSessionsLoading = true;
+    fetch(`${environment.apiUrl}/api/validation/sessions`, {
       headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` }
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      if (isAuthExpiredError({ status: response.status, error: errorData })) {
-        this.handleSessionExpired();
-        return;
-      }
-      throw new Error(errorData.detail || `Failed to load sessions (${response.status})`);
-    }
-
-    const data = await response.json();
-    this.recoverableSessions = data.sessions || [];
-  } catch (error) {
-    console.error('Failed to fetch recoverable sessions:', error);
-    this.recoverableSessions = [];
-  } finally {
-    this.isSessionsLoading = false;
-    this.cdr.detectChanges();
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`Failed to load sessions (${res.status})`);
+        return res.json();
+      })
+      .then((data) => {
+        this.recoverableSessions = data.sessions || [];
+        this.isSessionsLoading = false;
+        this.cdr.detectChanges();
+      })
+      .catch(() => (this.isSessionsLoading = false));
   }
-}
 
   resumeSession(sessionId: string, crm: string, object: string) {
     this.currentSessionId = sessionId;
@@ -1147,7 +1147,7 @@ toggleProfileDropdown(event: Event): void {
       // ==========================================
       //  SMART HOVER TOOLTIPS
       // ==========================================
-      monaco.languages.registerHoverProvider('sql', {
+      this.hoverProvider = monaco.languages.registerHoverProvider('sql', {
         provideHover: (model: any, position: any) => {
           const wordInfo = model.getWordAtPosition(position);
           if (!wordInfo) return null;
@@ -1743,7 +1743,7 @@ onReviewPanelDragEnd(): void {
           this.cdr.detectChanges();
         },
         error: (err) => {
-        if (isAuthExpiredError(err)) { this.handleSessionExpired(); return; }
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
           console.error('Failed to load parent object metadata for External ID matching:', err);
           this.isLoadingParentFields = false;
           this.toastr.warning(
@@ -2052,8 +2052,8 @@ onReviewPanelDragEnd(): void {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Unknown Server Error' }));
-        if (isAuthExpiredError({ status: response.status, error: errorData })) {
-          this.handleSessionExpired();
+        if (isAuthExpiredError({ status: response.status, error: errorData }, true)) {
+          this.handleSessionExpired(getExpiredSidesFromError({ error: errorData }));
           return;
         }
         throw new Error(errorData.detail || 'Failed to fetch filtered data.');
@@ -2101,11 +2101,14 @@ onReviewPanelDragEnd(): void {
         { headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` } }
       );
 
-      if (response.status === 401) {
-        this.handleSessionExpired();
-        return;
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        if (isAuthExpiredError({ status: response.status, error: errBody }, true)) {
+          this.handleSessionExpired(getExpiredSidesFromError({ error: errBody }));
+          return;
+        }
+        throw new Error('Failed to fetch object count.');
       }
-      if (!response.ok) throw new Error('Failed to fetch object count.');
 
       const data = await response.json();
       this.selectedSourceObjectCount = typeof data.count === 'number' ? data.count : null;
@@ -2369,16 +2372,12 @@ onReviewPanelDragEnd(): void {
     this.isGlobalLoading = true;
     this.globalLoadingText = 'Fetching Live Schemas...';
     this.globalLoadingSubText = 'Please wait while we sync the CRM engines';
-    this.showSchemaLoader();
     this.cdr.detectChanges();
-
 
     forkJoin({
       sourceObjs: this.mappingApi.getObjects(this.sourceCrmId, 'source'),
       targetObjs: this.mappingApi.getObjects(this.targetCrmId, 'target')
-    })
-    .pipe(takeUntil(this.mappingCancel$))
-    .subscribe({
+    }).subscribe({
       next: ({ sourceObjs, targetObjs }) => {
         this.sourceEntities = sourceObjs || [];
         this.targetEntities = targetObjs || [];
@@ -2411,7 +2410,7 @@ onReviewPanelDragEnd(): void {
         this.cdr.detectChanges();
       },
       error: (err) => {
-        if (isAuthExpiredError(err)) { this.handleSessionExpired(); return; }
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
         console.error('Failed to preload base entity dropdowns:', err);
         this.logMessages.unshift(`Configuration Error: Could not fetch core CRM schemas.`);
         this.isLoading = false;
@@ -2504,7 +2503,7 @@ onReviewPanelDragEnd(): void {
           }
         },
         error: (err) => {
-        if (isAuthExpiredError(err)) { this.handleSessionExpired(); return; }
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
           console.error('Metadata payload extraction failed:', err);
           this.logMessages.unshift(`API Error: Unable to fetch live dataset metrics from ${this.sourceSystem}.`);
           this.isLoading = false;
@@ -2777,7 +2776,7 @@ onReviewPanelDragEnd(): void {
             processNextChunk();
           },
           error: (error: any) => {
-        if (isAuthExpiredError(error)) { this.handleSessionExpired(); return; }
+        if (isAuthExpiredError(error)) { this.handleSessionExpired(getExpiredSidesFromError(error)); return; }
             console.error('[FRONTEND ERROR]: AI Chunk failed:', error);
             this.isAutoMapping = false;
 
@@ -3039,7 +3038,7 @@ onReviewPanelDragEnd(): void {
         const data = JSON.parse(event.data);
 
         if (isSocketAuthExpired(data)) {
-          this.handleSessionExpired();
+          this.handleSessionExpired(getSocketExpiredSides(data));
           return;
         }
 
@@ -3205,6 +3204,9 @@ onReviewPanelDragEnd(): void {
           this.migrationSocket.close();
         }
 
+
+        // Remove saved CRM connections on the server BEFORE logging out (the app token is still valid here),
+        // so nothing shows as "Connected" the next time someone logs in.
         forkJoin([
           this.crmAuthService.disconnectCrm('source').pipe(catchError(() => of(null))),
           this.crmAuthService.disconnectCrm('target').pipe(catchError(() => of(null)))
@@ -3364,13 +3366,13 @@ onReviewPanelDragEnd(): void {
 
     if (warnings.missingFields.length > 0) {
       warningHtml += `<p class="text-danger fw-bold mb-1"><i class="feather icon-alert-triangle"></i> Missing Required Fields:</p>
-                       <ul class="small mb-3 text-muted"><li class="mb-0">${warnings.missingFields.join('</li><li_item>')}</li></ul>`;
+                       <ul class="small mb-3 text-muted"><li class="mb-0">${warnings.missingFields.join('</li><li class="mb-0">')}</li></ul>`;
     }
 
     if (warnings.incompleteRefs.length > 0) {
       warningHtml += `<p class="text-warning text-dark fw-bold mb-1"><i class="feather icon-link"></i> Incomplete Lookups:</p>
                        <p class="small mb-1 text-muted">You mapped these relational fields but left the <strong>Parent Ext ID</strong> blank (Defaults to 'Id'):</p>
-                       <ul class="small mb-0 text-muted"><li class="mb-0">${warnings.incompleteRefs.join('</li><li_item>')}</li></ul>`;
+                       <ul class="small mb-0 text-muted"><li class="mb-0">${warnings.incompleteRefs.join('</li><li class="mb-0">')}</li></ul>`;
     }
     warningHtml += '</div>';
 
@@ -3528,7 +3530,7 @@ onReviewPanelDragEnd(): void {
         this.cdr.detectChanges();
       },
       error: (err) => {
-        if (isAuthExpiredError(err)) { this.handleSessionExpired(); return; }
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
         this.fileMigrationBudgetPreview = null;
         this.fileMigrationBudgetPreviewError =
           err?.error?.detail || 'Could not check the API Limit for this migration. You can still proceed -- the live guard during the run will catch this if needed.';
@@ -3735,7 +3737,7 @@ onReviewPanelDragEnd(): void {
         const data = JSON.parse(event.data);
 
         if (isSocketAuthExpired(data)) {
-          this.handleSessionExpired();
+          this.handleSessionExpired(getSocketExpiredSides(data));
           return;
         }
 
