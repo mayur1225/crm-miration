@@ -499,6 +499,7 @@ class RunStore:
             )
             c.execute("UPDATE job SET bulk_job_id=NULL, bulk_rows=NULL")
             c.execute("DELETE FROM pending_revert")
+            c.execute("DELETE FROM kv WHERE key='cancel'")
             for r in c.execute("SELECT DISTINCT job_idx FROM row_state WHERE state='pending'").fetchall():
                 c.execute("DELETE FROM kv WHERE key IN (?, ?)", (f"done:{r['job_idx']}", f"files_done:{r['job_idx']}"))
         return child

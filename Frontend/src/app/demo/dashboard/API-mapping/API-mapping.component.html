@@ -1918,6 +1918,22 @@
             </span>
             <div class="d-flex gap-2">
 
+              @if (canResume) {
+              <button class="btn btn-xs btn-warning d-flex align-items-center gap-1 btn-hover-lift"
+                style="font-size: 0.7rem; padding: 2px 8px;" [disabled]="isGlobalLoading"
+                title="Continue the interrupted migration from its last checkpoint" (click)="resumeMigration()">
+                <i class="feather icon-play-circle"></i> Resume
+              </button>
+              }
+
+              @if (canRetryFailed) {
+              <button class="btn btn-xs btn-outline-danger d-flex align-items-center gap-1 btn-hover-lift"
+                style="font-size: 0.7rem; padding: 2px 8px;" [disabled]="isGlobalLoading"
+                title="Re-send only the rows that failed" (click)="retryFailedRows()">
+                <i class="feather icon-refresh-cw"></i> Retry failed ({{ retryCount }})
+              </button>
+              }
+
               <!-- 1: Add Safe Navigation (?.) to prevent length errors on undefined data -->
               @if (successData?.length > 0) {
               <button class="btn btn-xs btn-outline-success d-flex align-items-center gap-1 btn-hover-lift"

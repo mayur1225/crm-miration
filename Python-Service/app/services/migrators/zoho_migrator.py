@@ -183,6 +183,9 @@ class ZohoMigrator:
                                 total_skipped += 1
                                 if raw_id:
                                     ids_to_revert.append(str(raw_id))
+                                    on_revert_pending = options.get("onRevertPending")
+                                    if on_revert_pending:
+                                        on_revert_pending([str(raw_id)])  # persisted before the revert so a crash can finish it
                                 continue
 
                             orig_record["Target_Id"] = str(raw_id) if raw_id else "Success"
@@ -230,6 +233,44 @@ class ZohoMigrator:
             await self._delete_records(client, domain, headers, normalized_obj, ids_to_revert, user_id, send_log)
 
         return total_success, total_error, total_skipped, all_success_data, all_error_data, all_skipped_data
+
+    @staticmethod
+    def _normalize_object(target_object):
+        normalized_obj = target_object.strip()
+        if not normalized_obj.endswith('s') and normalized_obj.lower() != 'data':
+            plurals = {'lead': 'Leads', 'contact': 'Contacts', 'account': 'Accounts', 'deal': 'Deals'}
+            normalized_obj = plurals.get(normalized_obj.lower(), normalized_obj.capitalize() + 's')
+        return normalized_obj
+
+    @staticmethod
+    def _domain(options):
+        domain = options["instance_url"].rstrip('/')
+        return domain if domain.startswith("http") else f"https://{domain}"
+
+    async def revert_created(self, client, options, record_ids, send_log):
+        """Public entry used by the resume path to finish a revert that was interrupted."""
+        headers = {"Authorization": f"Zoho-oauthtoken {options['token']}", "Content-Type": "application/json"}
+        await self._delete_records(
+            client, self._domain(options), headers, self._normalize_object(options["targetObject"]),
+            record_ids, options.get("userId"), send_log,
+        )
+
+    async def find_existing(self, client, options, key_field, values):
+        """{key_value: Zoho id} for rows that already exist -- makes insert resume duplicate-free."""
+        domain, module = self._domain(options), self._normalize_object(options["targetObject"])
+        headers = {"Authorization": f"Zoho-oauthtoken {options['token']}", "Content-Type": "application/json"}
+        found = {}
+        for chunk in chunk_dataset(list(values), 50):  # COQL IN() accepts at most 50 values
+            quoted = ",".join("'" + str(v).replace("\\", "\\\\").replace("'", "\\'") + "'" for v in chunk)
+            query = f"select id, {key_field} from {module} where {key_field} in ({quoted}) limit 200"
+            res = await client.post(f"{domain}/crm/v6/coql", headers=headers, json={"select_query": query})
+            if res.status_code == 204:
+                continue
+            res.raise_for_status()
+            for rec in res.json().get("data", []):
+                if rec.get(key_field) is not None:
+                    found[str(rec[key_field])] = str(rec["id"])
+        return found
 
     async def _delete_records(self, client, domain, headers, normalized_obj, record_ids, user_id, send_log):
         """Deletes records Zoho auto-created that 'update' mode should never

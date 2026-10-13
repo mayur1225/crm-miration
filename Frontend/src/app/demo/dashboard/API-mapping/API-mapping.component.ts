@@ -117,6 +117,11 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
   private isRedirectingToLogin = false;
   private validationSocket: WebSocket | null = null;
   private migrationSocket: WebSocket | null = null;
+  currentRunId: string | null = null;
+  canResume = false;
+  canRetryFailed = false;
+  retryCount = 0;
+  private static readonly LAST_RUN_KEY = 'last_migration_run_id';
   private http = inject(HttpClient);
 
   private mappingCancel$ = new Subject<void>();
@@ -362,6 +367,7 @@ get fileMigrationNotes(): string[] {
 
   ngOnInit(): void {
   this.getUserData();
+  void this.restoreLastRun();
 
   const navState = history.state;
   this.sourceCrmId = navState?.sourceCrm || localStorage.getItem('source_crm_slot');
@@ -3084,7 +3090,6 @@ onReviewPanelDragEnd(): void {
           this.handleSessionExpired(getSocketExpiredSides(data));
           return;
         }
-
         if (data.log) {
           this.logMessages.push(data.log);
           if (this.logMessages.length > 50) this.logMessages.shift();
@@ -3261,6 +3266,72 @@ onReviewPanelDragEnd(): void {
         });
       }
     });
+  }
+
+  resumeMigration(): void {
+    if (!this.currentRunId || this.isGlobalLoading) return;
+    this.isGlobalLoading = true;
+    this.jobStatus = 'Running';
+    this.openMigrationSocket({
+      mode: 'resume',
+      runId: this.currentRunId,
+      authToken: localStorage.getItem('supabase_token') || ''
+    });
+  }
+
+  retryFailedRows(): void {
+    if (!this.currentRunId || this.isGlobalLoading) return;
+    this.isGlobalLoading = true;
+    this.jobStatus = 'Running';
+    this.logMessages = [];
+    this.openMigrationSocket({
+      mode: 'retry_failed',
+      runId: this.currentRunId,
+      authToken: localStorage.getItem('supabase_token') || ''
+    });
+  }
+
+  private rememberRun(runId: string): void {
+    localStorage.setItem(ApiMappingComponent.LAST_RUN_KEY, runId);
+  }
+
+  private forgetRun(): void {
+    localStorage.removeItem(ApiMappingComponent.LAST_RUN_KEY);
+  }
+
+  /** After a refresh / login redirect: offer Resume or Retry for the last run if the server says it is still actionable. */
+  private async restoreLastRun(): Promise<void> {
+    const runId = localStorage.getItem(ApiMappingComponent.LAST_RUN_KEY);
+    if (!runId) return;
+    try {
+      const response = await fetch(`${environment.apiUrl}/api/runs/${encodeURIComponent(runId)}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` }
+      });
+      if (!response.ok) {
+        if (response.status === 404) this.forgetRun();
+        return;
+      }
+      const run = await response.json();
+      if (!run.resumable && !run.retryable) {
+        this.forgetRun();
+        return;
+      }
+      this.currentRunId = run.runId;
+      this.canResume = !!run.resumable;
+      this.canRetryFailed = !!run.retryable;
+      this.retryCount = run.counts?.error || 0;
+      this.jobStatus = run.resumable ? 'Interrupted' : this.jobStatus;
+      this.logMessages = [
+        ...this.logMessages,
+        run.resumable
+          ? `A previous migration (${run.runId}) was interrupted. Use Resume to continue where it stopped.`
+          : `A previous migration (${run.runId}) finished with ${this.retryCount} failed row(s). Use Retry failed to re-send only those.`
+      ];
+    } catch {
+      // offline / server restarting: keep the stored id and try again on the next visit
+    } finally {
+      this.cdr.detectChanges();
+    }
   }
 
   formatCellValue(val: any): string {
@@ -3762,8 +3833,17 @@ onReviewPanelDragEnd(): void {
       authToken: localStorage.getItem('supabase_token') || ''
     };
 
-    const payload = { queue: [job] };
+    this.openMigrationSocket({ queue: [job] });
+  }
 
+  private openMigrationSocket(payload: any): void {
+    this.canResume = false;
+    this.canRetryFailed = false;
+    if (!payload.mode) {
+      // a brand-new run: Resume / Retry must never target the previous one
+      this.currentRunId = null;
+      this.forgetRun();
+    }
     this.closeSocket(this.migrationSocket);
 
     const ws = new WebSocket(`${environment.wsUrl}/ws/migrate`);
@@ -3780,6 +3860,24 @@ onReviewPanelDragEnd(): void {
         if (isSocketAuthExpired(data)) {
           this.handleSessionExpired(getSocketExpiredSides(data));
           return;
+        }
+
+        if (data.runId) {
+          this.currentRunId = data.runId;
+          this.rememberRun(data.runId);
+        }
+
+        if (data.status === 'Interrupted' || data.status === 'Cancelled') {
+          this.isGlobalLoading = false;
+          this.canResume = data.status === 'Interrupted' && !!data.resumable;
+          if (data.status === 'Cancelled') this.forgetRun();
+          Swal.fire({
+            title: data.status === 'Cancelled' ? 'Migration cancelled' : 'Migration paused',
+            text: data.log,
+            icon: 'info',
+            confirmButtonColor: '#0d6efd',
+            customClass: { popup: 'rounded-4 shadow-lg border-0' }
+          });
         }
 
         if (data.log) {
@@ -3815,6 +3913,11 @@ onReviewPanelDragEnd(): void {
             const successCount = data.successData ? data.successData.length : 0;
             const errorCount = data.errorData ? data.errorData.length : 0;
             const skippedCount = data.skippedData ? data.skippedData.length : 0;
+
+            this.canResume = false;
+            this.canRetryFailed = !!data.retryable;
+            this.retryCount = errorCount;
+            if (!data.retryable) this.forgetRun();
 
             let swalIcon: 'success' | 'warning' | 'error' = 'success';
             let swalTitle = 'Migration Complete!';
@@ -3877,6 +3980,7 @@ onReviewPanelDragEnd(): void {
         this.isGlobalLoading = false;
         this.logMessages.push('FATAL: Connection to migration engine lost or refused.');
         this.jobStatus = 'Failed';
+        this.canResume = !!this.currentRunId;
         this.toastr.error('WebSocket connection failed.', 'Engine Error');
         Swal.fire({
           title: 'Connection Lost',
@@ -3895,6 +3999,7 @@ onReviewPanelDragEnd(): void {
         this.isGlobalLoading = false;
         if (this.jobStatus === 'Running' || this.jobStatus === 'Initializing...') {
           this.jobStatus = 'Disconnected';
+          this.canResume = !!this.currentRunId;
         }
         this.cdr.detectChanges();
       });

@@ -129,41 +129,59 @@ class SalesforceMigrator:
         job_config = {"operation": wire_op_mode, "object": target_object, "contentType": "JSON"}
         if wire_op_mode == "upsert": job_config["externalIdFieldName"] = target_ext_id_field
 
-        job_res = await client.post(f"{bulk_base_url}/job", json=job_config, headers=sf_headers)
-        
-        if job_res.status_code == 401:
-            await send_log(f"[{target_object}] Session Expired. Silently refreshing SF Token...")
-            sf_token = await CrmService.refresh_crm_token(user_id, "salesforce", "target")
-            sf_headers["X-SFDC-Session"] = sf_token
+        chunks = list(chunk_dataset(payload, batch_size))
+
+        # RESUME: a previous run already opened a Bulk job for exactly this segment (one job == one batch).
+        # Ingest its results instead of submitting the rows again.
+        job_id, batch_ids = None, []
+        resume_job_id = options.get("resumeBulkJobId")
+        if resume_job_id and len(chunks) == 1:
+            list_res = await client.get(f"{bulk_base_url}/job/{resume_job_id}/batch", headers=sf_headers)
+            existing = [b.get("id") for b in list_res.json().get("batchInfo", [])] if list_res.status_code == 200 else []
+            if len(existing) == 1:
+                job_id, batch_ids = resume_job_id, existing
+                await send_log(f"[{target_object}] {pass_name}: resuming Salesforce Bulk job {job_id} from the interrupted run...")
+            else:
+                await client.post(f"{bulk_base_url}/job/{resume_job_id}", json={"state": "Closed"}, headers=sf_headers)
+
+        if job_id is None:
             job_res = await client.post(f"{bulk_base_url}/job", json=job_config, headers=sf_headers)
 
-        if job_res.status_code != 201:
-            error_text = job_res.text
-            if wire_op_mode == "upsert" and "does not match an External ID" in error_text:
-                await send_log(
-                    f"[{target_object}] Salesforce Job Failed: '{target_ext_id_field}' is not marked as an "
-                    f"External ID, Salesforce Id, or indexed/lookup field on {target_object} in Salesforce. "
-                    f"Mark it as an External ID field in Salesforce Setup, or choose a different field for matching."
-                )
-            else:
-                await send_log(f"[{target_object}] Salesforce Job Failed: {error_text}")
-            return 0, len(payload), 0, [], [source_records[item["originalIndex"]] for item in payload], []
-            
-        job_id = job_res.json().get("id")
-        chunks = list(chunk_dataset(payload, batch_size))
-        await send_log(f"[{target_object}] {pass_name}: Executing {len(chunks)} batches...")
+            if job_res.status_code == 401:
+                await send_log(f"[{target_object}] Session Expired. Silently refreshing SF Token...")
+                sf_token = await CrmService.refresh_crm_token(user_id, "salesforce", "target")
+                sf_headers["X-SFDC-Session"] = sf_token
+                job_res = await client.post(f"{bulk_base_url}/job", json=job_config, headers=sf_headers)
 
-        semaphore = asyncio.Semaphore(6)
+            if job_res.status_code != 201:
+                error_text = job_res.text
+                if wire_op_mode == "upsert" and "does not match an External ID" in error_text:
+                    await send_log(
+                        f"[{target_object}] Salesforce Job Failed: '{target_ext_id_field}' is not marked as an "
+                        f"External ID, Salesforce Id, or indexed/lookup field on {target_object} in Salesforce. "
+                        f"Mark it as an External ID field in Salesforce Setup, or choose a different field for matching."
+                    )
+                else:
+                    await send_log(f"[{target_object}] Salesforce Job Failed: {error_text}")
+                return 0, len(payload), 0, [], [source_records[item["originalIndex"]] for item in payload], []
 
-        async def upload_chunk(chunk_data):
-            async with semaphore:
-                # NOTE: Adjusted to use "targetRecord" from your updated PayloadBuilder
-                just_records = [c["targetRecord"] for c in chunk_data]
-                b_res = await client.post(f"{bulk_base_url}/job/{job_id}/batch", json=just_records, headers=sf_headers)
-                b_res.raise_for_status()
-                return b_res.json().get("id")
+            job_id = job_res.json().get("id")
+            on_job_created = options.get("onBulkJobCreated")
+            if on_job_created:
+                on_job_created(job_id)  # persisted BEFORE any batch is submitted
+            await send_log(f"[{target_object}] {pass_name}: Executing {len(chunks)} batches...")
 
-        batch_ids = await asyncio.gather(*[upload_chunk(c) for c in chunks])
+            semaphore = asyncio.Semaphore(6)
+
+            async def upload_chunk(chunk_data):
+                async with semaphore:
+                    just_records = [c["targetRecord"] for c in chunk_data]
+                    b_res = await client.post(f"{bulk_base_url}/job/{job_id}/batch", json=just_records, headers=sf_headers)
+                    b_res.raise_for_status()
+                    return b_res.json().get("id")
+
+            batch_ids = await asyncio.gather(*[upload_chunk(c) for c in chunks])
+
         await client.post(f"{bulk_base_url}/job/{job_id}", json={"state": "Closed"}, headers=sf_headers)
 
         poll_delay = 1.0
@@ -217,9 +235,39 @@ class SalesforceMigrator:
                 f"[{target_object}] {pass_name}: Update mode found {len(ids_to_revert)} record(s) with no "
                 f"match — reverting the records Salesforce auto-created for them..."
             )
+            on_revert_pending = options.get("onRevertPending")
+            if on_revert_pending:
+                on_revert_pending(ids_to_revert)  # persisted BEFORE the delete job so a crash can finish the revert
             await self._delete_records(client, sf_instance, sf_headers, bulk_base_url, target_object, ids_to_revert, send_log)
 
         return total_success, total_error, total_skipped, all_success_data, all_error_data, all_skipped_data
+
+    async def revert_created(self, client, options, record_ids, send_log):
+        """Public entry used by the resume path to finish a revert that was interrupted."""
+        sf_instance = options["instance_url"]
+        sf_headers = {"X-SFDC-Session": options["token"], "Content-Type": "application/json; charset=UTF-8", "Accept": "application/json"}
+        bulk_base_url = f"{sf_instance.rstrip('/')}/services/async/60.0"
+        await self._delete_records(client, sf_instance, sf_headers, bulk_base_url, options["targetObject"], record_ids, send_log)
+
+    async def find_existing(self, client, options, key_field, values):
+        """{key_value: Salesforce Id} for rows that already exist -- makes insert resume duplicate-free."""
+        base = options["instance_url"].rstrip("/")
+        headers = {"Authorization": f"Bearer {options['token']}"}
+        found = {}
+        for chunk in chunk_dataset(list(values), 200):
+            quoted = ",".join("'" + str(v).replace("\\", "\\\\").replace("'", "\\'") + "'" for v in chunk)
+            soql = f"SELECT Id, {key_field} FROM {options['targetObject']} WHERE {key_field} IN ({quoted})"
+            url, params = f"{base}/services/data/v60.0/query", {"q": soql}
+            while url:
+                res = await client.get(url, params=params, headers=headers)
+                res.raise_for_status()
+                body = res.json()
+                for rec in body.get("records", []):
+                    if rec.get(key_field) is not None:
+                        found[str(rec[key_field])] = rec["Id"]
+                url = f"{base}{body['nextRecordsUrl']}" if not body.get("done") else None
+                params = None
+        return found
 
     async def _delete_records(self, client, sf_instance, sf_headers, bulk_base_url, target_object, record_ids, send_log):
         """Runs a small Bulk API delete job to undo records that 'update' mode

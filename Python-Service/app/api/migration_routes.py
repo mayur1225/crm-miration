@@ -22,10 +22,13 @@ from app.services.audit_service import AuditService
 from app.services.field_access_utils import find_non_writable_mapped_fields
 from app.services.id_mapping_service import IdMappingService
 from app.services.migrators.cross_crm_file_migrator import CrossCrmFileMigrator
-from app.services.file_adapters.registry import supported_crms
-from app.services.picklist_sync_service import PicklistSyncService
 from app.services.crm_picklist_sync_service import MultiCrmPicklistSyncService
-
+from app.services.file_adapters.registry import supported_crms, effective_strategy
+from app.services.picklist_sync_service import PicklistSyncService
+from app.services.migrators.salesforce_file_migrator import FileMigrationCheckpoint
+from app.services.resilience.retry import RetryingClient, ApiQuotaExhausted, CircuitOpen
+from app.services.store import RunStore, RunNotFound, RunForbidden
+from app.services.resumable_runner import ResumableRunner, PassSpec, RunInterrupted
 
 import uuid
 import sqlite3
@@ -53,7 +56,7 @@ MIGRATORS = {
     "hubspot": HubspotMigrator()
 }
 
-# Files/Attachments migration
+# Files/Attachments migration is Salesforce -> Salesforce only
 FILE_MIGRATION_CRMS = supported_crms()
 FILE_MIGRATOR = CrossCrmFileMigrator()
 FILE_MIGRATION_ESTIMATOR = FileMigrationEstimator()
@@ -66,7 +69,7 @@ def _require_valid_session_id(session_id: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid session ID.")
     return session_id
 
-    # ==========================================
+# ==========================================
 # CRM SESSION EXPIRY (shared by both websockets)
 # ==========================================
 def _session_expired_payload(sides, failed_status: str, log: str = None) -> dict:
@@ -101,6 +104,7 @@ async def _resolve_live_credentials(websocket, user_id, pairs, failed_status: st
         await websocket.close()
         return None
     return creds
+
 
 def get_db_path(session_id: str):
     session_id = _require_valid_session_id(session_id)
@@ -187,6 +191,7 @@ async def resolve_file_migration_scope(
             migrate_attachments, migrate_files, send_log,
             safety_threshold=FILE_MIGRATION_DEFAULT_SAFETY_THRESHOLD,
             source_crm=source_crm, target_crm=target_crm, source_object=source_object,
+            strategy=effective_strategy(source_crm, target_crm, "bulk_zip"),
         )
     except Exception as e:
         await send_log(
@@ -248,7 +253,7 @@ async def resolve_file_migration_scope(
     elif action == "proceed_full":
         await send_log(
             f"[{target_object}] Proceeding with the FULL scope despite exceeding the estimated safe "
-            f"budget, per explicit user override. This may hit the daily API limit mid-run."
+            f"budget, per explicit user override. This may hit Salesforce's daily API limit mid-run."
         )
         return job_id_map
 
@@ -258,35 +263,166 @@ async def resolve_file_migration_scope(
 
 
 # ==========================================
-# CORE MIGRATION ROUTE
+# CORE MIGRATION ROUTE (checkpointed / resumable)
 # ==========================================
+class _SafeSocket:
+    """
+    A vanished client flips `gone` instead of raising in the middle of a CRM call. The runner checks
+    `gone` at segment boundaries, so every interruption lands on a clean checkpoint.
+    """
+
+    def __init__(self, ws: WebSocket):
+        self._ws = ws
+        self.gone = False
+
+    async def send_json(self, data):
+        if self.gone:
+            return
+        try:
+            await self._ws.send_json(data)
+        except Exception:
+            self.gone = True
+
+    async def receive_json(self):
+        try:
+            return await self._ws.receive_json()
+        except Exception:
+            self.gone = True
+            raise WebSocketDisconnect()
+
+    async def close(self):
+        try:
+            await self._ws.close()
+        except Exception:
+            pass
+
+
+def _ui_safe(value):
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value) if value is not None else ""
+
+
+def _format_results_for_ui(success, errors, skipped):
+    safe_success = [{k: _ui_safe(v) for k, v in rec.items()} for rec in success]
+
+    formatted_errors = []
+    for err in errors:
+        if not isinstance(err, dict):
+            err = {"Raw_Data": str(err), "Target_Error": "Unknown error format."}
+        formatted_errors.append({
+            "record": {k: _ui_safe(v) for k, v in err.items() if k != "Target_Error"},
+            "error": err.get("Target_Error", "API rejected this record."),
+        })
+
+    formatted_skipped = []
+    for rec in skipped:
+        if not isinstance(rec, dict):
+            rec = {"Raw_Data": str(rec), "Target_SkipReason": "Unknown skip reason."}
+        formatted_skipped.append({
+            "record": {k: _ui_safe(v) for k, v in rec.items() if k != "Target_SkipReason"},
+            "reason": rec.get("Target_SkipReason", "Skipped: no matching record found."),
+        })
+    return safe_success, formatted_errors, formatted_skipped
+
+
 @router.websocket("/ws/migrate")
-async def websocket_migration(websocket: WebSocket):
-    await websocket.accept()
-    
+async def websocket_migration(ws: WebSocket):
+    """
+    mode = "start" (default) | "resume" | "retry_failed"
+      start        payload: {queue|job fields, authToken}                -> new run, replies {runId} first
+      resume       payload: {authToken, runId, mode:"resume"}            -> continues an interrupted run
+      retry_failed payload: {authToken, runId, mode:"retry_failed"}      -> child run of a completed run, failed rows only
+    """
+    await ws.accept()
+    websocket = _SafeSocket(ws)
+    store = None
+    heartbeat_task = None
+    lock_owner = uuid.uuid4().hex
+    final_status = "interrupted"
+    lock_held = False
+
     try:
         await websocket.send_json({"log": "System: Multi-Object Engine Initialized.", "status": "Initializing..."})
         payload = await websocket.receive_json()
-        
-        raw_queue = payload.get("queue") or [payload] 
+
+        mode = str(payload.get("mode") or "start").lower()
+        if mode not in ("start", "resume", "retry_failed"):
+            await websocket.send_json({"log": f"FATAL: Unknown mode '{mode}'.", "status": "Failed"})
+            await websocket.close()
+            return
+
+        raw_queue = payload.get("queue") or [payload]
         auth_token = payload.get("authToken") or raw_queue[0].get("authToken")
-        
+
         user_res = supabase.auth.get_user(auth_token)
         if not user_res or not user_res.user:
             await websocket.send_json({"log": "FATAL: Invalid or expired session.", "status": "Failed"})
             await websocket.close()
             return
-            
+
         user_id = user_res.user.id
         user_email = getattr(user_res.user, "email", None)
         user_name = (getattr(user_res.user, "user_metadata", None) or {}).get("full_name")
-        source_crm = raw_queue[0].get("sourceCrmId", "zendesk").lower() 
-        target_crm = raw_queue[0].get("targetCrmId", "salesforce").lower() 
-        
+
+        # ---------------- run lifecycle ----------------
+        if mode == "start":
+            execution_queue = sort_jobs_by_dependency(raw_queue)
+            store = RunStore.create(user_id, payload, execution_queue)
+        else:
+            try:
+                parent = RunStore.open(user_id, str(payload.get("runId") or ""))
+            except (RunNotFound, RunForbidden, ValueError):
+                await websocket.send_json({"log": "FATAL: Run not found.", "status": "Failed"})
+                await websocket.close()
+                return
+
+            if mode == "resume":
+                if parent.status() in ("completed", "cancelled", "failed"):
+                    await websocket.send_json({"log": f"FATAL: A {parent.status()} run cannot be resumed.", "status": "Failed"})
+                    parent.close()
+                    await websocket.close()
+                    return
+                store = parent
+            else:
+                try:
+                    if parent.status() != "completed":
+                        raise ValueError("Only a completed run can be retried; resume interrupted runs instead.")
+                    store = parent.fork_for_retry()
+                except ValueError as e:
+                    await websocket.send_json({"log": f"FATAL: {e}", "status": "Failed"})
+                    parent.close()
+                    await websocket.close()
+                    return
+                finally:
+                    parent.close()
+            execution_queue = store.load_queue()
+
+        if not store.acquire_lock(lock_owner):
+            await websocket.send_json({"log": "FATAL: This run is already active in another session.", "status": "Failed"})
+            await websocket.close()
+            return
+        lock_held = True
+
+        async def _heartbeat():
+            while True:
+                await asyncio.sleep(10)
+                store.heartbeat(lock_owner)
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
+        await websocket.send_json({
+            "log": f"System: Run {store.run_id} ({mode}).", "status": "Running", "runId": store.run_id, "mode": mode,
+        })
+
+        source_crm = execution_queue[0].get("sourceCrmId", "zendesk").lower()
+        target_crm = execution_queue[0].get("targetCrmId", "salesforce").lower()
+
         pairs = ([("source", source_crm)] if source_crm != "csv" else []) + [("target", target_crm)]
         live = await _resolve_live_credentials(websocket, user_id, pairs, "Failed")
         if live is None:
-            return  # client was told to log in again
+            return  # client was told to log in again; the run stays resumable
 
         source_creds = live.get("source")
         source_migrator = MIGRATORS.get(source_crm) if source_crm != "csv" else None
@@ -296,10 +432,14 @@ async def websocket_migration(websocket: WebSocket):
         async def send_log(msg: str, status: str = "Running"):
             await websocket.send_json({"log": msg, "status": status})
 
-        execution_queue = sort_jobs_by_dependency(raw_queue)
+        def should_stop() -> bool:
+            return websocket.gone or store.get_kv("cancel") == "1"
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            all_success_data, all_error_data, all_skipped_data = [], [], []
+        source_instance = (source_creds or {}).get("instance_url") or (source_creds or {}).get("api_domain") or (source_creds or {}).get("subdomain")
+        target_instance = target_creds.get("instance_url") or target_creds.get("api_domain") or target_creds.get("subdomain")
+
+        async with RetryingClient(httpx.AsyncClient(timeout=120.0)) as client:
+            runner = ResumableRunner(store, client, send_log, should_stop)
 
             for job_index, job in enumerate(execution_queue):
                 target_object = job.get("targetObject")
@@ -312,18 +452,23 @@ async def websocket_migration(websocket: WebSocket):
                 time_filter = job.get("migrationTimeFilter")
                 migrate_attachments = job.get("migrateAttachments", False)
                 migrate_files = job.get("migrateFiles", False)
+
+                if not mappings or store.is_job_done(job_index):
+                    continue
+                if should_stop():
+                    raise RunInterrupted()
+
                 if migrate_attachments or migrate_files:
                     await send_log(
                         f"[{target_object}] File/attachment migration requested "
                         f"(Attachments={migrate_attachments}, Files={migrate_files}, "
                         f"source={source_crm}, target={target_crm})."
                     )
-                
-                if not mappings: continue
 
                 sf_rules = job.get("sfRules", {})
                 fls_violations = find_non_writable_mapped_fields(mappings, sf_rules, op_mode)
                 if fls_violations:
+                    final_status = "failed"
                     await websocket.send_json({
                         "log": f"[{target_object}] FATAL: {len(fls_violations)} mapped field(s) can't be "
                                f"written by the connected {target_crm.capitalize()} user "
@@ -331,302 +476,283 @@ async def websocket_migration(websocket: WebSocket):
                                f"mapping (or connect a user with field-level write access) and re-validate "
                                f"before running.",
                         "status": "Failed",
-                        "fieldAccessErrors": fls_violations
+                        "fieldAccessErrors": fls_violations,
                     })
                     await websocket.close()
                     return
 
-                if source_crm in MultiCrmPicklistSyncService.SUPPORTED_CRMS and target_crm in MultiCrmPicklistSyncService.SUPPORTED_CRMS:
-                    picklist_sync_mappings = [m for m in mappings if m.get("syncPicklistValues")]
-                    if picklist_sync_mappings:
-                        sync_result = await MultiCrmPicklistSyncService.sync(
-                            client, source_crm, target_crm, source_creds, target_creds, user_id,
-                            source_object, target_object, picklist_sync_mappings, send_log
-                        )
-                        failed = sync_result.get("failed") or {}
-                        if failed:
-                            details = "; ".join(f"{k}: {v}" for k, v in failed.items())
-                            await websocket.send_json({
-                                "log": f"[{target_object}] FATAL: picklist sync failed for {details}. Aborting before data load.",
-                                "status": "Failed",
-                            })
-                            await websocket.close()
-                            return
-
-                source_records = []
-                actual_query_used = None
-
-                session_id = job.get("sessionId")
-                if source_crm == "csv":
-                    source_records = job.get("sourceRecords", [])
-                    source_mode = "CSV Upload"
-                    await send_log(f"[{target_object}] Loaded {len(source_records)} records from CSV payload.")
-                    
-                elif session_id:
-                    db_path = get_db_path(session_id)
-                    conn = sqlite3.connect(db_path)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT data FROM records WHERE is_valid = 1")
-                    source_records = [json.loads(row[0]) for row in cursor.fetchall()]
-                    try:
-                        cursor.execute("SELECT value FROM session_meta WHERE key = 'query_used'")
-                        meta_row = cursor.fetchone()
-                        if meta_row:
-                            actual_query_used = meta_row[0]
-                    except sqlite3.OperationalError:
-                        pass
-                    conn.close()
-                    source_mode = "Staged (Pre-Validated) Records"
-                    await send_log(f"[{target_object}] Loaded {len(source_records)} valid records from staging.")
-                    
+                # ---------------- extract once, then freeze ----------------
+                if store.is_extracted(job_index):
+                    source_records = store.load_extracted(job_index)
+                    await send_log(f"[{target_object}] Using {len(source_records)} frozen source record(s) from the checkpoint.")
                 else:
-                    source_mode = "Direct API Sync"
-                    await send_log(f"[{target_object}] Direct API extraction from {source_crm.capitalize()}...")
-                    extract_result = await source_migrator.extract(client, source_creds, source_object, extraction_query, mappings, send_log, time_filter)
+                    if source_crm == "salesforce" and target_crm == "salesforce":
+                        picklist_sync_mappings = [m for m in mappings if m.get("syncPicklistValues")]
+                        if picklist_sync_mappings:
+                            sync_result = await PicklistSyncService.sync(
+                                client, source_creds, target_creds, user_id,
+                                source_object, target_object, picklist_sync_mappings, send_log,
+                            )
+                            if sync_result["failed"]:
+                                final_status = "failed"
+                                await websocket.send_json({
+                                    "log": f"[{target_object}] FATAL: picklist sync failed for "
+                                           f"{', '.join(sync_result['failed'])}. Aborting before data load.",
+                                    "status": "Failed",
+                                })
+                                await websocket.close()
+                                return
 
-                    if isinstance(extract_result, tuple):
-                        source_records, actual_query_used = extract_result
+                    source_records, actual_query_used = [], None
+                    session_id = job.get("sessionId")
+                    if source_crm == "csv":
+                        source_records = store.get_csv_rows(job_index)
+                        source_mode = "CSV Upload"
+                        await send_log(f"[{target_object}] Loaded {len(source_records)} records from CSV payload.")
+                    elif session_id:
+                        db_path = get_db_path(session_id)
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT data FROM records WHERE is_valid = 1")
+                        source_records = [json.loads(row[0]) for row in cursor.fetchall()]
+                        try:
+                            cursor.execute("SELECT value FROM session_meta WHERE key = 'query_used'")
+                            meta_row = cursor.fetchone()
+                            if meta_row:
+                                actual_query_used = meta_row[0]
+                        except sqlite3.OperationalError:
+                            pass
+                        conn.close()
+                        source_mode = "Staged (Pre-Validated) Records"
+                        await send_log(f"[{target_object}] Loaded {len(source_records)} valid records from staging.")
                     else:
-                        source_records = extract_result
+                        source_mode = "Direct API Sync"
+                        await send_log(f"[{target_object}] Direct API extraction from {source_crm.capitalize()}...")
+                        extract_result = await source_migrator.extract(
+                            client, source_creds, source_object, extraction_query, mappings, send_log, time_filter
+                        )
+                        if isinstance(extract_result, tuple):
+                            source_records, actual_query_used = extract_result
+                        else:
+                            source_records = extract_result
 
-                source_instance = (source_creds or {}).get("instance_url") or (source_creds or {}).get("api_domain") or (source_creds or {}).get("subdomain")
-                target_instance = target_creds.get("instance_url") or target_creds.get("api_domain") or target_creds.get("subdomain")
+                    await IdMappingService.remap_reference_fields(
+                        source_records, mappings, user_id, source_crm, target_crm,
+                        source_instance=source_instance, target_instance=target_instance, send_log=send_log,
+                    )
+                    store.set_job_meta(job_index, sessionId=session_id, sourceMode=source_mode, actualQueryUsed=actual_query_used)
+                    store.save_extracted(job_index, source_records)  # the freeze point: resume never re-extracts
 
-                await IdMappingService.remap_reference_fields(
-                    source_records, mappings, user_id, source_crm, target_crm,
-                    source_instance=source_instance, target_instance=target_instance, send_log=send_log
-                )
-
+                # ---------------- plan passes ----------------
                 options_base = {
                     "targetObject": target_object, "targetExtIdField": ext_id_field, "operationMode": op_mode,
-                    "token": target_creds.get("access_token"), "instance_url": target_creds.get("instance_url") or target_creds.get("api_domain") or target_creds.get("subdomain"),
-                    "batchSize": batch_size, "sourceRecords": source_records, "userId": user_id
+                    "token": target_creds.get("access_token"), "instance_url": target_instance,
+                    "batchSize": batch_size, "userId": user_id,
                 }
+                has_self_ref = any(
+                    m.get("type") == "reference" and target_object in (m.get("referenceTo") or []) for m in mappings
+                )
+                base_opts = {"targetObject": target_object, "targetExtIdField": ext_id_field}
+                defer = job.get("deferReferencesTo", [])
 
-                async def execute_upload(payload_data, current_op, pass_name):
-                    options_pass = dict(options_base)
-                    result = await target_migrator.upload(client, payload_data, current_op, pass_name, options_pass, send_log)
-
-                    if len(result) == 6:
-                        _, _, _, succ, err, skipped = result
-                    else:
-                        _, _, succ, err = result
-                        skipped = []
-
-                    all_success_data.extend(succ)
-                    all_error_data.extend(err)
-                    all_skipped_data.extend(skipped)
-
-                async def dedupe_and_execute(payload_data, current_op, pass_name):
-                    """CRM-agnostic guard applied before any UPDATE/UPSERT hits the wire.
-                    Keeps the last row for any unique-key value that appears more than
-                    once in the same batch, and reports the earlier duplicates as
-                    skipped instead of letting the CRM API silently drop/overwrite one
-                    of them."""
-                    if current_op in ("update", "upsert") and ext_id_field:
-                        dedupe_key_field = "external_id" if target_crm == "zendesk" else ext_id_field
-                        clean_payload, dup_skips = PayloadBuilderService.dedupe_by_unique_key(
-                            payload_data, source_records, dedupe_key_field
-                        )
-                        if dup_skips:
-                            await send_log(
-                                f"[{target_object}] {pass_name}: {len(dup_skips)} record(s) shared the same "
-                                f"'{ext_id_field}' value within this batch -- keeping the last one, skipping the rest."
-                            )
-                            all_skipped_data.extend(dup_skips)
-                        await execute_upload(clean_payload, current_op, pass_name)
-                    else:
-                        await execute_upload(payload_data, current_op, pass_name)
-
-                job_success_start_idx = len(all_success_data)
-                has_self_ref = any(m.get("type") == "reference" and target_object in (m.get("referenceTo") or []) for m in mappings)
-                
                 if job.get("isPass3Patch", False):
-                    p_load = PayloadBuilderService.build_payload(source_records, mappings, {"targetObject": target_object, "targetExtIdField": ext_id_field, "onlyReferencesTo": job.get("onlyReferencesTo", []), "operationMode": "upsert"}, target_crm)
-                    await dedupe_and_execute(p_load, "upsert", "Pass 3 (Patch)")
+                    plan = [(3, "Pass 3 (Patch)", "upsert", {**base_opts, "onlyReferencesTo": job.get("onlyReferencesTo", []), "operationMode": "upsert"})]
                 elif op_mode == "delete":
-                    p_load = PayloadBuilderService.build_payload(source_records, mappings, {"targetObject": target_object, "operationMode": "delete"}, target_crm)
-                    await execute_upload(p_load, "delete", "Deletion")
+                    plan = [(1, "Deletion", "delete", {"targetObject": target_object, "operationMode": "delete"})]
                 elif has_self_ref:
-                    p1_load = PayloadBuilderService.build_payload(source_records, mappings, {"targetObject": target_object, "targetExtIdField": ext_id_field, "excludeReferencesTo": job.get("deferReferencesTo", []), "skipSelfReferencing": True, "operationMode": op_mode}, target_crm)
-                    await dedupe_and_execute(p1_load, op_mode, "Pass 1")
-                    p2_load = PayloadBuilderService.build_payload(source_records, mappings, {"targetObject": target_object, "targetExtIdField": ext_id_field, "onlySelfReferencing": True, "operationMode": "upsert"}, target_crm)
-                    await dedupe_and_execute(p2_load, "upsert", "Pass 2")
+                    plan = [
+                        (1, "Pass 1", op_mode, {**base_opts, "excludeReferencesTo": defer, "skipSelfReferencing": True, "operationMode": op_mode}),
+                        (2, "Pass 2", "upsert", {**base_opts, "onlySelfReferencing": True, "operationMode": "upsert"}),
+                    ]
                 else:
-                    p_load = PayloadBuilderService.build_payload(source_records, mappings, {"targetObject": target_object, "targetExtIdField": ext_id_field, "excludeReferencesTo": job.get("deferReferencesTo", []), "operationMode": op_mode}, target_crm)
-                    await dedupe_and_execute(p_load, op_mode, "Standard Sync")
+                    plan = [(1, "Standard Sync", op_mode, {**base_opts, "excludeReferencesTo": defer, "operationMode": op_mode})]
 
-    
-                job_success_records = all_success_data[job_success_start_idx:]
+                parent_job_idx = None
+                if job.get("isPass3Patch", False):
+                    parent_job_idx = next(
+                        (i for i, q in enumerate(execution_queue) if q.get("targetObject") == target_object and not q.get("isPass3Patch")),
+                        None,
+                    )
+
+                segment_size = batch_size if target_crm == "salesforce" else min(batch_size, 100)
+                segment_size = max(1, segment_size)
+
+                for pass_no, pass_name, pass_op, builder_opts in plan:
+                    payload_data = PayloadBuilderService.build_payload(source_records, mappings, builder_opts, target_crm)
+                    dedupe_key = ""
+                    if pass_op in ("update", "upsert") and ext_id_field:
+                        dedupe_key = "external_id" if target_crm == "zendesk" else ext_id_field
+
+                    await runner.run_pass(PassSpec(
+                        job_idx=job_index, pass_no=pass_no, pass_name=pass_name, op_mode=pass_op,
+                        target_object=target_object, ext_id_field=ext_id_field, segment_size=segment_size,
+                        payload=payload_data, source_records=source_records, migrator=target_migrator,
+                        options_base=options_base, dedupe_key_field=dedupe_key,
+                        correlation_field=(job.get("correlationField") or "") if pass_op == "insert" else "",
+                        parent_job_idx=(job_index if pass_no == 2 else parent_job_idx if pass_no == 3 else None),
+                    ))
+
+                # ---------------- id mapping ----------------
+                job_success_records = store.job_success_records(job_index)
                 job_id_map = {
                     (rec.get("Id") or rec.get("id")): rec.get("Target_Id")
                     for rec in job_success_records
-                    if (rec.get("Id") or rec.get("id"))
-                    and rec.get("Target_Id") not in (None, "", "Success")   # "Success" == target returned no record id
+                    if (rec.get("Id") or rec.get("id")) and rec.get("Target_Id")
                 }
                 if job_id_map:
                     saved_count = IdMappingService.save_mappings(
                         user_id, source_crm, target_crm, target_object, list(job_id_map.items()),
-                        source_instance=source_instance, target_instance=target_instance
+                        source_instance=source_instance, target_instance=target_instance,
                     )
                     await send_log(f"[{target_object}] Saved {saved_count} source->target Id mapping(s) for future reference lookups.")
 
-                # ==========================================
-                # FILES & ATTACHMENTS PASS
-                # ==========================================
-                if migrate_attachments or migrate_files:
+                # ---------------- files & attachments (any CRM pair with file adapters) ----------------
+                if (migrate_attachments or migrate_files) and not store.files_done(job_index):
                     if job.get("isPass3Patch", False):
                         await send_log(f"[{target_object}] File migration skipped for this pass (reference patch pass, not the primary sync).")
                     elif source_crm not in FILE_MIGRATION_CRMS or target_crm not in FILE_MIGRATION_CRMS:
-                        await send_log(f"[{target_object}] File migration skipped: {source_crm} -> {target_crm} isn't supported yet (supported: {', '.join(c.capitalize() for c in sorted(FILE_MIGRATION_CRMS))}).")
+                        await send_log(f"[{target_object}] File migration skipped: {source_crm} -> {target_crm} is not supported (supported: {', '.join(sorted(FILE_MIGRATION_CRMS))}).")
                     elif not job_id_map:
-                        await send_log(
-                            f"[{target_object}] File migration skipped: no source Id was found on synced records. "
-                            f"Sample record keys: {list(job_success_records[0].keys()) if job_success_records else 'N/A'}"
-                        )
+                        await send_log(f"[{target_object}] File migration skipped: no source Id was found on synced records.")
                     else:
                         scoped_id_map = await resolve_file_migration_scope(
                             websocket, client, source_creds, target_creds, user_id,
                             job_id_map, target_object, job_index,
                             migrate_attachments, migrate_files, send_log,
-                            source_crm, target_crm, source_object,
+                            source_crm=source_crm, target_crm=target_crm, source_object=source_object,
                         )
-
                         if not scoped_id_map:
                             await send_log(f"[{target_object}] No records in scope for file migration -- skipping this pass.")
                         else:
                             await send_log(f"[{target_object}] Starting file/attachment migration for {len(scoped_id_map)} synced record(s)...")
-                            file_results = await FILE_MIGRATOR.migrate_files_for_batch(
-                                client, source_creds, target_creds, user_id, scoped_id_map,
-                                migrate_attachments, migrate_files, send_log,
-                                source_crm=source_crm, target_crm=target_crm,
-                                source_object=source_object, target_object=target_object,
+                            saved = store.get_file_checkpoint(job_index)
+                            checkpoint = FileMigrationCheckpoint(
+                                migrated_attachment_ids=set(saved["attachments"]),
+                                migrated_content_version_ids=set(saved["contentVersions"]),
                             )
+                            try:
+                                file_results = await FILE_MIGRATOR.migrate_files_for_batch(
+                                    client, source_creds, target_creds, str(user_id), scoped_id_map,
+                                    migrate_attachments, migrate_files, send_log,
+                                    source_crm=source_crm, target_crm=target_crm,
+                                    source_object=source_object, target_object=target_object,
+                                    strategy=effective_strategy(source_crm, target_crm, "bulk_zip"),
+                                    checkpoint=checkpoint,
+                                )
+                            finally:
+                                # also runs when the pass is interrupted, so a resume skips files already copied
+                                store.save_file_checkpoint(
+                                    job_index, checkpoint.migrated_attachment_ids, checkpoint.migrated_content_version_ids
+                                )
                             await send_log(
                                 f"[{target_object}] Files complete — "
                                 f"Attachments: {file_results['attachments']['success']} ok / {file_results['attachments']['error']} failed, "
                                 f"Files: {file_results['files']['success']} ok / {file_results['files']['error']} failed."
-                                + (" (Stopped early: daily API limit reached.)" if file_results.get("apiLimitReached") else "")
                             )
-            await websocket.send_json({"log": f"QUEUE COMPLETE! Building final payload...", "status": "Processing"})
-            
-            safe_success_data = []
-            for record in all_success_data:
-                safe_record = {}
-                for key, value in record.items():
-                    if isinstance(value, float) and math.isnan(value):
-                        safe_record[key] = None
-                    elif hasattr(value, "isoformat"):
-                        safe_record[key] = value.isoformat()
-                    else:
-                        safe_record[key] = str(value) if value is not None else ""
-                safe_success_data.append(safe_record)
-            
-            formatted_errors = []
-            for err in all_error_data:
-                if not isinstance(err, dict):
-                    err = {"Raw_Data": str(err), "Target_Error": "Unknown error format."}
-                
-                error_msg = err.get("Target_Error", "API rejected this record.")
-                
-                safe_record = {}
-                for k, v in err.items():
-                    if k == "Target_Error":
-                        continue
-                    
-                    if isinstance(v, float) and math.isnan(v):
-                        safe_record[k] = None
-                    elif hasattr(v, "isoformat"):
-                        safe_record[k] = v.isoformat()
-                    else:
-                        safe_record[k] = str(v) if v is not None else ""
-                
-                formatted_errors.append({
-                    "record": safe_record,
-                    "error": error_msg
-                })
+                            await websocket.send_json({
+                                "status": "Running",
+                                "fileMigrationJobResult": {
+                                    "targetObject": target_object,
+                                    "attachmentsSuccess": file_results["attachments"]["success"],
+                                    "attachmentsError": file_results["attachments"]["error"],
+                                    "filesSuccess": file_results["files"]["success"],
+                                    "filesError": file_results["files"]["error"],
+                                    "deferredRecordCount": max(0, len(job_id_map) - len(scoped_id_map)),
+                                },
+                            })
+                            if file_results.get("apiLimitReached"):
+                                raise ApiQuotaExhausted("The daily API limit was reached during file migration.")
+                    store.mark_files_done(job_index)
 
+                store.mark_job_done(job_index)
 
-            formatted_skipped = []
-            for rec in all_skipped_data:
-                if not isinstance(rec, dict):
-                    rec = {"Raw_Data": str(rec), "Target_SkipReason": "Unknown skip reason."}
+            # ---------------- final report: latest state of every row, across resumes ----------------
+            await websocket.send_json({"log": "QUEUE COMPLETE! Building final payload...", "status": "Processing"})
+            success, errors, skipped = store.collect_results()
+            safe_success_data, formatted_errors, formatted_skipped = _format_results_for_ui(success, errors, skipped)
 
-                skip_reason = rec.get("Target_SkipReason", "Skipped: no matching record found.")
-
-                safe_record = {}
-                for k, v in rec.items():
-                    if k == "Target_SkipReason":
-                        continue
-
-                    if isinstance(v, float) and math.isnan(v):
-                        safe_record[k] = None
-                    elif hasattr(v, "isoformat"):
-                        safe_record[k] = v.isoformat()
-                    else:
-                        safe_record[k] = str(v) if v is not None else ""
-
-                formatted_skipped.append({
-                    "record": safe_record,
-                    "reason": skip_reason
-                })
-
-        report_urls = {}
-        try:
-            await websocket.send_json({"log": "Generating Audit Reports (PDF & CSV)...", "status": "Finalizing"})
-            report_urls = AuditService.generate_and_save_reports(
-                user_id=user_id,
-                session_id=session_id or f"direct_{str(uuid.uuid4())[:8]}",
-                source_crm=source_crm,
-                target_crm=target_crm,
-                target_object=target_object,
-                op_mode=op_mode,
-                auth_token=auth_token,
-                success_data=safe_success_data, 
-                error_data=formatted_errors,
-                extraction_query=extraction_query,
-                time_filter=time_filter,
-                user_email=user_email,
-                user_name=user_name,
-                source_mode=source_mode,
-                actual_query_used=actual_query_used,
-            )
-        except Exception as e:
-            logger.exception("Failed to generate/persist migration reports for session %s", session_id)
+            last_idx = len(execution_queue) - 1
+            last_job = execution_queue[last_idx]
+            last_meta = store.get_job_meta(last_idx)
             report_urls = {}
+            try:
+                await websocket.send_json({"log": "Generating Audit Reports (PDF & CSV)...", "status": "Finalizing"})
+                report_urls = AuditService.generate_and_save_reports(
+                    user_id=user_id,
+                    session_id=last_meta.get("sessionId") or f"direct_{str(uuid.uuid4())[:8]}",
+                    source_crm=source_crm,
+                    target_crm=target_crm,
+                    target_object=last_job.get("targetObject"),
+                    op_mode=last_job.get("operationMode", "insert"),
+                    auth_token=auth_token,
+                    success_data=safe_success_data,
+                    error_data=formatted_errors,
+                    extraction_query=(last_job.get("extractionQuery") or "").strip(),
+                    time_filter=last_job.get("migrationTimeFilter"),
+                    user_email=user_email,
+                    user_name=user_name,
+                    source_mode=last_meta.get("sourceMode", "Direct API Sync"),
+                    actual_query_used=last_meta.get("actualQueryUsed"),
+                )
+            except Exception:
+                logger.exception("Failed to generate/persist migration reports for run %s", store.run_id)
+                report_urls = {}
 
-        
-        await websocket.send_json({
-            "status": "Finished",
-            "log": f"Migration completed! {len(safe_success_data)} records successful, "
-                   f"{len(formatted_skipped)} skipped (no match), {len(formatted_errors)} failed.",
-            "successData": safe_success_data,
-            "errorData": formatted_errors,
-            "skippedData": formatted_skipped,
-            "reportUrls": report_urls
-
-        })
-        
+            final_status = "completed"
+            store.set_status("completed")
+            await websocket.send_json({
+                "status": "Finished",
+                "log": f"Migration completed! {len(safe_success_data)} records successful, "
+                       f"{len(formatted_skipped)} skipped (no match), {len(formatted_errors)} failed.",
+                "successData": safe_success_data,
+                "errorData": formatted_errors,
+                "skippedData": formatted_skipped,
+                "reportUrls": report_urls,
+                "runId": store.run_id,
+                "retryable": len(formatted_errors) > 0,
+            })
         await websocket.close()
-        
-    except WebSocketDisconnect:
-        pass
+
+    except (WebSocketDisconnect, RunInterrupted):
+        logger.info("Run %s interrupted (client left or cancelled); checkpoint is intact.", getattr(store, "run_id", None))
+        if store is not None and store.get_kv("cancel") == "1":
+            await websocket.send_json({"log": "Run cancelled.", "status": "Cancelled", "runId": store.run_id})
+        await websocket.close()
+    except (ApiQuotaExhausted, CircuitOpen) as e:
+        await websocket.send_json({
+            "log": f"Run paused: {e} Everything finished so far is saved -- resume once the limit resets or the CRM recovers.",
+            "status": "Interrupted", "runId": store.run_id if store else None, "resumable": True,
+        })
+        await websocket.close()
     except HTTPException as e:
-        try:
-            if is_crm_session_expired(e):
-                side = (e.detail or {}).get("side")
-                await websocket.send_json(_session_expired_payload([side] if side else ["source", "target"], "Failed"))
-            else:
-                await websocket.send_json({"log": f"SYSTEM CRASH: {e.detail}", "status": "Failed"})
-            await websocket.close()
-        except Exception:
-            pass
+        if is_crm_session_expired(e):
+            side = (e.detail or {}).get("side")
+            await websocket.send_json(_session_expired_payload([side] if side else ["source", "target"], "Failed"))
+        else:
+            await websocket.send_json({
+                "log": f"SYSTEM CRASH: {e.detail}. Progress is saved; you can resume this run.",
+                "status": "Interrupted", "runId": store.run_id if store else None, "resumable": store is not None,
+            })
+        await websocket.close()
     except Exception as e:
         traceback.print_exc()
-        try:
-            await websocket.send_json({"log": f"SYSTEM CRASH: {str(e)}", "status": "Failed"})
-            await websocket.close()
-        except: pass
+        await websocket.send_json({
+            "log": f"SYSTEM CRASH: {str(e)}. Progress is saved; you can resume this run.",
+            "status": "Interrupted", "runId": store.run_id if store else None, "resumable": store is not None,
+        })
+        await websocket.close()
+    finally:
+        if heartbeat_task:
+            heartbeat_task.cancel()
+        if store is not None:
+            try:
+                if lock_held:
+                    if final_status == "interrupted" and store.get_kv("cancel") == "1":
+                        final_status = "cancelled"
+                    store.set_status(final_status)
+                    store.release_lock(lock_owner)
+            finally:
+                store.close()
 
 
 # ==========================================
