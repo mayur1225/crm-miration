@@ -349,35 +349,41 @@ get fileMigrationNotes(): string[] {
   isSessionsLoading = false;
 
   ngOnInit(): void {
-    this.getUserData();
-// this.fetchRecoverableSessions();
-// this.preloadEntirePage();
-    const navState = history.state;
-    this.sourceCrmId = navState?.sourceCrm || localStorage.getItem('source_crm_slot');
-    this.targetCrmId = navState?.targetCrm || localStorage.getItem('target_crm_slot');
+  this.getUserData();
 
-    if (!this.sourceCrmId || !this.targetCrmId) {
-      this.toastr.warning('Please connect your Source and Target systems first.', 'Connections Required');
-      this.router.navigate(['/connection']);
-      return;
-    }
+  const navState = history.state;
+  this.sourceCrmId = navState?.sourceCrm || localStorage.getItem('source_crm_slot');
+  this.targetCrmId = navState?.targetCrm || localStorage.getItem('target_crm_slot');
 
-    this.sourceSystem = this.sourceCrmId;
-    this.targetSystem = this.targetCrmId;
-    this.migrationTimeFilter.field = this.timeFilterFieldOptions[0]?.value || '';
-    this.batchSize = this.batchConfig.default;
-
-    localStorage.setItem('source_crm_slot', this.sourceCrmId);
-    localStorage.setItem('target_crm_slot', this.targetCrmId);
-
-    this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
-
-    // Verify both CRM tokens are still valid before loading anything; expired => straight back to login.
-    this.verifyCrmSessions(() => {
-      this.fetchRecoverableSessions();
-      this.preloadEntirePage();
-    });
+  if (!this.sourceCrmId || !this.targetCrmId) {
+    this.toastr.warning('Please connect your Source and Target systems first.', 'Connections Required');
+    this.router.navigate(['/connection']);
+    return;
   }
+
+  this.sourceSystem = this.sourceCrmId;
+  this.targetSystem = this.targetCrmId;
+  this.migrationTimeFilter.field = this.timeFilterFieldOptions[0]?.value || '';
+  this.batchSize = this.batchConfig.default;
+
+  localStorage.setItem('source_crm_slot', this.sourceCrmId);
+  localStorage.setItem('target_crm_slot', this.targetCrmId);
+
+  this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
+
+  // Show the loader on the very first change-detection pass, then run session
+  // verification and schema preload concurrently instead of sequentially.
+  this.showSchemaLoader();
+  this.verifyCrmSessions(() => this.fetchRecoverableSessions());
+  this.preloadEntirePage();
+}
+
+private showSchemaLoader(): void {
+  this.isLoading = true;
+  this.isGlobalLoading = true;
+  this.globalLoadingText = 'Fetching Live Schemas...';
+  this.globalLoadingSubText = 'Please wait while we sync the CRM engines';
+}
 
   // ==========================================
   //  CRM SESSION EXPIRY
@@ -471,22 +477,32 @@ get fileMigrationNotes(): string[] {
     }
   }
 
-  fetchRecoverableSessions() {
-    this.isSessionsLoading = true;
-    fetch(`${environment.apiUrl}/api/validation/sessions`, {
+  async fetchRecoverableSessions(): Promise<void> {
+  this.isSessionsLoading = true;
+  try {
+    const response = await fetch(`${environment.apiUrl}/api/validation/sessions`, {
       headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` }
-    })
-      .then((res) => {
-        if (!res.ok) throw new Error(`Failed to load sessions (${res.status})`);
-        return res.json();
-      })
-      .then((data) => {
-        this.recoverableSessions = data.sessions || [];
-        this.isSessionsLoading = false;
-        this.cdr.detectChanges();
-      })
-      .catch(() => (this.isSessionsLoading = false));
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      if (isAuthExpiredError({ status: response.status, error: errorData })) {
+        this.handleSessionExpired();
+        return;
+      }
+      throw new Error(errorData.detail || `Failed to load sessions (${response.status})`);
+    }
+
+    const data = await response.json();
+    this.recoverableSessions = data.sessions || [];
+  } catch (error) {
+    console.error('Failed to fetch recoverable sessions:', error);
+    this.recoverableSessions = [];
+  } finally {
+    this.isSessionsLoading = false;
+    this.cdr.detectChanges();
   }
+}
 
   resumeSession(sessionId: string, crm: string, object: string) {
     this.currentSessionId = sessionId;
@@ -2372,12 +2388,15 @@ onReviewPanelDragEnd(): void {
     this.isGlobalLoading = true;
     this.globalLoadingText = 'Fetching Live Schemas...';
     this.globalLoadingSubText = 'Please wait while we sync the CRM engines';
+    this.showSchemaLoader();
     this.cdr.detectChanges();
 
     forkJoin({
       sourceObjs: this.mappingApi.getObjects(this.sourceCrmId, 'source'),
       targetObjs: this.mappingApi.getObjects(this.targetCrmId, 'target')
-    }).subscribe({
+    })
+    .pipe(takeUntil(this.mappingCancel$))
+    .subscribe({
       next: ({ sourceObjs, targetObjs }) => {
         this.sourceEntities = sourceObjs || [];
         this.targetEntities = targetObjs || [];
