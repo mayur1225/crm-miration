@@ -74,7 +74,7 @@ export class AuthService {
     const token = localStorage.getItem('supabase_token');
     const headers = new HttpHeaders().set('Authorization', `Bearer ${token}`);
 
-    return this.http.put(`${environment.apiUrl}/update-email`,
+    return this.http.put(`${this.apiUrl}/update-email`,
       { new_email: newEmail },
       { headers }
     );
@@ -86,6 +86,10 @@ export class AuthService {
 
   forgotPassword(email: string): Observable<any> {
     return this.http.post<any>(`${this.apiUrl}/forgot-password`, { email });
+  }
+
+  forceLogout() {
+    this.clearLocalSession();
   }
 
   private clearLocalSession() {

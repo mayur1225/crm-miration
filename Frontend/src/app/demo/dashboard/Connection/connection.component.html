@@ -196,6 +196,14 @@
     font-weight: 700;
     display: flex; align-items: center; justify-content: center; gap: 6px;
   }
+  .crm-expired-row {
+    color: var(--warning, #b45309);
+    background: rgba(245, 158, 11, 0.12);
+    border-radius: 8px;
+    padding: 8px 10px; margin-bottom: 12px;
+    font-weight: 600; font-size: 0.82rem;
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+  }
   .crm-instance-url {
     max-width: 220px; margin: 4px auto 0;
     color: var(--muted);
@@ -431,6 +439,11 @@
                 <p class="conn-mono crm-instance-url small text-truncate">{{ sourceInstanceUrl }}</p>
                 <button class="btn-disconnect" [disabled]="isPageLoading" (click)="disconnectCRM('source')">Disconnect</button>
               } @else {
+                @if (sourceSessionExpired) {
+                  <div class="crm-expired-row">
+                    <i class="feather icon-alert-triangle"></i> Session expired &mdash; please log in again.
+                  </div>
+                }
                 @if (selectedSource === 'zendesk') {
                   <div class="field-inline">
                     <span>https://</span>
@@ -498,6 +511,11 @@
                 <p class="conn-mono crm-instance-url small text-truncate">{{ targetInstanceUrl }}</p>
                 <button class="btn-disconnect" [disabled]="isPageLoading" (click)="disconnectCRM('target')">Disconnect</button>
               } @else {
+                @if (targetSessionExpired) {
+                  <div class="crm-expired-row">
+                    <i class="feather icon-alert-triangle"></i> Session expired &mdash; please log in again.
+                  </div>
+                }
                 @if (selectedTarget === 'zendesk') {
                   <div class="field-inline">
                     <span>https://</span>

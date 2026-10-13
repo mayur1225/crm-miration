@@ -1,82 +1,72 @@
 import { HttpInterceptorFn, HttpErrorResponse } from '@angular/common/http';
 import { inject } from '@angular/core';
-import { throwError, BehaviorSubject } from 'rxjs';
-import { catchError, switchMap, filter, take } from 'rxjs/operators';
+import { Observable, throwError } from 'rxjs';
+import { catchError, finalize, map, shareReplay, switchMap } from 'rxjs/operators';
 import { AuthService } from './auth.service';
 import { environment } from 'src/environments/environment';
 
-let isRefreshing = false;
-let refreshTokenSubject: BehaviorSubject<string | null> = new BehaviorSubject<string | null>(null);
+let refresh$: Observable<string> | null = null;
+
+function refreshOnce(authService: AuthService): Observable<string> {
+  if (!refresh$) {
+    refresh$ = authService.refreshToken().pipe(
+      map((res: any) => {
+        if (!res?.token) throw new Error('Token refresh returned no token');
+        return res.token as string;
+      }),
+      finalize(() => { refresh$ = null; }),
+      shareReplay(1)
+    );
+  }
+  return refresh$;
+}
+
+function isCrmSessionError(error: HttpErrorResponse): boolean {
+  const detail = error?.error?.detail;
+  return !!detail && typeof detail === 'object' && detail.code === 'CRM_SESSION_EXPIRED';
+}
+
+
+const PUBLIC_AUTH_SUFFIXES = [
+  '/api/auth/login',
+  '/api/auth/signup',
+  '/api/auth/refresh',
+  '/api/auth/logout',
+  '/api/auth/forgot-password'
+];
 
 export const authInterceptor: HttpInterceptorFn = (req, next) => {
   const authService = inject(AuthService);
 
-  const isOwnApi = req.url.startsWith(environment.apiUrl);
-  if (!isOwnApi) {
+  if (!req.url.startsWith(environment.apiUrl)) {
     return next(req);
   }
 
-  // 1. STRICT BYPASS: Only ignore actual Supabase login/signup routes
-  const isPublicAuthRoute = req.url.endsWith('/api/auth/login') ||
-                            req.url.endsWith('/api/auth/signup') ||
-                            req.url.endsWith('/api/auth/refresh');
-
-  if (isPublicAuthRoute) {
+  if (PUBLIC_AUTH_SUFFIXES.some((suffix) => req.url.endsWith(suffix))) {
     return next(req);
   }
 
-  // 2. GET TOKEN safely
   let token = authService.currentUser();
   if (token === 'null' || token === 'undefined' || !token) {
     token = null;
   }
 
-  // 3. ATTACH TOKEN
-  let authReq = req;
-  if (token) {
-    authReq = req.clone({
-      setHeaders: { Authorization: `Bearer ${token}` }
-    });
-  }
+  const authReq = token ? req.clone({ setHeaders: { Authorization: `Bearer ${token}` } }) : req;
 
-  // 4. HANDLE RESPONSES
   return next(authReq).pipe(
     catchError((error: HttpErrorResponse) => {
-      if (error.status === 401 && token) {
-        if (!isRefreshing) {
-          isRefreshing = true;
-          refreshTokenSubject.next(null);
-
-          return authService.refreshToken().pipe(
-            switchMap((res: any) => {
-              isRefreshing = false;
-              const newToken = res.token;
-              refreshTokenSubject.next(newToken);
-
-              return next(req.clone({
-                setHeaders: { Authorization: `Bearer ${newToken}` }
-              }));
-            }),
-            catchError((err) => {
-              isRefreshing = false;
-              refreshTokenSubject.next(null);
-              authService.logout();
-              return throwError(() => err);
-            })
-          );
-        } else {
-          return refreshTokenSubject.pipe(
-            filter(newToken => newToken !== null),
-            take(1),
-            switchMap((newToken) => {
-              return next(req.clone({
-                setHeaders: { Authorization: `Bearer ${newToken}` }
-              }));
-            })
-          );
-        }
+      if (error.status !== 401 || !token || isCrmSessionError(error)) {
+        return throwError(() => error);
       }
-      return throwError(() => error);
+
+      return refreshOnce(authService).pipe(
+        // Only a failed *refresh* ends the app session -- not a failure of the retried request.
+        catchError((err) => {
+          authService.forceLogout();
+          return throwError(() => err);
+        }),
+        switchMap((newToken) => next(req.clone({ setHeaders: { Authorization: `Bearer ${newToken}` } })))
+      );
     })
   );
 };
