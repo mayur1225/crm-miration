@@ -121,7 +121,6 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
 
   private mappingCancel$ = new Subject<void>();
 
-  /** Unfiltered source describe result. Used only for query validation; `sourceFields` is the writable subset used for mapping. */
   private allSourceFields: FieldMeta[] = [];
   private readonly PICKLIST_TYPES = ['picklist', 'multipicklist'];
 
@@ -371,8 +370,6 @@ get fileMigrationNotes(): string[] {
 
   this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
 
-  // Show the loader on the very first change-detection pass, then run session
-  // verification and schema preload concurrently instead of sequentially.
   this.showSchemaLoader();
   this.verifyCrmSessions(() => this.fetchRecoverableSessions());
   this.preloadEntirePage();
@@ -1239,7 +1236,6 @@ toggleProfileDropdown(event: Event): void {
 
     const mappedFieldCount = this.mappings.filter((m) => m.targetField !== '').length;
 
-    // Nothing mapped yet -- no decision to make, just switch.
     if (mappedFieldCount === 0) {
       this.lastOperationMode = newMode;
       if (newMode === 'delete') {
@@ -1291,7 +1287,6 @@ toggleProfileDropdown(event: Event): void {
         'Mappings Retained'
       );
     } else if (confirmResult.dismiss === Swal.DismissReason.cancel) {
-      // Explicit "No, Clear Mapped Fields" click -- switch mode, wipe mappings.
       this.lastOperationMode = newMode;
       if (newMode === 'delete') {
         this.externalIdField = '';
@@ -2321,11 +2316,6 @@ onReviewPanelDragEnd(): void {
         }
       }
 
-      // Deep Field & Type Validation
-      // Group 1: field (or dotted relationship path). Group 2: operator. Group 3: exactly ONE value token
-      // (a quoted literal, or an unquoted token that stops at whitespace/parens/commas), so trailing
-      // clauses like "0 and Type" can never be swallowed into the value.
-      // Word operators (like / is [not]) require leading whitespace so "Dislike" isn't parsed as "Dis" + "like".
       const sqlRegex = /\b([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*)(?:\s*(?:<>|!=|<=|>=|=|<|>)|\s+(?:like|is(?:\s+not)?))\s*('(?:[^'\\]|\\.)*'|[^\s()',]+)/gi;
       const reservedWords = new Set(['select', 'from', 'where', 'and', 'or', 'null', 'is', 'like', 'not']);
       const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent']);
@@ -2338,8 +2328,6 @@ onReviewPanelDragEnd(): void {
           const rawPath = match[1];
           if (reservedWords.has(rawPath.toLowerCase())) continue;
 
-          // Relationship traversal (RecordType.Name, Owner.Profile.Name) cannot be validated
-          // against this object's describe; the CRM validates it server-side.
           if (rawPath.includes('.')) continue;
 
           const schemaField = this.allSourceFields.find((f) => f.name.toLowerCase() === rawPath.toLowerCase());
@@ -3224,8 +3212,6 @@ onReviewPanelDragEnd(): void {
         }
 
 
-        // Remove saved CRM connections on the server BEFORE logging out (the app token is still valid here),
-        // so nothing shows as "Connected" the next time someone logs in.
         forkJoin([
           this.crmAuthService.disconnectCrm('source').pipe(catchError(() => of(null))),
           this.crmAuthService.disconnectCrm('target').pipe(catchError(() => of(null)))
