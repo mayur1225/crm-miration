@@ -122,7 +122,12 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
   private mappingCancel$ = new Subject<void>();
 
   private allSourceFields: FieldMeta[] = [];
-  private readonly PICKLIST_TYPES = ['picklist', 'multipicklist'];
+  private readonly PICKLIST_TYPES_BY_CRM: Record<string, string[]> = {
+    salesforce: ['picklist', 'multipicklist'],
+    hubspot: ['picklist'],
+    zoho: ['picklist'],
+    zendesk: ['tagger', 'dropdown', 'multiselect'],
+  };
 
   private readonly SYSTEM_MANAGED_FIELDS = new Set<string>([
     'hs_object_id',
@@ -284,10 +289,18 @@ isProfileDropdownOpen = false;
   private readonly SINGLE_FILE_TYPE_CRMS = ['zoho', 'hubspot'];
 
   canSyncPicklist(mapping: MappingRow): boolean {
-    if (!this.isSalesforceToSalesforce || !mapping.sourceField || !mapping.targetField) return false;
+    if (!this.isPicklistSyncSupported || !mapping.sourceField || !mapping.targetField) return false;
+    const sourceTypes = this.PICKLIST_TYPES_BY_CRM[this.sourceCrmId.toLowerCase()];
+    const targetTypes = this.PICKLIST_TYPES_BY_CRM[this.targetCrmId.toLowerCase()];
     const s = this.getFieldMeta(mapping.sourceField, 'source')?.type?.toLowerCase();
     const t = this.getFieldMeta(mapping.targetField, 'target')?.type?.toLowerCase();
-    return !!s && !!t && this.PICKLIST_TYPES.includes(s) && this.PICKLIST_TYPES.includes(t);
+    return !!s && !!t && sourceTypes.includes(s) && targetTypes.includes(t);
+  }
+
+   get isPicklistSyncSupported(): boolean {
+    const s = this.sourceCrmId?.toLowerCase();
+    const t = this.targetCrmId?.toLowerCase();
+    return !!s && !!t && !!this.PICKLIST_TYPES_BY_CRM[s] && !!this.PICKLIST_TYPES_BY_CRM[t];
   }
 
 get fileMigrationSupported(): boolean {
@@ -1721,15 +1734,19 @@ onReviewPanelDragEnd(): void {
   private getAllReferencedParentObjects(): string[] {
     const names = new Set<string>();
     (this.targetFields || []).forEach((f) => {
-      if (f.type === 'reference' || (f.referenceTo && f.referenceTo.length > 0)) {
-        (f.referenceTo || []).forEach((r) => { if (r) names.add(r); });
+      const refs = this.normalizeReferenceTo(f.referenceTo);
+      if (f.type === 'reference' || refs.length > 0) {
+        refs.forEach((r) => names.add(r));
       }
     });
     return Array.from(names);
   }
 
   private prefetchParentFieldMetadata(): void {
-    const parentObjects = this.getAllReferencedParentObjects();
+    const isHubspotTarget = (this.targetCrmId || '').toLowerCase() === 'hubspot';
+    const parentObjects = this.getAllReferencedParentObjects().filter(
+      (n) => !(isHubspotTarget && n.toUpperCase() === 'OWNER')
+    );
     this.parentFieldsCache = {};
 
     if (parentObjects.length === 0) {
@@ -1740,7 +1757,12 @@ onReviewPanelDragEnd(): void {
     this.isLoadingParentFields = true;
     const requests: Record<string, any> = {};
     parentObjects.forEach((name) => {
-      requests[name] = this.mappingApi.getFields(this.targetCrmId, name, 'target');
+      requests[name] = this.mappingApi.getFields(this.targetCrmId, name, 'target').pipe(
+        catchError((err) => {
+          console.warn(`Parent metadata unavailable for ${name}; defaulting to Id matching.`, err);
+          return of({ fields: [] });
+        })
+      );
     });
 
     forkJoin(requests)
@@ -1748,7 +1770,7 @@ onReviewPanelDragEnd(): void {
       .subscribe({
         next: (results: any) => {
           parentObjects.forEach((name) => {
-            this.parentFieldsCache[name] = results[name]?.fields || [];
+            this.parentFieldsCache[name] = this.normalizeFields(results[name]?.fields || []);
           });
           this.isLoadingParentFields = false;
           this.cdr.detectChanges();
@@ -1769,7 +1791,7 @@ onReviewPanelDragEnd(): void {
 
   getReferenceParentCandidates(mapping: MappingRow): string[] {
     const fieldMeta = this.targetFields.find((f) => f.name === mapping.targetField);
-    return fieldMeta?.referenceTo || [];
+    return this.normalizeReferenceTo(fieldMeta?.referenceTo);
   }
 
   getReferenceParentObjectName(mapping: MappingRow): string | undefined {
@@ -2140,6 +2162,20 @@ onReviewPanelDragEnd(): void {
     this.logMessages = [...this.logMessages, message];
   }
 
+  private normalizeReferenceTo(raw: any): string[] {
+    if (!raw) return [];
+    const items = Array.isArray(raw) ? raw : [raw];
+    return items
+      .map((r: any) =>
+        typeof r === 'string' ? r : (r?.module?.api_name || r?.api_name || r?.name || r?.apiName || '')
+      )
+      .filter((r: string) => !!r);
+  }
+
+  private normalizeFields(fields: any[]): FieldMeta[] {
+    return (fields || []).map((f) => ({ ...f, referenceTo: this.normalizeReferenceTo(f.referenceTo) }));
+  }
+
   validateQuery(): boolean {
     this.queryError = null;
 
@@ -2456,8 +2492,8 @@ onReviewPanelDragEnd(): void {
       .pipe(takeUntil(this.mappingCancel$))
       .subscribe({
         next: ({ sourceData, targetData }) => {
-          this.targetFields = targetData.fields || [];
-          this.allSourceFields = sourceData.fields || [];
+          this.targetFields = this.normalizeFields(targetData.fields || []);
+          this.allSourceFields = this.normalizeFields(sourceData.fields || []);
           this.sourceFields = this.allSourceFields.filter(
             (field: FieldMeta) => this.isSourceFieldWritable(field) && !this.isSystemManagedField(field.name)
           );
@@ -2715,10 +2751,10 @@ onReviewPanelDragEnd(): void {
               this.reviewFilter = 'unmapped';
             }
 
-            this.openReviewPanel();
-
             this.mappings = [...this.mappings];
             if (typeof this.updateMappedCount === 'function') this.updateMappedCount();
+            this.openReviewPanel();
+            this.cdr.detectChanges();
           }, 600);
 
           return;
@@ -2791,9 +2827,9 @@ onReviewPanelDragEnd(): void {
             this.mappings = [...this.mappings];
 
             if (typeof this.updateMappedCount === 'function') this.updateMappedCount();
-            this.cdr.detectChanges();
             this.reviewFilter = heuristicMatchCount > 0 ? 'mapped' : 'unmapped';
             this.openReviewPanel();
+            this.cdr.detectChanges();
 
             if (this.toastr) {
               if (error.status === 404) {
@@ -2870,7 +2906,7 @@ onReviewPanelDragEnd(): void {
     }
 
     this.mappedCount = this.mappings.filter((m) => m.targetField !== '').length;
-    this.cdr.detectChanges();
+    this.cdr.markForCheck();
   }
 
   isMappingBlockedByWriteAccess(mapping: MappingRow): boolean {
