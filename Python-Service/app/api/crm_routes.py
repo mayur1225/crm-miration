@@ -122,28 +122,28 @@ async def salesforce_callback(code: str = None, state: str = None, error: str = 
 @router.get("/auth/zoho/login")
 def get_zoho_url(side: str, region: str = "IN", current_user = Depends(get_current_user)):
     custom_state = f"{side}::{current_user.id}::{region}"
-    accounts_url = ZOHO_REGIONS.get(region.lower(), ZOHO_REGIONS["us"])
-
+    
+    
     scopes = [
-        "ZohoCRM.modules.ALL",       # records + attachments
-        "ZohoCRM.bulk.READ",
-        "ZohoCRM.files.CREATE",
-        "ZohoCRM.files.READ",
-        "ZohoCRM.settings.ALL",      # fields/modules metadata + picklist value updates
-        "ZohoCRM.coql.READ",
+        "ZohoCRM.modules.ALL", 
+        "ZohoCRM.bulk.READ", 
+        "ZohoCRM.settings.FIELDS.READ",
+        "ZohoCRM.settings.modules.READ",
+        "ZohoCRM.settings.ALL",
+        "ZohoCRM.coql.READ"
     ]
-
+    
     params = {
         "scope": ",".join(scopes),
         "client_id": ZOHO_CLIENT_ID,
         "response_type": "code",
         "access_type": "offline",
         "redirect_uri": ZOHO_REDIRECT_URI,
-        "prompt": "consent",
-        "state": custom_state,
+        "prompt": "consent", 
+        "state": custom_state
     }
-
-    auth_url = f"{accounts_url}/oauth/v2/auth?{urllib.parse.urlencode(params)}"
+    
+    auth_url = f"https://accounts.zoho.com/oauth/v2/auth?{urllib.parse.urlencode(params)}"
     return {"url": auth_url}
 
 @router.get("/auth/zoho/callback")
@@ -247,27 +247,6 @@ async def zendesk_callback(code: str, state: str):
 # =========================================================
 # HUBSPOT OAUTH FLOW
 # =========================================================
-
-HUBSPOT_SCOPES = [
-    "oauth",
-    "crm.objects.contacts.read",
-    "crm.objects.contacts.write",
-    "crm.objects.companies.read",
-    "crm.objects.companies.write",
-    "crm.objects.deals.read",
-    "crm.objects.deals.write",
-    "tickets",
-    "files.read",
-    "files.write",
-    "files.ui_hidden.read",
-]
-
-HUBSPOT_OPTIONAL_SCOPES = [
-    "crm.schemas.contacts.write",
-    "crm.schemas.companies.write",
-    "crm.schemas.deals.write",
-    "crm.schemas.custom.write",
-]
 @router.get("/auth/hubspot/login")
 def get_hubspot_url(side: str, current_user = Depends(get_current_user)):
     import urllib.parse
@@ -275,13 +254,16 @@ def get_hubspot_url(side: str, current_user = Depends(get_current_user)):
     HS_CLIENT_ID = os.getenv("HS_CLIENT_ID", "").strip()
     HS_REDIRECT_URI = os.getenv("HS_REDIRECT_URI", f"{FASTAPI_BACKEND_URL}/api/crm/auth/hubspot/callback")
 
+    custom_state = f"{side}::{current_user.id}"
+
+    scopes = "crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read crm.objects.companies.write crm.objects.deals.read crm.objects.deals.write tickets"
     params = {
         "client_id": HS_CLIENT_ID,
         "redirect_uri": HS_REDIRECT_URI,
-        "scope": " ".join(HUBSPOT_SCOPES),
-        "optional_scope": " ".join(HUBSPOT_OPTIONAL_SCOPES),
-        "state": f"{side}::{current_user.id}",
+        "scope": scopes,
+        "state": custom_state
     }
+
     auth_url = f"https://app.hubspot.com/oauth/authorize?{urllib.parse.urlencode(params)}"
     return {"url": auth_url}
 

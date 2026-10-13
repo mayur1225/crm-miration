@@ -4,7 +4,8 @@ import { FormsModule } from '@angular/forms';
 import { Router, ActivatedRoute } from '@angular/router';
 import { CrmAuthService, CrmConnection } from 'src/app/services/CrmAuthService.service';
 import { ToastrService } from 'ngx-toastr';
-import { Subscription, switchMap, delay } from 'rxjs';
+import { Subscription, Observable, switchMap, delay, forkJoin, of, catchError } from 'rxjs';
+import { isConnectionExpired } from 'src/app/services/crm-session.util';
 
 @Component({
   selector: 'app-connection',
@@ -53,9 +54,17 @@ export class ConnectionComponent implements OnInit, OnDestroy {
   isPageLoading: boolean = true;
   isSourceConnecting: boolean = false;
   isTargetConnecting: boolean = false;
+  private expiredToastShown = false;
 
   ngOnInit() {
     this.isPageLoading = true;
+
+    // Sides the API-mapping page told us have an expired session (consumed once, so a refresh won't repeat it).
+    const expiredSides: Array<'source' | 'target'> = history.state?.expiredSides || [];
+    if (expiredSides.length) {
+      history.replaceState({ ...history.state, expiredSides: undefined }, '');
+      this.showExpiredToast();
+    }
 
     this.authSubscription = this.route.queryParams.pipe(
       switchMap(params => {
@@ -70,7 +79,13 @@ export class ConnectionComponent implements OnInit, OnDestroy {
           this.router.navigate([], { relativeTo: this.route, replaceUrl: true });
         }
 
-        return this.crmAuthService.getUserConnections();
+        // Drop the expired connection(s) first so the page starts clean, then load what is still valid.
+        const clear$: Observable<unknown> = expiredSides.length
+          ? forkJoin(expiredSides.map((side) => this.crmAuthService.disconnectCrm(side).pipe(catchError(() => of(null)))))
+          : of(null);
+        expiredSides.length = 0; // only clear once, even if query params change again
+
+        return clear$.pipe(switchMap(() => this.crmAuthService.getUserConnections()));
       }),
       delay(0)
     ).subscribe({
@@ -113,7 +128,15 @@ export class ConnectionComponent implements OnInit, OnDestroy {
     let nextSourceUrl = '';
     let nextTargetUrl = '';
 
+    const expiredRoles: string[] = [];
+
     connections.forEach(conn => {
+      // Expired token => treat as not connected (no "Connected" badge, no pre-selected CRM).
+      if (isConnectionExpired(conn)) {
+        expiredRoles.push(conn.connection_role);
+        return;
+      }
+
       if (conn.connection_role === 'source') {
         nextSelectedSource = conn.crm_type;
         nextSourceConnected = true;
@@ -146,6 +169,18 @@ export class ConnectionComponent implements OnInit, OnDestroy {
       }
     });
 
+    if (expiredRoles.includes('source')) {
+      this.sourceZendeskSubdomain = '';
+      this.sourceZohoRegion = 'IN';
+      this.sourceSalesforceEnv = 'production';
+    }
+    if (expiredRoles.includes('target')) {
+      this.targetZendeskSubdomain = '';
+      this.targetZohoRegion = 'IN';
+      this.targetSalesforceEnv = 'production';
+    }
+    if (expiredRoles.length) this.showExpiredToast();
+
     this.selectedSource = nextSelectedSource;
     this.selectedTarget = nextSelectedTarget;
     this.isSourceConnected = nextSourceConnected;
@@ -169,6 +204,12 @@ export class ConnectionComponent implements OnInit, OnDestroy {
     this.isTargetConnecting = false;
 
     this.cdr.detectChanges();
+  }
+
+  private showExpiredToast() {
+    if (this.expiredToastShown) return;
+    this.expiredToastShown = true;
+    this.toastr.warning('Your CRM session has expired. Please log in again.', 'Session Expired');
   }
 
   getCrmConfig(crmId: string) {

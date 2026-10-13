@@ -21,9 +21,7 @@ from app.services.payload_builder import PayloadBuilderService
 from app.services.audit_service import AuditService
 from app.services.field_access_utils import find_non_writable_mapped_fields
 from app.services.id_mapping_service import IdMappingService
-from app.services.migrators.cross_crm_file_migrator import CrossCrmFileMigrator
-from app.services.file_adapters.registry import supported_crms
-from app.services.crm_picklist_sync_service import MultiCrmPicklistSyncService
+from app.services.picklist_sync_service import PicklistSyncService
 
 import uuid
 import sqlite3
@@ -51,9 +49,8 @@ MIGRATORS = {
     "hubspot": HubspotMigrator()
 }
 
-# Files/Attachments migration
-FILE_MIGRATION_CRMS = supported_crms()
-FILE_MIGRATOR = CrossCrmFileMigrator()
+# Files/Attachments migration is Salesforce -> Salesforce only
+FILE_MIGRATOR = SalesforceFileMigrator()
 FILE_MIGRATION_ESTIMATOR = FileMigrationEstimator()
 FILE_MIGRATION_DEFAULT_SAFETY_THRESHOLD = 0.90
 
@@ -132,7 +129,6 @@ async def resolve_file_migration_scope(
     websocket: WebSocket, client, source_creds, target_creds, user_id: str,
     job_id_map: dict, target_object: str, job_index: int,
     migrate_attachments: bool, migrate_files: bool, send_log,
-    source_crm: str = "salesforce", target_crm: str = "salesforce", source_object: str = "",
 ) -> dict:
     """
     Runs the pre-flight API budget estimate for this job's file/attachment pass and,
@@ -148,7 +144,6 @@ async def resolve_file_migration_scope(
             client, source_creds, target_creds, user_id, list(job_id_map.keys()),
             migrate_attachments, migrate_files, send_log,
             safety_threshold=FILE_MIGRATION_DEFAULT_SAFETY_THRESHOLD,
-            source_crm=source_crm, target_crm=target_crm, source_object=source_object,
         )
     except Exception as e:
         await send_log(
@@ -210,7 +205,7 @@ async def resolve_file_migration_scope(
     elif action == "proceed_full":
         await send_log(
             f"[{target_object}] Proceeding with the FULL scope despite exceeding the estimated safe "
-            f"budget, per explicit user override. This may hit the daily API limit mid-run."
+            f"budget, per explicit user override. This may hit Salesforce's daily API limit mid-run."
         )
         return job_id_map
 
@@ -298,13 +293,21 @@ async def websocket_migration(websocket: WebSocket):
                     await websocket.close()
                     return
 
-                if source_crm in MultiCrmPicklistSyncService.SUPPORTED_CRMS and target_crm in MultiCrmPicklistSyncService.SUPPORTED_CRMS:
+                if source_crm == "salesforce" and target_crm == "salesforce":
                     picklist_sync_mappings = [m for m in mappings if m.get("syncPicklistValues")]
                     if picklist_sync_mappings:
-                        await MultiCrmPicklistSyncService.sync(
-                            client, source_crm, target_crm, source_creds, target_creds, user_id,
+                        sync_result = await PicklistSyncService.sync(
+                            client, source_creds, target_creds, user_id,
                             source_object, target_object, picklist_sync_mappings, send_log
                         )
+                        if sync_result["failed"]:
+                            await websocket.send_json({
+                                "log": f"[{target_object}] FATAL: picklist sync failed for "
+                                       f"{', '.join(sync_result['failed'])}. Aborting before data load.",
+                                "status": "Failed",
+                            })
+                            await websocket.close()
+                            return
 
                 source_records = []
                 actual_query_used = None
@@ -414,8 +417,7 @@ async def websocket_migration(websocket: WebSocket):
                 job_id_map = {
                     (rec.get("Id") or rec.get("id")): rec.get("Target_Id")
                     for rec in job_success_records
-                    if (rec.get("Id") or rec.get("id"))
-                    and rec.get("Target_Id") not in (None, "", "Success")   # "Success" == target returned no record id
+                    if (rec.get("Id") or rec.get("id")) and rec.get("Target_Id")
                 }
                 if job_id_map:
                     saved_count = IdMappingService.save_mappings(
@@ -425,13 +427,13 @@ async def websocket_migration(websocket: WebSocket):
                     await send_log(f"[{target_object}] Saved {saved_count} source->target Id mapping(s) for future reference lookups.")
 
                 # ==========================================
-                # FILES & ATTACHMENTS PASS
+                # FILES & ATTACHMENTS PASS (Salesforce -> Salesforce only)
                 # ==========================================
                 if migrate_attachments or migrate_files:
                     if job.get("isPass3Patch", False):
                         await send_log(f"[{target_object}] File migration skipped for this pass (reference patch pass, not the primary sync).")
-                    elif source_crm not in FILE_MIGRATION_CRMS or target_crm not in FILE_MIGRATION_CRMS:
-                        await send_log(f"[{target_object}] File migration skipped: {source_crm} -> {target_crm} isn't supported yet (supported: {', '.join(c.capitalize() for c in sorted(FILE_MIGRATION_CRMS))}).")
+                    elif source_crm != "salesforce" or target_crm != "salesforce":
+                        await send_log(f"[{target_object}] File migration skipped: only Salesforce -> Salesforce is supported right now (got {source_crm} -> {target_crm}).")
                     elif not job_id_map:
                         await send_log(
                             f"[{target_object}] File migration skipped: no source Id was found on synced records. "
@@ -442,7 +444,6 @@ async def websocket_migration(websocket: WebSocket):
                             websocket, client, source_creds, target_creds, user_id,
                             job_id_map, target_object, job_index,
                             migrate_attachments, migrate_files, send_log,
-                            source_crm, target_crm, source_object,
                         )
 
                         if not scoped_id_map:
@@ -451,9 +452,7 @@ async def websocket_migration(websocket: WebSocket):
                             await send_log(f"[{target_object}] Starting file/attachment migration for {len(scoped_id_map)} synced record(s)...")
                             file_results = await FILE_MIGRATOR.migrate_files_for_batch(
                                 client, source_creds, target_creds, user_id, scoped_id_map,
-                                migrate_attachments, migrate_files, send_log,
-                                source_crm=source_crm, target_crm=target_crm,
-                                source_object=source_object, target_object=target_object,
+                                migrate_attachments, migrate_files, send_log
                             )
                             await send_log(
                                 f"[{target_object}] Files complete — "
@@ -588,8 +587,6 @@ async def websocket_validate_stream(websocket: WebSocket):
             await websocket.close()
             return
         user_id = user_res.user.id
-        user_email = getattr(user_res.user, "email", None)
-        user_name = (getattr(user_res.user, "user_metadata", None) or {}).get("full_name")
 
         is_revalidation = payload.get("isRevalidation", False)
         session_id = payload.get("sessionId", "")
@@ -671,9 +668,6 @@ async def websocket_validate_stream(websocket: WebSocket):
                     stats=validation_stats,
                     invalid_records=full_invalid_records,
                     auth_token=auth_token,
-                    staging_db_path=db_path,
-                    user_email=user_email,
-                    user_name=user_name,
                 )
             except Exception as e:
                 logger.exception("Failed to persist re-validation history for session %s", session_id)
@@ -795,9 +789,6 @@ async def websocket_validate_stream(websocket: WebSocket):
                 stats=aggregate_stats,
                 invalid_records=full_invalid_records,
                 auth_token=auth_token,
-                staging_db_path=db_path,
-                user_email=user_email,
-                user_name=user_name,
             )
         except Exception as e:
             logger.exception("Failed to persist validation history for session %s", session_id)
