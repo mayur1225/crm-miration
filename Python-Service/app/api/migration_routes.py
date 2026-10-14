@@ -30,6 +30,7 @@ from app.services.resilience.retry import RetryingClient, ApiQuotaExhausted, Cir
 from app.services.store import RunStore, RunNotFound, RunForbidden
 from app.services.run_access import RunAccess
 from app.services.org_identity import org_key
+from app.services import run_recovery
 from app.services.resumable_runner import ResumableRunner, PassSpec, RunInterrupted
 
 import uuid
@@ -81,6 +82,22 @@ def _note_stop(store, code: str, message: str) -> None:
             store.set_stop_reason(code, str(message)[:400])
     except Exception:
         logger.exception("Could not record stop reason")
+
+
+def _supersede_parent(user_id, store) -> None:
+    """A 'start over' run replaces its parent: stop the parent from being resumed in parallel."""
+    parent_id = store._run_row()["parent_run_id"]
+    if not parent_id:
+        return
+    try:
+        parent = RunAccess.open(user_id, parent_id)
+        try:
+            if parent.status() != "completed":
+                parent.set_status("superseded")
+        finally:
+            parent.close()
+    except Exception:
+        logger.exception("Could not mark parent run %s as superseded", parent_id)
 
 
 def _session_expired_payload(sides, failed_status: str, log: str = None) -> dict:
@@ -400,6 +417,8 @@ async def websocket_migration(ws: WebSocket):
                     return
                 parent.delete_kv("cancel")        # a cancelled run may be resumed from its checkpoint
                 parent.clear_stop_reason()
+                if payload.get("includeFailed"):
+                    parent.requeue_failed()       # resume AND re-send the rows that failed
                 store = parent
             elif mode == "restart":
                 try:
@@ -426,7 +445,7 @@ async def websocket_migration(ws: WebSocket):
             execution_queue = store.load_queue()
 
         if not store.acquire_lock(lock_owner):
-            await websocket.send_json({"log": "FATAL: This run is already active in another session.", "status": "Failed"})
+            await websocket.send_json({"log": "FATAL: This run is still locked by a previous session (after a crash it frees itself within ~30 seconds). Wait a moment and try again.", "status": "Failed"})
             await websocket.close()
             return
         lock_held = True
@@ -463,8 +482,24 @@ async def websocket_migration(ws: WebSocket):
         source_instance = (source_creds or {}).get("instance_url") or (source_creds or {}).get("api_domain") or (source_creds or {}).get("subdomain")
         target_instance = target_creds.get("instance_url") or target_creds.get("api_domain") or target_creds.get("subdomain")
 
-        # ---------------- org identity, ownership, hand-over ----------------
+        # ---------------- never continue a run against a DIFFERENT org ----------------
+        # (log out, log in to another org, press Resume on the old run id -> without this it would send there)
         run_meta = store.run_meta()
+        if mode in ("resume", "retry_failed", "restart"):
+            mismatch = run_recovery.org_mismatch(run_meta, source_crm, source_creds, target_crm, target_creds)
+            if mismatch:
+                if mode == "resume":
+                    _note_stop(store, "org_mismatch", mismatch)  # lock is released and status restored in `finally`
+                else:
+                    store.abandon()  # discard the child run created for this refused request
+                    store, lock_held = None, False
+                await websocket.send_json({"log": f"FATAL: {mismatch}", "status": "Failed", "errorCode": "ORG_MISMATCH"})
+                await websocket.close()
+                return
+        if mode == "restart":
+            _supersede_parent(user_id, store)
+
+        # ---------------- org identity, ownership, hand-over ----------------
         if mode in ("start", "restart") or not run_meta.get("targetOrg"):
             store.set_run_meta(
                 startedBy={"id": str(user_id), "name": user_name or user_email, "email": user_email},
@@ -472,6 +507,7 @@ async def websocket_migration(ws: WebSocket):
                 sourceOrg=org_key(source_crm, source_creds) if source_creds else None,
                 targetOrg=org_key(target_crm, target_creds),
                 jobTargets=[q.get("targetObject") for q in execution_queue],
+                keyedJobs=[i for i, q in enumerate(execution_queue) if q.get("correlationField")],
             )
         store.add_participant(user_id, user_name or user_email, mode)
 
@@ -537,6 +573,20 @@ async def websocket_migration(ws: WebSocket):
                 if store.is_extracted(job_index):
                     source_records = store.load_extracted(job_index)
                     await send_log(f"[{target_object}] Using {len(source_records)} frozen source record(s) from the checkpoint.")
+                    if store.take_refresh_flag(job_index):
+                        # Retry / edit: parents may have been created since this job was frozen. Re-link references.
+                        async def _remap(rows, _m=mappings):
+                            await IdMappingService.remap_reference_fields(
+                                rows, _m, user_id, source_crm, target_crm,
+                                source_instance=source_instance, target_instance=target_instance, send_log=send_log,
+                            )
+                        try:
+                            relinked = await run_recovery.refresh_references(store, job_index, mappings, source_records, _remap)
+                            if relinked:
+                                await send_log(f"[{target_object}] Re-linked references on {relinked} re-queued record(s) using Ids created since the first attempt.")
+                        except Exception as exc:
+                            logger.exception("Reference refresh failed for run %s job %s", store.run_id, job_index)
+                            await send_log(f"[{target_object}] WARNING: could not refresh reference links ({exc}); sending the saved values.")
                 else:
                     if source_crm == "salesforce" and target_crm == "salesforce":
                         picklist_sync_mappings = [m for m in mappings if m.get("syncPicklistValues")]
@@ -588,12 +638,14 @@ async def websocket_migration(ws: WebSocket):
                         else:
                             source_records = extract_result
 
+                    ref_raw = run_recovery.capture_reference_raw(source_records, mappings)  # BEFORE the remap
                     await IdMappingService.remap_reference_fields(
                         source_records, mappings, user_id, source_crm, target_crm,
                         source_instance=source_instance, target_instance=target_instance, send_log=send_log,
                     )
                     store.set_job_meta(job_index, sessionId=session_id, sourceMode=source_mode, actualQueryUsed=actual_query_used)
                     store.save_extracted(job_index, source_records)  # the freeze point: resume never re-extracts
+                    store.save_ref_raw(job_index, ref_raw)          # lets a retry re-link children to parents created later
 
                 # ---------------- plan passes ----------------
                 options_base = {

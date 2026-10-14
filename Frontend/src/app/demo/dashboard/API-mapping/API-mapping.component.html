@@ -491,6 +491,23 @@
     cursor: pointer;
   }
 
+  /* Recovery panel: when minimized, dock to the bottom-right corner instead of floating mid-screen */
+  .floating-review-panel.recovery-panel.minimized {
+    top: auto !important;
+    left: auto !important;
+    bottom: 24px;
+    right: 24px;
+  }
+
+  /* Shown when the recovery panel is closed but the run still has failed / resumable records */
+  .recovery-reopen-chip {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 1100;
+    border-radius: 999px;
+  }
+
   .floating-review-panel .panel-body {
     overflow-y: auto;
     flex-grow: 1;
@@ -2273,7 +2290,7 @@
 
 <!-- ===================== MIGRATION RECOVERY PANEL (failed records, resume, start over) ===================== -->
 @if (showRecoveryPanel) {
-<div class="floating-review-panel animate__animated animate__fadeInUp" [class.minimized]="recoveryMinimized"
+<div class="floating-review-panel recovery-panel animate__animated animate__fadeInUp" [class.minimized]="recoveryMinimized"
   [class.expanded]="recoveryExpanded" [style.top.px]="recoveryTop" [style.left.px]="recoveryLeft">
 
   <div class="bg-dark text-white p-2 px-3 d-flex justify-content-between align-items-center flex-shrink-0 panel-header"
@@ -2288,24 +2305,30 @@
     </div>
     <div class="d-flex gap-2">
       @if (!recoveryMinimized) {
-      <button class="btn btn-sm btn-link text-white-50 p-0" title="Toggle Fullscreen"
+      <button class="btn btn-sm btn-link text-white-50 p-0 btn-hover-lift" title="Toggle Fullscreen"
         (click)="recoveryExpanded = !recoveryExpanded; $event.stopPropagation()">
         <i class="feather fs-5" [ngClass]="recoveryExpanded ? 'icon-minimize' : 'icon-maximize'"></i>
       </button>
-      <button class="btn btn-sm btn-link text-white-50 p-0" title="Minimize"
-        (click)="recoveryMinimized = true; recoveryExpanded = false; $event.stopPropagation()">
+      <button class="btn btn-sm btn-link text-white-50 p-0 btn-hover-lift" title="Minimize"
+        (click)="minimizeRecoveryPanel(); $event.stopPropagation()">
         <i class="feather icon-minus fs-5"></i>
       </button>
+      <button
+        class="btn btn-sm btn-link p-0 btn-hover-lift panel-close-btn rounded-circle d-flex align-items-center justify-content-center"
+        style="width: 22px; height: 22px;" (click)="cancelRecoveryPanel(); $event.stopPropagation()" title="Close">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+      </button>
       } @else {
-      <button class="btn btn-sm btn-link text-white-50 p-0" title="Restore"
-        (click)="recoveryMinimized = false; $event.stopPropagation()">
+      <button class="btn btn-sm btn-link text-white-50 p-0 btn-hover-lift" title="Restore"
+        (click)="restoreRecoveryPanel(); $event.stopPropagation()">
         <i class="feather icon-maximize-2 fs-5"></i>
       </button>
-      }
-      <button class="btn btn-sm btn-link text-white-50 p-0" title="Close"
-        (click)="showRecoveryPanel = false; $event.stopPropagation()">
-        <i class="feather icon-x fs-5"></i>
+      <button
+        class="btn btn-sm btn-link p-0 btn-hover-lift panel-close-btn rounded-circle d-flex align-items-center justify-content-center"
+        style="width: 22px; height: 22px;" (click)="cancelRecoveryPanel(); $event.stopPropagation()" title="Close">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
       </button>
+      }
     </div>
   </div>
 
@@ -2353,7 +2376,16 @@
     }
     @if (activeRun.status === 'running') {
     <div class="alert alert-warning py-1 px-2 mt-2 mb-0 small">
-      This run is active in another session. You can view it, but editing and resuming are disabled until it stops.
+      This run is active in another session, so editing and resuming are disabled for now.
+      @if (activeRun.lockRemainingSec > 0) {
+      If that session crashed, this frees itself in about <b>{{ activeRun.lockRemainingSec }}s</b> and Resume will appear.
+      }
+    </div>
+    }
+    @if (activeRun.insertAtRiskRows > 0 && activeRun.status !== 'running') {
+    <div class="alert alert-danger py-1 px-2 mt-2 mb-0 small">
+      <b>{{ activeRun.insertAtRiskRows }}</b> insert row(s) were mid-send when the run stopped and can't be verified in the target.
+      Resuming sends them again and may create duplicates for those rows.
     </div>
     }
 
@@ -2366,9 +2398,14 @@
 
     <div class="d-flex flex-wrap gap-2 mt-3">
       @if (activeRun.resumable) {
-      <button class="btn btn-sm btn-primary fw-bold" (click)="resumeFromPanel()" [disabled]="isGlobalLoading || isSavingEdits">
+      <button class="btn btn-sm btn-primary fw-bold" (click)="resumeFromPanel(false)" [disabled]="isGlobalLoading || isSavingEdits">
         <i class="feather icon-play"></i> Resume from where it stopped
       </button>
+      @if ((activeRun.counts?.error || 0) > 0) {
+      <button class="btn btn-sm btn-primary fw-bold" (click)="resumeFromPanel(true)" [disabled]="isGlobalLoading || isSavingEdits">
+        <i class="feather icon-refresh-cw"></i> Resume + retry {{ activeRun.counts?.error }} failed
+      </button>
+      }
       }
       @if (activeRun.retryable) {
       <button class="btn btn-sm btn-primary fw-bold" (click)="retryFromPanel()" [disabled]="isGlobalLoading || isSavingEdits">
@@ -2466,11 +2503,22 @@
 
   <div class="bg-light border-top p-2 px-3 d-flex justify-content-between align-items-center flex-shrink-0 small">
     <span>Page {{ failurePage + 1 }} of {{ failurePageCount }}</span>
-    <div class="btn-group btn-group-sm">
-      <button class="btn btn-outline-secondary" [disabled]="failurePage === 0" (click)="changeFailurePage(-1)">Previous</button>
-      <button class="btn btn-outline-secondary" [disabled]="failurePage + 1 >= failurePageCount" (click)="changeFailurePage(1)">Next</button>
+    <div class="d-flex align-items-center gap-2">
+      <div class="btn-group btn-group-sm">
+        <button class="btn btn-outline-secondary" [disabled]="failurePage === 0" (click)="changeFailurePage(-1)">Previous</button>
+        <button class="btn btn-outline-secondary" [disabled]="failurePage + 1 >= failurePageCount" (click)="changeFailurePage(1)">Next</button>
+      </div>
     </div>
   </div>
   }
 </div>
+}
+
+<!-- Reopen chip: the recovery panel was closed but the run still has failed / resumable records -->
+@if (canReopenRecovery) {
+<button class="btn btn-danger shadow recovery-reopen-chip d-flex align-items-center gap-2" (click)="reopenRecoveryPanel()"
+  title="Reopen the Migration Recovery panel">
+  <i class="feather icon-alert-triangle"></i> Recovery
+  @if (retryCount > 0) { <span class="badge bg-light text-danger">{{ retryCount }}</span> }
+</button>
 }

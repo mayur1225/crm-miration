@@ -3268,12 +3268,13 @@ onReviewPanelDragEnd(): void {
     });
   }
 
-  resumeMigration(): void {
+  resumeMigration(includeFailed = false): void {
     if (!this.currentRunId || this.isGlobalLoading) return;
     this.isGlobalLoading = true;
     this.jobStatus = 'Running';
     this.openMigrationSocket({
       mode: 'resume',
+      includeFailed,
       runId: this.currentRunId,
       authToken: localStorage.getItem('supabase_token') || ''
     });
@@ -3354,7 +3355,9 @@ onReviewPanelDragEnd(): void {
         this.handleSessionExpired(getExpiredSidesFromError({ error: body }));
       }
       const detail = body?.detail;
-      throw new Error(typeof detail === 'string' ? detail : detail?.message || `Request failed (${response.status})`);
+      const err: any = new Error(typeof detail === 'string' ? detail : detail?.message || `Request failed (${response.status})`);
+      err.status = response.status;
+      throw err;
     }
     return body as T;
   }
@@ -3388,6 +3391,7 @@ onReviewPanelDragEnd(): void {
     try {
       const detail = await this.runApi(`/api/runs/${encodeURIComponent(runId)}`);
       this.activeRun = detail;
+      this.scheduleLockRefresh();
       this.runJobs = detail.jobColumns || [];
       this.currentRunId = detail.runId;
       this.canResume = !!detail.resumable;
@@ -3402,10 +3406,31 @@ onReviewPanelDragEnd(): void {
       this.recoveryMinimized = false;
       await this.loadFailures();
     } catch (e: any) {
-      this.toastr.error(e?.message || 'Could not load the run.', 'Recovery');
+      if (e?.status === 404) {
+        this.handleStaleRun(runId);
+      } else {
+        this.toastr.error(e?.message || 'Could not load the run.', 'Recovery');
+      }
     } finally {
       this.cdr.detectChanges();
     }
+  }
+
+  /** The server no longer has this run (cleaned up, other folder, other account): stop offering Retry/Resume for it. */
+  private handleStaleRun(runId?: string): void {
+    this.forgetRun();
+    if (!runId || this.currentRunId === runId) {
+      this.currentRunId = null;
+      this.canResume = false;
+      this.canRetryFailed = false;
+    }
+    this.activeRun = null;
+    this.showRecoveryPanel = false;
+    this.recoverableRuns = this.recoverableRuns.filter((r) => r.runId !== runId);
+    this.toastr.warning(
+      'That run is no longer available on the server, so it cannot be retried or resumed. Start a new migration.',
+      'Run not found'
+    );
   }
 
   async loadFailures(): Promise<void> {
@@ -3438,6 +3463,7 @@ onReviewPanelDragEnd(): void {
     this.canResume = !!detail.resumable;
     this.canRetryFailed = !!detail.retryable;
     this.retryCount = detail.counts?.error || 0;
+    this.scheduleLockRefresh();
   }
 
   onFailureSearchChange(value: string): void {
@@ -3546,14 +3572,26 @@ onReviewPanelDragEnd(): void {
     }
   }
 
-  async resumeFromPanel(): Promise<void> {
+  async resumeFromPanel(includeFailed = false): Promise<void> {
     if (!this.activeRun) return;
+    const atRisk = this.activeRun.insertAtRiskRows || 0;
+    if (atRisk > 0) {
+      const ok = await Swal.fire({
+        title: 'Some rows may already exist',
+        html: `<b>${atRisk}</b> record(s) were being inserted when the run stopped, and there is no key to check whether the target already received them. Resuming sends them again, so <b>duplicates are possible</b> for those rows. Check the target first if that matters.`,
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Resume anyway',
+        customClass: { popup: 'rounded-4 shadow-lg border-0' }
+      });
+      if (!ok.isConfirmed) return;
+    }
     if (this.dirtyRowCount) await this.saveRunEdits(true);
     this.showRecoveryPanel = false;
     this.currentRunId = this.activeRun.runId;
     this.globalLoadingText = 'Resuming migration...';
     this.globalLoadingSubText = 'Continuing from the last saved checkpoint.';
-    this.resumeMigration();
+    this.resumeMigration(includeFailed);
   }
 
   async retryFromPanel(): Promise<void> {
@@ -3600,8 +3638,80 @@ onReviewPanelDragEnd(): void {
       case 'quota': return 'CRM API limit reached';
       case 'crm_unavailable': return 'CRM stopped responding';
       case 'session_expired': return 'CRM login expired';
+      case 'org_mismatch': return 'Connected to a different org';
       case 'error': return 'Unexpected error';
       default: return 'Stopped';
+    }
+  }
+
+  private lockRefreshTimer: any = null;
+
+  /**
+   * After a backend crash the dead session's lock lapses on its own (~30s). Re-check the run when it does, so
+   * Resume appears without the user having to reload. A genuinely live run is re-checked the same way.
+   */
+  private scheduleLockRefresh(): void {
+    clearTimeout(this.lockRefreshTimer);
+    const wait = this.activeRun?.lockRemainingSec || 0;
+    if (this.showRecoveryPanel && this.activeRun?.status === 'running' && wait > 0) {
+      this.lockRefreshTimer = setTimeout(async () => {
+        try {
+          await this.refreshActiveRun();
+        } catch {
+          /* ignore: the next user action reloads */
+        }
+        this.cdr.detectChanges();
+      }, (wait + 1) * 1000);
+    }
+  }
+
+  /** True when the panel is closed but the current run still has something to resume / retry. */
+  get canReopenRecovery(): boolean {
+    return !this.showRecoveryPanel && !this.isGlobalLoading && !!this.currentRunId && (this.canResume || this.canRetryFailed);
+  }
+
+  minimizeRecoveryPanel(): void {
+    this.recoveryMinimized = true;
+    this.recoveryExpanded = false;
+  }
+
+  restoreRecoveryPanel(): void {
+    this.recoveryMinimized = false;
+  }
+
+  /** Dismiss the panel. Unsaved cell edits are discarded, so ask first when there are any. */
+  async cancelRecoveryPanel(): Promise<void> {
+    const dirty = this.dirtyRowCount;
+    if (dirty > 0) {
+      const confirm = await Swal.fire({
+        title: 'Discard unsaved edits?',
+        html: `<b>${dirty}</b> edited record(s) have not been saved. Closing the panel discards those edits.`,
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Discard and close',
+        cancelButtonText: 'Keep editing',
+        confirmButtonColor: '#dc3545',
+        customClass: { popup: 'rounded-4 shadow-lg border-0' }
+      });
+      if (!confirm.isConfirmed) return;
+    }
+    clearTimeout(this.failureSearchTimer);
+    this.showRecoveryPanel = false;
+    this.recoveryMinimized = false;
+    this.recoveryExpanded = false;
+    this.cdr.detectChanges();
+  }
+
+  /** Always reloads from the server so counts and failed rows are current after a retry / resume. */
+  async reopenRecoveryPanel(): Promise<void> {
+    if (this.currentRunId) await this.openRunRecovery(this.currentRunId);
+  }
+
+  @HostListener('document:keydown.escape')
+  onRecoveryEscape(): void {
+    if (this.showRecoveryPanel && !this.recoveryMinimized && !Swal.isVisible()) {
+      this.minimizeRecoveryPanel();
+      this.cdr.detectChanges();
     }
   }
 
@@ -3612,7 +3722,7 @@ onReviewPanelDragEnd(): void {
   }
 
   startRecoveryPanelDrag(event: MouseEvent): void {
-    if (this.recoveryExpanded) return;
+    if (this.recoveryExpanded || this.recoveryMinimized) return;
     if ((event.target as HTMLElement).closest('button')) return;
     const panelEl = (event.currentTarget as HTMLElement).closest('.floating-review-panel') as HTMLElement;
     if (!panelEl) return;
@@ -4183,6 +4293,22 @@ onReviewPanelDragEnd(): void {
 
         if (data.log) {
           this.logMessages = [...this.logMessages, data.log];
+        }
+
+        if (data.errorCode === 'ORG_MISMATCH') {
+          this.isGlobalLoading = false;
+          Swal.fire({
+            title: 'Different org connected',
+            text: data.log,
+            icon: 'error',
+            confirmButtonColor: '#0d6efd',
+            customClass: { popup: 'rounded-4 shadow-lg border-0' }
+          });
+        }
+
+        if (data.status === 'Failed' && /Run not found/i.test(data.log || '')) {
+          this.isGlobalLoading = false;
+          this.handleStaleRun(this.currentRunId || undefined);
         }
 
         if (data.status === 'AwaitingFileMigrationApproval' && data.fileMigrationBudget) {

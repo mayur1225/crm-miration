@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-BASE_RUNS_DIR = os.path.join(os.getcwd(), "SureShift_staging_databases", "runs")
+# Absolute path; set SURESHIFT_RUNS_DIR so a restart from another working directory still finds old runs.
+BASE_RUNS_DIR = os.path.abspath(os.environ.get("SURESHIFT_RUNS_DIR") or os.path.join(os.getcwd(), "SureShift_staging_databases", "runs"))
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _STRIPPED_REQUEST_KEYS = {"authToken", "sourceRecords"}
 RESULT_STATES = ("success", "error", "skipped")
@@ -43,6 +44,10 @@ CREATE INDEX IF NOT EXISTS idx_row_state_key ON row_state (job_idx, source_key);
 CREATE TABLE IF NOT EXISTS pending_revert (
     job_idx INTEGER NOT NULL, pass_no INTEGER NOT NULL, target_id TEXT NOT NULL,
     PRIMARY KEY (job_idx, pass_no, target_id)
+);
+CREATE TABLE IF NOT EXISTS ref_raw (
+    job_idx INTEGER NOT NULL, row_idx INTEGER NOT NULL, raw_json TEXT NOT NULL,
+    PRIMARY KEY (job_idx, row_idx)
 );
 CREATE TABLE IF NOT EXISTS row_edit (
     id INTEGER PRIMARY KEY AUTOINCREMENT, job_idx INTEGER NOT NULL, row_idx INTEGER NOT NULL,
@@ -262,6 +267,9 @@ class RunStore:
             "jobTargets": meta.get("jobTargets") or [],
             "position": self.position() if status != "completed" else None,
             "stopReason": self.get_stop_reason() if stopped else None,
+            "inFlight": counts.get("in_flight", 0),
+            "insertAtRiskRows": self.insert_at_risk_rows() if stopped or status == "running" else 0,
+            "lockRemainingSec": self.lock_remaining_sec() if row["status"] == "running" else 0,
         }
 
     def counts(self) -> Dict[str, int]:
@@ -541,6 +549,7 @@ class RunStore:
             c.execute("DELETE FROM kv WHERE key IN ('cancel','stop_reason')")
             for r in c.execute("SELECT DISTINCT job_idx FROM row_state WHERE state='pending'").fetchall():
                 c.execute("DELETE FROM kv WHERE key IN (?, ?)", (f"done:{r['job_idx']}", f"files_done:{r['job_idx']}"))
+                c.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, '1')", (f"refresh_refs:{r['job_idx']}",))
         return child
 
     # ------------------------------------------------------------------ org identity / ownership / stop reason
@@ -710,6 +719,7 @@ class RunStore:
 
             for job_idx in touched_jobs:  # a finished job must be re-entered to send its re-queued rows
                 c.execute("DELETE FROM kv WHERE key IN (?, ?)", (f"done:{job_idx}", f"files_done:{job_idx}"))
+                c.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, '1')", (f"refresh_refs:{job_idx}",))
 
         return {"rowsChanged": changed_rows, "rowsRequeued": requeued, "rowsUnblocked": unblocked, "jobs": sorted(touched_jobs)}
 
@@ -726,7 +736,7 @@ class RunStore:
         """
         New run with the same request + queue + CSV payload and NO progress: it re-extracts and re-sends
         everything. In insert mode that duplicates records the old run already created, so that case needs
-        an explicit acknowledgement. The old run is marked 'superseded' so it can't be resumed in parallel.
+        an explicit acknowledgement. The caller marks the old run 'superseded' afterwards so it can't be resumed in parallel.
         """
         if self.effective_status() in ("running", "superseded"):
             raise ValueError(f"A {self.effective_status()} run cannot be restarted.")
@@ -747,6 +757,84 @@ class RunStore:
             )
             for kv in self._conn.execute("SELECT key, value FROM kv WHERE key LIKE 'csv:%' OR key='run_meta'").fetchall():
                 c.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", (kv["key"], kv["value"]))
-        if self.status() != "completed":
-            self.set_status("superseded")
-        return child
+        return child  # the caller marks the parent 'superseded' once it has passed its safety checks
+
+    def requeue_failed(self) -> int:
+        """Put failed rows (and rows blocked by a failed parent) back to pending IN THIS run, so Resume retries them too."""
+        now = time.time()
+        with self._tx() as c:
+            jobs = [r["job_idx"] for r in c.execute(
+                "SELECT DISTINCT job_idx FROM row_state WHERE state='error' OR (state='skipped' AND skip_reason LIKE 'parent_failed%')").fetchall()]
+            cur = c.execute(
+                "UPDATE row_state SET state='pending', error=NULL, skip_reason=NULL, attempts=0, updated_at=? "
+                "WHERE state='error' OR (state='skipped' AND skip_reason LIKE 'parent_failed%')", (now,))
+            for j in jobs:
+                c.execute("DELETE FROM kv WHERE key IN (?, ?)", (f"done:{j}", f"files_done:{j}"))
+                c.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, '1')", (f"refresh_refs:{j}",))
+            return cur.rowcount
+
+    # ------------------------------------------------------------------ dependency-aware retry support
+    def save_ref_raw(self, job_idx: int, raw: Dict[int, Dict[str, Any]]) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM ref_raw WHERE job_idx=?", (job_idx,))
+            c.executemany("INSERT INTO ref_raw (job_idx, row_idx, raw_json) VALUES (?, ?, ?)",
+                          [(job_idx, i, _dumps(v)) for i, v in raw.items()])
+
+    def load_ref_raw(self, job_idx: int) -> Dict[int, Dict[str, Any]]:
+        rows = self._conn.execute("SELECT row_idx, raw_json FROM ref_raw WHERE job_idx=?", (job_idx,)).fetchall()
+        return {r["row_idx"]: json.loads(r["raw_json"]) for r in rows}
+
+    def pending_row_idxs(self, job_idx: int) -> List[int]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT row_idx FROM row_state WHERE job_idx=? AND state='pending' ORDER BY row_idx", (job_idx,)).fetchall()
+        return [r["row_idx"] for r in rows]
+
+    def edited_fields(self, job_idx: int) -> Dict[int, set]:
+        out: Dict[int, set] = {}
+        for r in self._conn.execute("SELECT row_idx, field FROM row_edit WHERE job_idx=?", (job_idx,)).fetchall():
+            out.setdefault(r["row_idx"], set()).add(r["field"])
+        return out
+
+    def update_extracted_rows(self, job_idx: int, rows: Dict[int, Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        with self._tx() as c:
+            c.executemany("UPDATE extracted SET source_json=? WHERE job_idx=? AND row_idx=?",
+                          [(_dumps(rec), job_idx, i) for i, rec in rows.items()])
+
+    def take_refresh_flag(self, job_idx: int) -> bool:
+        """True once after a retry / requeue / edit: this job's pending rows need their references re-mapped."""
+        if self.get_kv(f"refresh_refs:{job_idx}") != "1":
+            return False
+        self.delete_kv(f"refresh_refs:{job_idx}")
+        return True
+
+    # ------------------------------------------------------------------ crash diagnostics shown in the panel
+    def insert_at_risk_rows(self) -> int:
+        """
+        Insert rows that were mid-send when the run stopped AND cannot be reconciled: no Bulk job id was
+        recorded and the job has no correlation key, so a resume cannot tell whether they already exist.
+        """
+        keyed = set(self.run_meta().get("keyedJobs") or [])
+        rows = self._conn.execute(
+            "SELECT r.job_idx AS job_idx, COUNT(*) AS n FROM row_state r JOIN job j "
+            "ON j.job_idx=r.job_idx AND j.pass_no=r.pass_no "
+            "WHERE r.state='in_flight' AND j.op_mode='insert' AND j.bulk_job_id IS NULL GROUP BY r.job_idx"
+        ).fetchall()
+        return sum(r["n"] for r in rows if r["job_idx"] not in keyed)
+
+    def lock_remaining_sec(self) -> int:
+        row = self._run_row()
+        if not row["lock_owner"]:
+            return 0
+        return max(0, int((row["lock_expires_at"] or 0) - time.time()))
+
+    def abandon(self) -> None:
+        """Delete this run's files (a child run created for a resume/retry that was refused)."""
+        path = self.path
+        self.close()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass

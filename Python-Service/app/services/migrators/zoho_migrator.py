@@ -1,6 +1,7 @@
 import re
 import asyncio
 from app.services.crm_service import CrmService
+from app.services.resilience.retry import ApiQuotaExhausted, CircuitOpen
 from app.services.time_filter_service import (
     merge_time_clause,
     build_zoho_time_clause,
@@ -8,6 +9,9 @@ from app.services.time_filter_service import (
 )
 from app.services.query_field_utils import ensure_fields_selected
 from app.services.coql_query_builder import build_coql, extract_user_limit, COQL_PAGE_SIZE
+
+MAX_RATE_LIMIT_PAUSES = 10  # x 30s = ~5 minutes before the run is paused for a later resume
+
 
 def chunk_dataset(data: list, chunk_size: int = 100):
     for i in range(0, len(data), chunk_size):
@@ -147,6 +151,7 @@ class ZohoMigrator:
                 if wire_op_mode == "upsert" and options.get("targetExtIdField"):
                    req_payload["duplicate_check_fields"] = [options["targetExtIdField"]]
 
+                rate_limit_hits = 0
                 while True:
                     if http_method == "PUT":
                         res = await client.put(api_path, json=req_payload, headers=headers)
@@ -160,7 +165,11 @@ class ZohoMigrator:
                         continue 
                         
                     if res.status_code == 429:
-                        await send_log(" ⏳ Zoho API Rate Limit reached during upload. Pausing 30s...")
+                        rate_limit_hits += 1
+                        if rate_limit_hits > MAX_RATE_LIMIT_PAUSES:
+                            # Stop pausing forever: checkpoint the run so it can be resumed once Zoho's limit resets.
+                            raise ApiQuotaExhausted(f"Zoho API rate limit still active after {MAX_RATE_LIMIT_PAUSES} pauses.")
+                        await send_log(f" ⏳ Zoho API Rate Limit reached during upload. Pausing 30s ({rate_limit_hits}/{MAX_RATE_LIMIT_PAUSES})...")
                         await asyncio.sleep(30)
                         continue
                         
@@ -218,6 +227,8 @@ class ZohoMigrator:
                         all_error_data.append(orig_record)
                         total_error += 1
                         
+            except (ApiQuotaExhausted, CircuitOpen):
+                raise  # a stop signal for the run, not a per-row failure: let the runner checkpoint and pause
             except Exception as exc:
                 for item in chunk:
                     orig_record = source_records[item["originalIndex"]]

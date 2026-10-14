@@ -29,7 +29,8 @@ _idempotent_post: contextvars.ContextVar[bool] = contextvars.ContextVar("idempot
 def idempotent_posts(enabled: bool = True) -> Iterator[None]:
     """
     Within this block POSTs may be retried after ambiguous failures (read timeout, 502, 504).
-    Enable only for upsert/update/delete traffic; never for plain inserts.
+    Enable only for upsert/delete traffic; never for plain inserts, and never for UPDATE mode (it is sent as an upsert
+    and the CRM-created record of an unmatched row is reverted afterwards: a replayed POST would hide that record).
     """
     token = _idempotent_post.set(enabled)
     try:

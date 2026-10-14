@@ -138,6 +138,14 @@ class SalesforceMigrator:
         if resume_job_id and len(chunks) == 1:
             list_res = await client.get(f"{bulk_base_url}/job/{resume_job_id}/batch", headers=sf_headers)
             existing = [b.get("id") for b in list_res.json().get("batchInfo", [])] if list_res.status_code == 200 else []
+            if list_res.status_code != 200 and op_mode == "insert":
+                # Bulk jobs are visible only to the Salesforce user who created them (and expire). If we cannot read it we
+                # cannot tell which rows it created; re-sending an INSERT would duplicate them.
+                raise Exception(
+                    f"Cannot read the interrupted Salesforce Bulk job {resume_job_id} (HTTP {list_res.status_code}; it was created by "
+                    f"another Salesforce user or has expired). Its rows may already exist in Salesforce, so they were NOT re-sent. "
+                    f"Check Setup > Bulk Data Load Jobs, then use Retry failed if they are missing."
+                )
             if len(existing) == 1:
                 job_id, batch_ids = resume_job_id, existing
                 await send_log(f"[{target_object}] {pass_name}: resuming Salesforce Bulk job {job_id} from the interrupted run...")

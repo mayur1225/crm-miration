@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies.auth import get_current_user
 from app.services.run_access import RunAccess
-from app.services.store import RunForbidden, RunNotFound, RunStore
+from app.services.store import BASE_RUNS_DIR, RunForbidden, RunNotFound, RunStore
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -16,8 +16,14 @@ def _open_run(user_id: str, run_id: str) -> RunStore:
     """Owner, or a colleague connected to the same org(s). 404 for everything else: don't reveal run ids."""
     try:
         return RunAccess.open(user_id, run_id)
-    except (RunNotFound, RunForbidden, ValueError):
-        raise HTTPException(status_code=404, detail="Run not found.")
+    except RunNotFound:
+        logger.warning("[RUNS] %s not found for user %s (looked under %s) - file missing, deleted by cleanup, or server started from another folder.",
+                       run_id, user_id, BASE_RUNS_DIR)
+    except RunForbidden:
+        logger.warning("[RUNS] %s exists but user %s is not its owner and is not connected to the same org(s).", run_id, user_id)
+    except ValueError:
+        logger.warning("[RUNS] invalid run id %r", run_id)
+    raise HTTPException(status_code=404, detail={"code": "RUN_NOT_FOUND", "message": "This run is no longer available."})
 
 
 def _editor(user) -> str:

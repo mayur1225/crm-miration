@@ -22,6 +22,8 @@ TRANSIENT_ROW_RE = re.compile(
     r"UNABLE_TO_LOCK_ROW|ROW_LOCK|lock wait|concurrent|timed? ?out|temporar|try again|too many requests|rate limit",
     re.I,
 )
+# DELETE is replayed after a crash: a row the interrupted attempt already deleted is done, not an error.
+ALREADY_GONE_RE = re.compile(r"ENTITY_IS_DELETED|entity is deleted|already (been )?deleted|NOT_FOUND|record not found|no record found", re.I)
 _PROPAGATE = (ApiQuotaExhausted, CircuitOpen, WebSocketDisconnect, asyncio.CancelledError)
 
 
@@ -274,7 +276,7 @@ class ResumableRunner:
         if bulk and bulk[1] == sorted(idxs):
             options["resumeBulkJobId"] = bulk[0]
 
-        with idempotent_posts(spec.op_mode != "insert"):
+        with idempotent_posts(spec.op_mode in ("upsert", "delete")):
             raw = await spec.migrator.upload(self.client, items, spec.op_mode, spec.pass_name, options, self.send_log)
 
         if len(raw) == 6:
@@ -302,6 +304,10 @@ class ResumableRunner:
                 results[idx] = RowResult(idx, "error", error=rec.get("Target_Error") or "API rejected this record.")
         for idx in idxs:
             results.setdefault(idx, RowResult(idx, "error", error="Target returned no result for this row."))
+        if spec.op_mode == "delete":
+            for idx, res in list(results.items()):
+                if res.state == "error" and ALREADY_GONE_RE.search(res.error or ""):
+                    results[idx] = RowResult(idx, "skipped", skip_reason="Already deleted in the target (likely by an interrupted earlier attempt).")
         return [results[i] for i in idxs]
 
     def _pass_counts(self, spec: PassSpec) -> Dict[str, int]:
