@@ -371,8 +371,6 @@ get fileMigrationNotes(): string[] {
 
   this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
 
-  // Show the loader on the very first change-detection pass, then run session
-  // verification and schema preload concurrently instead of sequentially.
   this.showSchemaLoader();
   this.verifyCrmSessions(() => this.fetchRecoverableSessions());
   this.preloadEntirePage();
@@ -560,21 +558,107 @@ private showSchemaLoader(): void {
     }
   }
 
-  private parseSqlStyleSelectedFields(query: string): string[] | null {
-    const queryLower = query.toLowerCase();
-    if (!queryLower.startsWith('select ')) return null;
+  private normalizeSql(query: string): string {
+    return (query || '').replace(/\s+/g, ' ').trim();
+  }
 
-    const fromIdx = queryLower.indexOf(' from ');
+  private splitTopLevel(input: string, delimiter: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let inString = false;
+    let current = '';
+
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+
+      if (inString) {
+        current += ch;
+        if (ch === '\\' && i + 1 < input.length) {
+          current += input[++i];
+        } else if (ch === "'") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === "'") {
+        inString = true;
+      } else if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
+        depth = Math.max(0, depth - 1);
+      } else if (ch === delimiter && depth === 0) {
+        parts.push(current);
+        current = '';
+        continue;
+      }
+      current += ch;
+    }
+
+    parts.push(current);
+    return parts;
+  }
+
+  /** Index of the top-level FROM keyword (ignores FROM inside sub-selects / string literals), or -1. */
+  private findTopLevelFrom(sql: string, searchFrom: number): number {
+    let depth = 0;
+    let inString = false;
+
+    for (let i = searchFrom; i < sql.length; i++) {
+      const ch = sql[i];
+
+      if (inString) {
+        if (ch === '\\') i++;
+        else if (ch === "'") inString = false;
+        continue;
+      }
+
+      if (ch === "'") inString = true;
+      else if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && /^from(\s|$)/i.test(sql.slice(i, i + 5)) && (i === 0 || /[\s)]/.test(sql[i - 1]))) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private parseSqlStyleSelectedFields(query: string): string[] | null {
+    const sql = this.normalizeSql(query);
+
+    const selectMatch = /^select\s+/i.exec(sql);
+    if (!selectMatch) return null;
+
+    const selectStart = selectMatch[0].length;
+    const fromIdx = this.findTopLevelFrom(sql, selectStart);
     if (fromIdx === -1) return null;
 
-    const selectClause = query.substring(7, fromIdx).trim();
-    if (selectClause === '*') return null;
+    const selectClause = sql.substring(selectStart, fromIdx).trim();
+    if (!selectClause) return null;
 
-    const fields = selectClause
-      .split(',')
-      .map((f) => f.trim())
-      .filter((f) => f.length > 0)
-      .map((f) => f.split('.')[0]);
+    const seen = new Set<string>();
+    const fields: string[] = [];
+
+    for (const rawItem of this.splitTopLevel(selectClause, ',')) {
+      const item = rawItem.trim();
+      if (!item) continue;
+
+      // SELECT * / FIELDS(ALL|STANDARD|CUSTOM) => every field, so no narrowing.
+      if (item === '*' || /^fields\s*\(/i.test(item)) return null;
+
+      // Child-relationship sub-select, e.g. (SELECT Id FROM Contacts) -- not a field of this object.
+      if (item.startsWith('(')) continue;
+
+      // Unwrap single-argument functions: toLabel(Status), FORMAT(Amount), convertCurrency(Amount)
+      const fnMatch = /^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*([A-Za-z0-9_.]+)\s*\)/.exec(item);
+      const expression = fnMatch ? fnMatch[1] : item.split(/\s+/)[0];
+
+      const root = expression.split('.')[0].trim();
+      if (!root || seen.has(root.toLowerCase())) continue;
+
+      seen.add(root.toLowerCase());
+      fields.push(root);
+    }
 
     return fields.length > 0 ? fields : null;
   }
@@ -838,6 +922,10 @@ get isEligibleForTimeFilter(): boolean {
     }
 
     return filtered;
+  }
+
+  get showMigrationFilter(): boolean {
+    return this.isEligibleForTimeFilter && (!this.restrictMappingToQueryFields || this.getQuerySelectedFields() === null);
   }
 
   get isQueryFieldFilterActive(): boolean {
@@ -2276,26 +2364,29 @@ onReviewPanelDragEnd(): void {
     //  SALESFORCE & ZOHO SQL VALIDATION
     // ==========================================
     else if (crm === 'salesforce' || crm === 'zoho') {
+      // Multi-line pasted queries ("SELECT\n Id,\n Name\nFROM Account") must validate like single-line ones.
+      const sqlLower = this.normalizeSql(this.customQuery).toLowerCase();
+
       if (this.customQuery.includes('"')) {
         return applySquiggle('Salesforce strictly requires single quotes (\') for text values. Do not use double quotes (").', '"');
       }
 
-      if (queryLower.includes('order by ')) {
+      if (/\border by\b/.test(sqlLower)) {
         return applySquiggle('Do not use ORDER BY.', 'order by');
-      } else if (queryLower.endsWith(';')) {
+      } else if (sqlLower.endsWith(';')) {
         return applySquiggle('Do not end your query with a semicolon (;).', ';');
       }
 
-      const hasSelect = queryLower.startsWith('select ');
-      const hasWhere = queryLower.includes(' where ');
+      const hasSelect = sqlLower.startsWith('select ');
+      const hasWhere = sqlLower.includes(' where ');
       let conditionPart = '';
 
       if (hasSelect) {
         if (hasWhere) {
-          conditionPart = queryLower.split(' where ')[1];
+          conditionPart = sqlLower.split(' where ')[1];
         }
       } else {
-        conditionPart = queryLower;
+        conditionPart = sqlLower;
       }
 
       if (conditionPart.trim() !== '') {
@@ -2310,8 +2401,8 @@ onReviewPanelDragEnd(): void {
         }
       }
 
-      if (hasSelect && queryLower.includes(' from ')) {
-        const fromParts = queryLower.split(' from ');
+      if (hasSelect && sqlLower.includes(' from ')) {
+        const fromParts = sqlLower.split(' from ');
         const objPart = fromParts[1].trim().split(' ')[0];
         if (objPart && objPart.toLowerCase() !== this.selectedSourceObject.toLowerCase()) {
           return applySquiggle(
@@ -2321,11 +2412,6 @@ onReviewPanelDragEnd(): void {
         }
       }
 
-      // Deep Field & Type Validation
-      // Group 1: field (or dotted relationship path). Group 2: operator. Group 3: exactly ONE value token
-      // (a quoted literal, or an unquoted token that stops at whitespace/parens/commas), so trailing
-      // clauses like "0 and Type" can never be swallowed into the value.
-      // Word operators (like / is [not]) require leading whitespace so "Dislike" isn't parsed as "Dis" + "like".
       const sqlRegex = /\b([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*)(?:\s*(?:<>|!=|<=|>=|=|<|>)|\s+(?:like|is(?:\s+not)?))\s*('(?:[^'\\]|\\.)*'|[^\s()',]+)/gi;
       const reservedWords = new Set(['select', 'from', 'where', 'and', 'or', 'null', 'is', 'like', 'not']);
       const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent']);
