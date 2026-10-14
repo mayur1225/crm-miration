@@ -3299,39 +3299,340 @@ onReviewPanelDragEnd(): void {
     localStorage.removeItem(ApiMappingComponent.LAST_RUN_KEY);
   }
 
-  /** After a refresh / login redirect: offer Resume or Retry for the last run if the server says it is still actionable. */
+  // ======================================================================================
+  // RUN RECOVERY: failed-record panel, resume / retry / start over, hand-over between users
+  // ======================================================================================
+  showRecoveryPanel = false;
+  recoveryMinimized = false;
+  recoveryExpanded = false;
+  recoveryTop = 80;
+  recoveryLeft = 120;
+  readonly recoveryDefaultWidth = 1100;
+  readonly recoveryDefaultHeight = 700;
+  private recoveryDragging = false;
+  private recoveryDragOffset = { x: 0, y: 0 };
+
+  recoverableRuns: any[] = [];
+  activeRun: any = null;
+  runJobs: any[] = [];
+  failureRows: any[] = [];
+  failureGroups: any[] = [];
+  failureTotal = 0;
+  failurePage = 0;
+  readonly failurePageSize = 25;
+  failureSearch = '';
+  failureJobIdx: number | null = null;
+  isLoadingFailures = false;
+  isSavingEdits = false;
+  private failureSearchTimer: any = null;
+
+  get activeColumns(): any[] {
+    const job = this.runJobs.find((j) => j.jobIdx === this.failureJobIdx) || this.runJobs[0];
+    return job?.columns || [];
+  }
+
+  get dirtyRowCount(): number {
+    return this.failureRows.filter((r) => r._dirty).length;
+  }
+
+  get failurePageCount(): number {
+    return Math.max(1, Math.ceil(this.failureTotal / this.failurePageSize));
+  }
+
+  private async runApi<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+    const response = await fetch(`${environment.apiUrl}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}`,
+        ...((init.headers as Record<string, string>) || {})
+      }
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (isAuthExpiredError({ status: response.status, error: body })) {
+        this.handleSessionExpired(getExpiredSidesFromError({ error: body }));
+      }
+      const detail = body?.detail;
+      throw new Error(typeof detail === 'string' ? detail : detail?.message || `Request failed (${response.status})`);
+    }
+    return body as T;
+  }
+
+  /**
+   * Called on page load (and therefore after every login redirect). The SERVER decides which unfinished
+   * runs belong to the org pair this user is connected to now: their own, or a colleague's on the same org.
+   */
   private async restoreLastRun(): Promise<void> {
-    const runId = localStorage.getItem(ApiMappingComponent.LAST_RUN_KEY);
-    if (!runId) return;
     try {
-      const response = await fetch(`${environment.apiUrl}/api/runs/${encodeURIComponent(runId)}`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` }
-      });
-      if (!response.ok) {
-        if (response.status === 404) this.forgetRun();
-        return;
-      }
-      const run = await response.json();
-      if (!run.resumable && !run.retryable) {
-        this.forgetRun();
-        return;
-      }
-      this.currentRunId = run.runId;
-      this.canResume = !!run.resumable;
-      this.canRetryFailed = !!run.retryable;
-      this.retryCount = run.counts?.error || 0;
-      this.jobStatus = run.resumable ? 'Interrupted' : this.jobStatus;
+      const { runs } = await this.runApi('/api/runs/recoverable');
+      this.recoverableRuns = runs || [];
+      const candidate = this.recoverableRuns.find((r) => r.resumable || r.retryable);
+      if (!candidate || this.isGlobalLoading) return;
+      await this.openRunRecovery(candidate.runId);
+      const who = candidate.isMine ? 'You' : candidate.startedBy?.name || 'Another user';
       this.logMessages = [
         ...this.logMessages,
-        run.resumable
-          ? `A previous migration (${run.runId}) was interrupted. Use Resume to continue where it stopped.`
-          : `A previous migration (${run.runId}) finished with ${this.retryCount} failed row(s). Use Retry failed to re-send only those.`
+        `${who} started a migration on this org (${candidate.runId}) that ${
+          candidate.resumable ? 'stopped before finishing' : 'finished with failed rows'
+        }. Review it in the Recovery panel.`
       ];
     } catch {
-      // offline / server restarting: keep the stored id and try again on the next visit
+      // offline / server restarting: the next visit asks again
     } finally {
       this.cdr.detectChanges();
     }
+  }
+
+  async openRunRecovery(runId: string): Promise<void> {
+    try {
+      const detail = await this.runApi(`/api/runs/${encodeURIComponent(runId)}`);
+      this.activeRun = detail;
+      this.runJobs = detail.jobColumns || [];
+      this.currentRunId = detail.runId;
+      this.canResume = !!detail.resumable;
+      this.canRetryFailed = !!detail.retryable;
+      this.retryCount = detail.counts?.error || 0;
+      const withErrors = (detail.jobs || []).find((j: any) => j.counts?.error);
+      this.failureJobIdx = withErrors?.jobIdx ?? this.runJobs[0]?.jobIdx ?? null;
+      this.failurePage = 0;
+      this.failureSearch = '';
+      if (!this.showRecoveryPanel) this.positionRecoveryPanel();
+      this.showRecoveryPanel = true;
+      this.recoveryMinimized = false;
+      await this.loadFailures();
+    } catch (e: any) {
+      this.toastr.error(e?.message || 'Could not load the run.', 'Recovery');
+    } finally {
+      this.cdr.detectChanges();
+    }
+  }
+
+  async loadFailures(): Promise<void> {
+    if (!this.activeRun) return;
+    this.isLoadingFailures = true;
+    this.cdr.detectChanges();
+    try {
+      const q = new URLSearchParams({
+        offset: String(this.failurePage * this.failurePageSize),
+        limit: String(this.failurePageSize)
+      });
+      if (this.failureJobIdx !== null) q.set('jobIdx', String(this.failureJobIdx));
+      if (this.failureSearch.trim()) q.set('search', this.failureSearch.trim());
+      const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/failures?${q}`);
+      this.failureRows = (res.rows || []).map((r: any) => ({ ...r, _edited: {}, _dirty: false }));
+      this.failureTotal = res.total || 0;
+      this.failureGroups = res.groups || [];
+    } catch (e: any) {
+      this.toastr.error(e?.message || 'Could not load failed records.', 'Recovery');
+    } finally {
+      this.isLoadingFailures = false;
+      this.cdr.detectChanges();
+    }
+  }
+
+  private async refreshActiveRun(): Promise<void> {
+    if (!this.activeRun) return;
+    const detail = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}`);
+    this.activeRun = detail;
+    this.canResume = !!detail.resumable;
+    this.canRetryFailed = !!detail.retryable;
+    this.retryCount = detail.counts?.error || 0;
+  }
+
+  onFailureSearchChange(value: string): void {
+    this.failureSearch = value;
+    clearTimeout(this.failureSearchTimer);
+    this.failureSearchTimer = setTimeout(() => {
+      this.failurePage = 0;
+      void this.loadFailures();
+    }, 350);
+  }
+
+  async onFailureJobChange(value: string): Promise<void> {
+    this.failureJobIdx = value === '' ? null : Number(value);
+    this.failurePage = 0;
+    await this.loadFailures();
+  }
+
+  filterByGroup(group: any): void {
+    this.failureJobIdx = group.jobIdx;
+    this.failureSearch = group.message;
+    this.failurePage = 0;
+    void this.loadFailures();
+  }
+
+  async changeFailurePage(delta: number): Promise<void> {
+    const next = this.failurePage + delta;
+    if (next < 0 || next >= this.failurePageCount) return;
+    if (this.dirtyRowCount) await this.saveRunEdits(true);
+    this.failurePage = next;
+    await this.loadFailures();
+  }
+
+  /** The CRM usually names the offending field in the error text: highlight those cells like the validation grid. */
+  hasRunCellError(row: any, col: any): boolean {
+    const text = String(row?.error || '').toLowerCase();
+    if (!text) return false;
+    return (
+      (!!col.targetField && text.includes(String(col.targetField).toLowerCase())) ||
+      (!!col.sourceField && text.includes(String(col.sourceField).toLowerCase()))
+    );
+  }
+
+  onRunCellEdit(row: any, field: string, value: string): void {
+    if (String(row.record[field] ?? '') === value) return;
+    row.record[field] = value;
+    row._edited[field] = true;
+    row._dirty = true;
+  }
+
+  async saveRunEdits(silent = false): Promise<void> {
+    const dirty = this.failureRows.filter((r) => r._dirty);
+    if (!dirty.length || !this.activeRun) return;
+    this.isSavingEdits = true;
+    this.cdr.detectChanges();
+    try {
+      const edits = dirty.map((r) => ({
+        jobIdx: r.jobIdx,
+        rowIdx: r.rowIdx,
+        fields: Object.fromEntries(Object.keys(r._edited).map((k) => [k, r.record[k]]))
+      }));
+      const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/records`, {
+        method: 'PATCH',
+        body: JSON.stringify({ edits })
+      });
+      if (!silent) {
+        this.toastr.success(
+          `${res.rowsRequeued} record(s) corrected and queued. Use ${this.activeRun.resumable ? 'Resume' : 'Retry failed'} to send them.`,
+          'Saved'
+        );
+      }
+      await this.refreshActiveRun();
+      if (!silent) await this.loadFailures();
+    } catch (e: any) {
+      this.toastr.error(e?.message || 'Could not save your edits.', 'Recovery');
+    } finally {
+      this.isSavingEdits = false;
+      this.cdr.detectChanges();
+    }
+  }
+
+  /** Same value into one column for EVERY failed row (server-side, not just this page) matching the current error filter. */
+  async applyRunMassUpdate(field: string, value: string): Promise<void> {
+    if (!field || !this.activeRun || this.failureJobIdx === null) return;
+    const confirm = await Swal.fire({
+      title: 'Apply to all matching failed rows?',
+      html: `Set <b>${field}</b> to <b>${value || '(empty)'}</b> on <b>${this.failureTotal}</b> failed record(s)${
+        this.failureSearch.trim() ? ' matching the current filter' : ''
+      }.`,
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonText: 'Apply',
+      customClass: { popup: 'rounded-4 shadow-lg border-0' }
+    });
+    if (!confirm.isConfirmed) return;
+    try {
+      const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/records/mass-update`, {
+        method: 'POST',
+        body: JSON.stringify({ jobIdx: this.failureJobIdx, field, value, errorContains: this.failureSearch.trim() })
+      });
+      this.toastr.success(`${res.rowsRequeued} record(s) corrected and queued.`, 'Mass update applied');
+      this.failurePage = 0;
+      await this.refreshActiveRun();
+      await this.loadFailures();
+    } catch (e: any) {
+      this.toastr.error(e?.message || 'Mass update failed.', 'Recovery');
+    }
+  }
+
+  async resumeFromPanel(): Promise<void> {
+    if (!this.activeRun) return;
+    if (this.dirtyRowCount) await this.saveRunEdits(true);
+    this.showRecoveryPanel = false;
+    this.currentRunId = this.activeRun.runId;
+    this.globalLoadingText = 'Resuming migration...';
+    this.globalLoadingSubText = 'Continuing from the last saved checkpoint.';
+    this.resumeMigration();
+  }
+
+  async retryFromPanel(): Promise<void> {
+    if (!this.activeRun) return;
+    if (this.dirtyRowCount) await this.saveRunEdits(true);
+    this.showRecoveryPanel = false;
+    this.currentRunId = this.activeRun.runId;
+    this.globalLoadingText = 'Retrying failed records...';
+    this.globalLoadingSubText = 'Only failed and corrected records are re-sent.';
+    this.retryFailedRows();
+  }
+
+  async restartFromPanel(): Promise<void> {
+    if (!this.activeRun || this.isGlobalLoading) return;
+    const created = this.activeRun.counts?.success || 0;
+    const confirm = await Swal.fire({
+      title: 'Start over?',
+      html: created
+        ? `This run already sent <b>${created}</b> record(s). Starting over re-extracts and re-sends <b>everything</b>; in Insert mode that can create duplicates in the target org. Use <b>Resume</b> to continue from where it stopped instead.`
+        : 'Starts a fresh run with the same configuration. Nothing has been sent yet.',
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonText: 'Start over',
+      confirmButtonColor: '#dc3545',
+      customClass: { popup: 'rounded-4 shadow-lg border-0' }
+    });
+    if (!confirm.isConfirmed) return;
+    this.showRecoveryPanel = false;
+    this.isGlobalLoading = true;
+    this.jobStatus = 'Running';
+    this.logMessages = [];
+    this.openMigrationSocket({
+      mode: 'restart',
+      runId: this.activeRun.runId,
+      acknowledgeDuplicates: created > 0,
+      authToken: localStorage.getItem('supabase_token') || ''
+    });
+  }
+
+  stopReasonLabel(code: string | undefined): string {
+    switch (code) {
+      case 'client_left': return 'Browser tab closed / connection lost';
+      case 'cancelled': return 'Cancelled by a user';
+      case 'quota': return 'CRM API limit reached';
+      case 'crm_unavailable': return 'CRM stopped responding';
+      case 'session_expired': return 'CRM login expired';
+      case 'error': return 'Unexpected error';
+      default: return 'Stopped';
+    }
+  }
+
+  positionRecoveryPanel(): void {
+    this.recoveryExpanded = false;
+    this.recoveryLeft = Math.max(20, (window.innerWidth - this.recoveryDefaultWidth) / 2);
+    this.recoveryTop = Math.max(20, (window.innerHeight - this.recoveryDefaultHeight) / 2);
+  }
+
+  startRecoveryPanelDrag(event: MouseEvent): void {
+    if (this.recoveryExpanded) return;
+    if ((event.target as HTMLElement).closest('button')) return;
+    const panelEl = (event.currentTarget as HTMLElement).closest('.floating-review-panel') as HTMLElement;
+    if (!panelEl) return;
+    const rect = panelEl.getBoundingClientRect();
+    this.recoveryDragOffset = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    this.recoveryDragging = true;
+    event.preventDefault();
+  }
+
+  @HostListener('document:mousemove', ['$event'])
+  onRecoveryPanelDrag(event: MouseEvent): void {
+    if (!this.recoveryDragging) return;
+    const margin = 60;
+    this.recoveryLeft = Math.min(Math.max(event.clientX - this.recoveryDragOffset.x, 0), window.innerWidth - margin);
+    this.recoveryTop = Math.min(Math.max(event.clientY - this.recoveryDragOffset.y, 0), window.innerHeight - margin);
+  }
+
+  @HostListener('document:mouseup')
+  onRecoveryPanelDragEnd(): void {
+    this.recoveryDragging = false;
   }
 
   formatCellValue(val: any): string {
@@ -3965,6 +4266,14 @@ onReviewPanelDragEnd(): void {
         if (data.successData) this.successData = data.successData;
         if (data.errorData) this.errorData = data.errorData;
         if (data.skippedData) this.skippedData = data.skippedData;
+
+        // Failed records / stop details open in the recovery panel (loaded from the server, paged)
+        if (data.runId && data.status === 'Finished' && (data.errorData?.length || 0) > 0) {
+          void this.openRunRecovery(data.runId);
+        }
+        if (data.runId && (data.status === 'Interrupted' || data.status === 'Cancelled')) {
+          void this.openRunRecovery(data.runId);
+        }
 
         this.cdr.detectChanges();
         setTimeout(() => {

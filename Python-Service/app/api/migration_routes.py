@@ -28,6 +28,8 @@ from app.services.picklist_sync_service import PicklistSyncService
 from app.services.migrators.salesforce_file_migrator import FileMigrationCheckpoint
 from app.services.resilience.retry import RetryingClient, ApiQuotaExhausted, CircuitOpen
 from app.services.store import RunStore, RunNotFound, RunForbidden
+from app.services.run_access import RunAccess
+from app.services.org_identity import org_key
 from app.services.resumable_runner import ResumableRunner, PassSpec, RunInterrupted
 
 import uuid
@@ -72,6 +74,15 @@ def _require_valid_session_id(session_id: str) -> str:
 # ==========================================
 # CRM SESSION EXPIRY (shared by both websockets)
 # ==========================================
+def _note_stop(store, code: str, message: str) -> None:
+    """Remember WHY a run stopped so the recovery panel can explain it to whoever opens it next."""
+    try:
+        if store is not None:
+            store.set_stop_reason(code, str(message)[:400])
+    except Exception:
+        logger.exception("Could not record stop reason")
+
+
 def _session_expired_payload(sides, failed_status: str, log: str = None) -> dict:
     """The frontend (isSocketAuthExpired) redirects to the Source/Target connection page on this."""
     return {
@@ -335,6 +346,8 @@ async def websocket_migration(ws: WebSocket):
       start        payload: {queue|job fields, authToken}                -> new run, replies {runId} first
       resume       payload: {authToken, runId, mode:"resume"}            -> continues an interrupted run
       retry_failed payload: {authToken, runId, mode:"retry_failed"}      -> child run of a completed run, failed rows only
+      restart      payload: {authToken, runId, mode:"restart", acknowledgeDuplicates?} -> fresh run, same configuration
+    The run may belong to a colleague connected to the same org(s); RunAccess authorizes by org identity.
     """
     await ws.accept()
     websocket = _SafeSocket(ws)
@@ -349,7 +362,7 @@ async def websocket_migration(ws: WebSocket):
         payload = await websocket.receive_json()
 
         mode = str(payload.get("mode") or "start").lower()
-        if mode not in ("start", "resume", "retry_failed"):
+        if mode not in ("start", "resume", "retry_failed", "restart"):
             await websocket.send_json({"log": f"FATAL: Unknown mode '{mode}'.", "status": "Failed"})
             await websocket.close()
             return
@@ -373,19 +386,31 @@ async def websocket_migration(ws: WebSocket):
             store = RunStore.create(user_id, payload, execution_queue)
         else:
             try:
-                parent = RunStore.open(user_id, str(payload.get("runId") or ""))
+                parent = RunAccess.open(user_id, str(payload.get("runId") or ""))
             except (RunNotFound, RunForbidden, ValueError):
                 await websocket.send_json({"log": "FATAL: Run not found.", "status": "Failed"})
                 await websocket.close()
                 return
 
             if mode == "resume":
-                if parent.status() in ("completed", "cancelled", "failed"):
+                if parent.status() in ("completed", "failed", "superseded"):
                     await websocket.send_json({"log": f"FATAL: A {parent.status()} run cannot be resumed.", "status": "Failed"})
                     parent.close()
                     await websocket.close()
                     return
+                parent.delete_kv("cancel")        # a cancelled run may be resumed from its checkpoint
+                parent.clear_stop_reason()
                 store = parent
+            elif mode == "restart":
+                try:
+                    store = parent.fork_for_restart(acknowledge_duplicates=bool(payload.get("acknowledgeDuplicates")))
+                except ValueError as e:
+                    await websocket.send_json({"log": f"FATAL: {e}", "status": "Failed"})
+                    parent.close()
+                    await websocket.close()
+                    return
+                finally:
+                    parent.close()
             else:
                 try:
                     if parent.status() != "completed":
@@ -437,6 +462,33 @@ async def websocket_migration(ws: WebSocket):
 
         source_instance = (source_creds or {}).get("instance_url") or (source_creds or {}).get("api_domain") or (source_creds or {}).get("subdomain")
         target_instance = target_creds.get("instance_url") or target_creds.get("api_domain") or target_creds.get("subdomain")
+
+        # ---------------- org identity, ownership, hand-over ----------------
+        run_meta = store.run_meta()
+        if mode in ("start", "restart") or not run_meta.get("targetOrg"):
+            store.set_run_meta(
+                startedBy={"id": str(user_id), "name": user_name or user_email, "email": user_email},
+                sourceCrm=source_crm, targetCrm=target_crm,
+                sourceOrg=org_key(source_crm, source_creds) if source_creds else None,
+                targetOrg=org_key(target_crm, target_creds),
+                jobTargets=[q.get("targetObject") for q in execution_queue],
+            )
+        store.add_participant(user_id, user_name or user_email, mode)
+
+        if store.user_id != str(user_id) and mode in ("resume", "retry_failed"):
+            # A colleague is continuing someone else's run. Reference remapping reads the ACTING user's id map,
+            # so copy over the source->target ids this run already created.
+            for j, q in enumerate(execution_queue):
+                pairs = [
+                    ((r.get("Id") or r.get("id")), r.get("Target_Id"))
+                    for r in store.job_success_records(j)
+                    if (r.get("Id") or r.get("id")) and r.get("Target_Id")
+                ]
+                if pairs:
+                    IdMappingService.save_mappings(
+                        user_id, source_crm, target_crm, q.get("targetObject"), pairs,
+                        source_instance=source_instance, target_instance=target_instance,
+                    )
 
         async with RetryingClient(httpx.AsyncClient(timeout=120.0)) as client:
             runner = ResumableRunner(store, client, send_log, should_stop)
@@ -699,6 +751,7 @@ async def websocket_migration(ws: WebSocket):
                 report_urls = {}
 
             final_status = "completed"
+            store.clear_stop_reason()
             store.set_status("completed")
             await websocket.send_json({
                 "status": "Finished",
@@ -715,16 +768,21 @@ async def websocket_migration(ws: WebSocket):
 
     except (WebSocketDisconnect, RunInterrupted):
         logger.info("Run %s interrupted (client left or cancelled); checkpoint is intact.", getattr(store, "run_id", None))
+        if store is not None and store.get_kv("cancel") != "1":
+            _note_stop(store, "client_left", "The browser tab was closed or the connection dropped. Everything finished so far is saved.")
         if store is not None and store.get_kv("cancel") == "1":
             await websocket.send_json({"log": "Run cancelled.", "status": "Cancelled", "runId": store.run_id})
         await websocket.close()
     except (ApiQuotaExhausted, CircuitOpen) as e:
+        _note_stop(store, "quota" if isinstance(e, ApiQuotaExhausted) else "crm_unavailable", str(e))
         await websocket.send_json({
             "log": f"Run paused: {e} Everything finished so far is saved -- resume once the limit resets or the CRM recovers.",
             "status": "Interrupted", "runId": store.run_id if store else None, "resumable": True,
         })
         await websocket.close()
     except HTTPException as e:
+        _note_stop(store, "session_expired" if is_crm_session_expired(e) else "error",
+                   "CRM login expired; log in again to the same org and resume." if is_crm_session_expired(e) else e.detail)
         if is_crm_session_expired(e):
             side = (e.detail or {}).get("side")
             await websocket.send_json(_session_expired_payload([side] if side else ["source", "target"], "Failed"))
@@ -736,6 +794,7 @@ async def websocket_migration(ws: WebSocket):
         await websocket.close()
     except Exception as e:
         traceback.print_exc()
+        _note_stop(store, "error", str(e))
         await websocket.send_json({
             "log": f"SYSTEM CRASH: {str(e)}. Progress is saved; you can resume this run.",
             "status": "Interrupted", "runId": store.run_id if store else None, "resumable": store is not None,

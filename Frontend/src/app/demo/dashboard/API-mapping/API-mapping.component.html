@@ -1958,6 +1958,12 @@
                 <i class="feather icon-alert-triangle"></i> Errors ({{ errorData.length }})
               </button>
               }
+              @if (currentRunId && (canResume || canRetryFailed || errorData?.length > 0)) {
+              <button class="btn btn-xs btn-danger d-flex align-items-center gap-1 btn-hover-lift"
+                style="font-size: 0.7rem; padding: 2px 8px;" (click)="openRunRecovery(currentRunId)">
+                <i class="feather icon-edit-2"></i> Review &amp; fix failed records
+              </button>
+              }
               <span class="small text-muted ms-2"><span class="badge bg-secondary">{{ logMessages?.length || 0 }}</span>
                 logs</span>
             </div>
@@ -2260,6 +2266,210 @@
       (click)="showReviewPanel = false">
       Done Reviewing
     </button>
+  </div>
+  }
+</div>
+}
+
+<!-- ===================== MIGRATION RECOVERY PANEL (failed records, resume, start over) ===================== -->
+@if (showRecoveryPanel) {
+<div class="floating-review-panel animate__animated animate__fadeInUp" [class.minimized]="recoveryMinimized"
+  [class.expanded]="recoveryExpanded" [style.top.px]="recoveryTop" [style.left.px]="recoveryLeft">
+
+  <div class="bg-dark text-white p-2 px-3 d-flex justify-content-between align-items-center flex-shrink-0 panel-header"
+    style="border-radius: 8px 8px 0 0;" (mousedown)="startRecoveryPanelDrag($event)"
+    (click)="recoveryMinimized ? recoveryMinimized = false : null" title="Drag to move">
+    <div class="d-flex align-items-center gap-2">
+      <i class="feather icon-alert-triangle text-warning fs-5"></i>
+      <h6 class="m-0 fw-bold">Migration Recovery</h6>
+      @if (activeRun) {
+      <span class="badge bg-danger ms-2">{{ activeRun.counts?.error || 0 }} failed</span>
+      }
+    </div>
+    <div class="d-flex gap-2">
+      @if (!recoveryMinimized) {
+      <button class="btn btn-sm btn-link text-white-50 p-0" title="Toggle Fullscreen"
+        (click)="recoveryExpanded = !recoveryExpanded; $event.stopPropagation()">
+        <i class="feather fs-5" [ngClass]="recoveryExpanded ? 'icon-minimize' : 'icon-maximize'"></i>
+      </button>
+      <button class="btn btn-sm btn-link text-white-50 p-0" title="Minimize"
+        (click)="recoveryMinimized = true; recoveryExpanded = false; $event.stopPropagation()">
+        <i class="feather icon-minus fs-5"></i>
+      </button>
+      } @else {
+      <button class="btn btn-sm btn-link text-white-50 p-0" title="Restore"
+        (click)="recoveryMinimized = false; $event.stopPropagation()">
+        <i class="feather icon-maximize-2 fs-5"></i>
+      </button>
+      }
+      <button class="btn btn-sm btn-link text-white-50 p-0" title="Close"
+        (click)="showRecoveryPanel = false; $event.stopPropagation()">
+        <i class="feather icon-x fs-5"></i>
+      </button>
+    </div>
+  </div>
+
+  @if (!recoveryMinimized && activeRun) {
+  <!-- Run summary -->
+  <div class="bg-white p-3 border-bottom flex-shrink-0">
+    @if (recoverableRuns.length > 1) {
+    <select class="form-select form-select-sm mb-2" (change)="openRunRecovery($any($event.target).value)">
+      @for (r of recoverableRuns; track r.runId) {
+      <option [value]="r.runId" [selected]="r.runId === activeRun.runId">
+        {{ r.runId }} · {{ r.status }} · {{ r.isMine ? 'you' : (r.startedBy?.name || 'another user') }}
+      </option>
+      }
+    </select>
+    }
+
+    <div class="d-flex flex-wrap align-items-center gap-2 small">
+      <span class="badge" [ngClass]="activeRun.status === 'completed' ? 'bg-success' : activeRun.status === 'running' ? 'bg-primary' : 'bg-warning text-dark'">
+        {{ activeRun.status | titlecase }}
+      </span>
+      <span class="text-muted">Run <span class="font-monospace">{{ activeRun.runId }}</span></span>
+      <span class="text-muted">· Started by <b>{{ activeRun.isMine ? 'you' : (activeRun.startedBy?.name || activeRun.startedBy?.email || 'another user') }}</b></span>
+      <span class="text-muted">· Last activity {{ activeRun.updatedAt | date: 'medium' }}</span>
+    </div>
+
+    @if (activeRun.position) {
+    <div class="mt-2 small">
+      <i class="feather icon-map-pin text-primary"></i>
+      {{ activeRun.status === 'running' ? 'Currently at' : 'Stopped at' }}
+      <b>{{ activeRun.position.targetObject }}</b>
+      @if (activeRun.position.passName) { · {{ activeRun.position.passName }} }
+      @if (activeRun.position.total) { — {{ activeRun.position.processed }} / {{ activeRun.position.total }} records processed }
+      @else { — {{ activeRun.position.stage }} }
+    </div>
+    }
+    @if (activeRun.stopReason) {
+    <div class="mt-1 small text-muted">
+      <b>{{ stopReasonLabel(activeRun.stopReason.code) }}:</b> {{ activeRun.stopReason.message }}
+    </div>
+    }
+    @if (!activeRun.isMine && activeRun.status !== 'running') {
+    <div class="alert alert-info py-1 px-2 mt-2 mb-0 small">
+      This run was started by another user of this org. Resuming or retrying uses <b>your</b> connection to the org.
+    </div>
+    }
+    @if (activeRun.status === 'running') {
+    <div class="alert alert-warning py-1 px-2 mt-2 mb-0 small">
+      This run is active in another session. You can view it, but editing and resuming are disabled until it stops.
+    </div>
+    }
+
+    <div class="d-flex flex-wrap gap-2 mt-2">
+      <span class="badge bg-success-subtle text-success-emphasis">{{ activeRun.counts?.success || 0 }} succeeded</span>
+      <span class="badge bg-danger-subtle text-danger-emphasis">{{ activeRun.counts?.error || 0 }} failed</span>
+      <span class="badge bg-warning-subtle text-warning-emphasis">{{ activeRun.counts?.skipped || 0 }} skipped</span>
+      <span class="badge bg-secondary-subtle text-secondary-emphasis">{{ activeRun.counts?.pending || 0 }} waiting</span>
+    </div>
+
+    <div class="d-flex flex-wrap gap-2 mt-3">
+      @if (activeRun.resumable) {
+      <button class="btn btn-sm btn-primary fw-bold" (click)="resumeFromPanel()" [disabled]="isGlobalLoading || isSavingEdits">
+        <i class="feather icon-play"></i> Resume from where it stopped
+      </button>
+      }
+      @if (activeRun.retryable) {
+      <button class="btn btn-sm btn-primary fw-bold" (click)="retryFromPanel()" [disabled]="isGlobalLoading || isSavingEdits">
+        <i class="feather icon-refresh-cw"></i> Retry failed records
+      </button>
+      }
+      @if (activeRun.status !== 'running' && activeRun.status !== 'superseded') {
+      <button class="btn btn-sm btn-outline-danger" (click)="restartFromPanel()" [disabled]="isGlobalLoading">
+        <i class="feather icon-rotate-ccw"></i> Start over
+      </button>
+      }
+      <button class="btn btn-sm btn-success fw-bold ms-auto" (click)="saveRunEdits()"
+        [disabled]="dirtyRowCount === 0 || isSavingEdits || activeRun.status === 'running'">
+        <i class="feather icon-save"></i> Save {{ dirtyRowCount }} edited record(s)
+      </button>
+    </div>
+  </div>
+
+  <!-- Filters, error groups, mass update -->
+  <div class="bg-light p-2 px-3 border-bottom flex-shrink-0">
+    <div class="d-flex flex-wrap gap-2 align-items-center">
+      @if (runJobs.length > 1) {
+      <select class="form-select form-select-sm w-auto" (change)="onFailureJobChange($any($event.target).value)">
+        @for (j of runJobs; track j.jobIdx) {
+        <option [value]="j.jobIdx" [selected]="j.jobIdx === failureJobIdx">{{ j.targetObject }}{{ j.isPass3Patch ? ' (reference patch)' : '' }}</option>
+        }
+      </select>
+      }
+      <input class="form-control form-control-sm w-auto" style="min-width: 240px" placeholder="Filter by error text or value..."
+        [value]="failureSearch" (input)="onFailureSearchChange($any($event.target).value)">
+      <span class="small text-muted">{{ failureTotal }} failed record(s)</span>
+
+      <div class="d-flex gap-1 align-items-center ms-auto">
+        <span class="small fw-bold">Fix all matching:</span>
+        <select #massCol class="form-select form-select-sm w-auto">
+          @for (c of activeColumns; track c.sourceField) { <option [value]="c.sourceField">{{ c.sourceField }}</option> }
+        </select>
+        <input #massVal class="form-control form-control-sm w-auto" style="max-width: 160px" placeholder="New value">
+        <button class="btn btn-sm btn-outline-success" [disabled]="!failureTotal || activeRun.status === 'running'"
+          (click)="applyRunMassUpdate(massCol.value, massVal.value)">Apply</button>
+      </div>
+    </div>
+
+    @if (failureGroups.length) {
+    <div class="d-flex flex-wrap gap-1 mt-2">
+      @for (g of failureGroups; track $index) {
+      <button class="btn btn-xs btn-outline-danger text-start" style="font-size: 0.72rem; max-width: 420px"
+        (click)="filterByGroup(g)" [title]="g.message">
+        <span class="badge bg-danger me-1">{{ g.count }}</span>{{ g.message.length > 80 ? (g.message | slice: 0 : 80) + '…' : g.message }}
+      </button>
+      }
+    </div>
+    }
+  </div>
+
+  <!-- Failed records grid (editable, like the validation grid) -->
+  <div class="panel-body flex-grow-1 overflow-auto bg-white">
+    @if (isLoadingFailures) {
+    <div class="text-center text-muted p-4">Loading failed records...</div>
+    } @else if (failureRows.length === 0) {
+    <div class="text-center text-muted p-4">
+      @if (failureSearch) { No failed records match this filter. } @else { No failed records. }
+    </div>
+    } @else {
+    <table class="table table-sm table-bordered mb-0 align-middle" style="font-size: 0.78rem">
+      <thead class="table-light" style="position: sticky; top: 0; z-index: 2">
+        <tr>
+          <th style="width: 50px">#</th>
+          <th style="min-width: 280px">Error from CRM</th>
+          @for (c of activeColumns; track c.sourceField) {
+          <th style="min-width: 150px">{{ c.sourceField }}<small class="text-muted d-block fw-normal">&rarr; {{ c.targetField }}</small></th>
+          }
+        </tr>
+      </thead>
+      <tbody>
+        @for (row of failureRows; track row.jobIdx + '-' + row.passNo + '-' + row.rowIdx) {
+        <tr [class.table-success]="row._dirty">
+          <td class="text-muted">{{ row.rowIdx + 1 }}</td>
+          <td class="text-danger">{{ row.error }}</td>
+          @for (c of activeColumns; track c.sourceField) {
+          <td>
+            <input class="form-control form-control-sm"
+              [class.is-invalid]="hasRunCellError(row, c) && !row._edited[c.sourceField]"
+              [class.bg-success-subtle]="row._edited[c.sourceField]" [class.border-success]="row._edited[c.sourceField]"
+              [disabled]="activeRun.status === 'running'" [value]="formatCellValue(row.record[c.sourceField])"
+              (input)="onRunCellEdit(row, c.sourceField, $any($event.target).value)">
+          </td>
+          }
+        </tr>
+        }
+      </tbody>
+    </table>
+    }
+  </div>
+
+  <div class="bg-light border-top p-2 px-3 d-flex justify-content-between align-items-center flex-shrink-0 small">
+    <span>Page {{ failurePage + 1 }} of {{ failurePageCount }}</span>
+    <div class="btn-group btn-group-sm">
+      <button class="btn btn-outline-secondary" [disabled]="failurePage === 0" (click)="changeFailurePage(-1)">Previous</button>
+      <button class="btn btn-outline-secondary" [disabled]="failurePage + 1 >= failurePageCount" (click)="changeFailurePage(1)">Next</button>
+    </div>
   </div>
   }
 </div>
