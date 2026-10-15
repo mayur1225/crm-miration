@@ -30,8 +30,8 @@ class CrmQueryService:
             raise HTTPException(status_code=400, detail=str(e))
 
         query = (query or "").strip().rstrip(";").strip()
+        query = re.sub(r'(?i)\s+where\s*$', '', query)
 
-        # `\s` (not a literal space) so "SELECT\n  Id,\n  Name\nFROM Account" is recognised too.
         if re.match(r'(?i)^select\s', query):
             soql = query
             if time_clause:
@@ -49,9 +49,7 @@ class CrmQueryService:
         else:
             fields_str = ", ".join(headers_list) if headers_list else "Id, Name"
 
-            # A bare condition may be typed with its own leading WHERE -- strip it so we
-            # don't generate "WHERE (WHERE ...)".
-            condition = re.sub(r'(?i)^where\s+', '', query).strip()
+            condition = re.sub(r'(?i)^where\b\s*', '', query).strip()
 
             where_parts = []
             if condition: where_parts.append(f"({condition})")
@@ -357,12 +355,12 @@ class CrmQueryService:
             raise HTTPException(status_code=400, detail=str(e))
 
         stripped = (query or "").strip().rstrip(";").strip()
+        stripped = re.sub(r'(?i)\s+where\s*$', '', stripped)
 
         if re.match(r'(?i)^select\s', stripped):
-            # Top-level-FROM aware, multi-line safe; drops ORDER BY / LIMIT / OFFSET.
             count_soql = build_count_query(stripped, "COUNT()", time_clause, where_kw="WHERE", and_kw="AND")
         else:
-            condition = re.sub(r'(?i)^where\s+', '', stripped).strip()
+            condition = re.sub(r'(?i)^where\b\s*', '', stripped).strip()
             where_parts = []
             if condition:
                 where_parts.append(f"({condition})")

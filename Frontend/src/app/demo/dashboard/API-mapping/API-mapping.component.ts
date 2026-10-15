@@ -123,6 +123,13 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
 
   /** Unfiltered source describe result. Used only for query validation; `sourceFields` is the writable subset used for mapping. */
   private allSourceFields: FieldMeta[] = [];
+
+  /**
+   * Single switch for ORDER BY in the Salesforce/Zoho query editor. While false, the validator rejects it AND the
+   * autocomplete hides ORDER BY / ASC / DESC, so the editor never suggests something it will then flag as an error.
+   * Flip to true once salesforce_migrator.py / zoho_migrator.py are confirmed to tolerate it.
+   */
+  private readonly allowOrderBy = true;
   private readonly PICKLIST_TYPES = ['picklist', 'multipicklist'];
 
   private readonly SYSTEM_MANAGED_FIELDS = new Set<string>([
@@ -562,6 +569,10 @@ private showSchemaLoader(): void {
     return (query || '').replace(/\s+/g, ' ').trim();
   }
 
+  /**
+   * Returns the object name after the FROM that belongs to the outer SELECT, ignoring FROMs inside
+   * parentheses (sub-selects) and inside quoted text values. Expects whitespace-normalised, lower-cased SQL.
+   */
   private getTopLevelFromObject(sql: string): string | null {
     let depth = 0;
     let inString = false;
@@ -1214,6 +1225,14 @@ toggleProfileDropdown(event: Event): void {
           //  SALESFORCE & ZOHO (SQL) MODE
           // ------------------------------------
           else {
+            const isSalesforce = crm === 'salesforce';
+            const snippet = monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+            const kinds = monaco.languages.CompletionItemKind;
+
+            // Autocomplete offers EVERY queryable field (Id, CreatedDate, OwnerId, formula/read-only fields...), not just
+            // the writable/mapped subset in sourceFields -- those are exactly the fields people filter on in a WHERE.
+            const queryFields: FieldMeta[] = this.allSourceFields.length > 0 ? this.allSourceFields : this.sourceFields;
+
             const snippetFields =
               this.sourceFields && this.sourceFields.length > 0
                 ? this.sourceFields.slice(0, 15).map((f) => f.name).join(', ')
@@ -1221,49 +1240,121 @@ toggleProfileDropdown(event: Event): void {
 
             suggestions.push({
               label: 'SELECT (Basic)',
-              kind: monaco.languages.CompletionItemKind.Snippet,
-              insertText: `SELECT ${snippetFields} FROM ${this.selectedSourceObject || 'Object'} WHERE `,
-              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-              documentation: 'Auto-generates a SELECT query using real field names for the current object.',
+              kind: kinds.Snippet,
+              insertText: `SELECT ${snippetFields} FROM ${this.selectedSourceObject || 'Object'} WHERE \${1:${isSalesforce ? 'Id' : 'id'}} = '\${2:value}'`,
+              insertTextRules: snippet,
+              documentation: 'Auto-generates a SELECT query using real field names for the current object, with a WHERE ready to fill in.',
               range: range
             });
 
-            const sqlKeywords = [
-              'SELECT',
-              'FROM',
-              'WHERE',
-              'AND',
-              'OR',
-              'LIKE',
-              'LIMIT',
-              'ORDER BY',
-              'ASC',
-              'DESC',
-              'NULL',
-              'IS',
-              'NOT',
-              'IN'
+            // --- Context-aware operators: right after a known field name, offer the operators valid for ITS type ---
+            const lineText: string = model.getLineContent(position.lineNumber);
+            const beforeWord = lineText.substring(0, word.startColumn - 1);
+            const prevToken = beforeWord.match(/([A-Za-z0-9_.]+)\s+$/);
+            const prevField = prevToken
+              ? queryFields.find((f) => f.name.toLowerCase() === prevToken[1].toLowerCase())
+              : undefined;
+
+            if (prevField) {
+              const t = (prevField.type || 'string').toLowerCase();
+              const isNumeric = ['number', 'integer', 'int', 'double', 'currency', 'percent', 'float', 'long', 'bigint', 'decimal'].includes(t);
+              const isDate = t.includes('date') || t.includes('time');
+              const isBool = t === 'boolean';
+
+              let ops: string[];
+              if (isBool) {
+                ops = ['=', '!='];
+              } else {
+                ops = ['=', '!=', 'IN', 'NOT IN', 'IS NULL', 'IS NOT NULL'];
+                if (isNumeric || isDate) {
+                  ops.push('<', '<=', '>', '>=');
+                  if (!isSalesforce) ops.push('BETWEEN', 'NOT BETWEEN');
+                } else {
+                  ops.push('LIKE', 'NOT LIKE');
+                  if (!isSalesforce) ops.push('STARTS WITH', 'ENDS WITH', 'CONTAINS', 'NOT CONTAINS');
+                  if (isSalesforce && t.includes('multipicklist')) ops.push('INCLUDES', 'EXCLUDES');
+                }
+              }
+              ops.forEach((op) =>
+                suggestions.push({
+                  label: op,
+                  kind: kinds.Operator,
+                  insertText: op + ' ',
+                  detail: `Operator for ${prevField.name} (${prevField.type || 'string'})`,
+                  sortText: '0_' + op,
+                  range: range
+                })
+              );
+            }
+
+            // --- Keywords (only things the editor accepts AND the migration can run) ---
+            const keywords = [
+              'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT',
+              'LIKE', 'NOT LIKE', 'IN', 'NOT IN', 'IS NULL', 'IS NOT NULL',
+              'NULL', 'TRUE', 'FALSE', 'LIMIT',
+              ...(isSalesforce ? ['INCLUDES', 'EXCLUDES'] : ['BETWEEN', 'NOT BETWEEN', 'STARTS WITH', 'ENDS WITH', 'CONTAINS', 'NOT CONTAINS']),
+              ...(this.allowOrderBy ? ['ORDER BY', 'ASC', 'DESC'] : [])
             ];
-            sqlKeywords.forEach((kw) => {
-              suggestions.push({
-                label: kw,
-                kind: monaco.languages.CompletionItemKind.Keyword,
-                insertText: kw + ' ',
-                range: range
-              });
+            keywords.forEach((kw) => {
+              suggestions.push({ label: kw, kind: kinds.Keyword, insertText: kw + ' ', range: range });
             });
 
-            if (this.sourceFields && this.sourceFields.length > 0) {
-              this.sourceFields.forEach((field) => {
+            // --- Value / shape snippets ---
+            const snippets: Array<{ label: string; text: string; doc: string }> = [
+              { label: "IN ('…', '…')", text: "IN ('${1:value1}', '${2:value2}')", doc: 'Match any value in a list.' },
+              { label: "LIKE '%…%'", text: "LIKE '%${1:text}%'", doc: 'Text contains a value.' }
+            ];
+            if (!isSalesforce) {
+              snippets.push(
+                { label: 'BETWEEN … AND …', text: 'BETWEEN ${1:min} AND ${2:max}', doc: 'Zoho COQL range filter.' },
+                { label: 'Datetime literal (Zoho)', text: "'${1:2026-01-01}T00:00:00+00:00'", doc: 'Zoho COQL datetime format: YYYY-MM-DDThh:mm:ss+hh:mm' }
+              );
+            }
+            snippets.forEach((s) =>
+              suggestions.push({ label: s.label, kind: kinds.Snippet, insertText: s.text, insertTextRules: snippet, documentation: s.doc, range: range })
+            );
+
+            // --- Salesforce date literals (SOQL only) ---
+            if (isSalesforce) {
+              ['TODAY', 'YESTERDAY', 'TOMORROW', 'THIS_WEEK', 'LAST_WEEK', 'THIS_MONTH', 'LAST_MONTH',
+               'THIS_QUARTER', 'LAST_QUARTER', 'THIS_YEAR', 'LAST_YEAR'].forEach((d) =>
+                suggestions.push({ label: d, kind: kinds.Constant, insertText: d + ' ', detail: 'SOQL date literal', range: range })
+              );
+              ['LAST_N_DAYS', 'NEXT_N_DAYS', 'LAST_N_WEEKS', 'LAST_N_MONTHS', 'LAST_N_YEARS'].forEach((d) =>
                 suggestions.push({
-                  label: field.name,
-                  detail: `${field.label} (${field.type})`,
-                  kind: monaco.languages.CompletionItemKind.Field,
-                  insertText: field.name,
+                  label: d + ':n',
+                  kind: kinds.Constant,
+                  insertText: d + ':${1:30}',
+                  insertTextRules: snippet,
+                  detail: 'SOQL date literal',
+                  range: range
+                })
+              );
+            }
+
+            // --- Fields ---
+            const seenRelationships = new Set<string>();
+            queryFields.forEach((field) => {
+              suggestions.push({
+                label: field.name,
+                detail: `${field.label} (${field.type})`,
+                kind: kinds.Field,
+                insertText: field.name,
+                range: range
+              });
+
+              // Parent traversal, e.g. Account.Name / Owner.Email (Salesforce)
+              if (isSalesforce && field.relationshipName && !seenRelationships.has(field.relationshipName)) {
+                seenRelationships.add(field.relationshipName);
+                suggestions.push({
+                  label: field.relationshipName + '.',
+                  detail: `Parent relationship (${(field.referenceTo || []).join(', ') || 'lookup'})`,
+                  kind: kinds.Reference,
+                  insertText: field.relationshipName + '.',
                   range: range
                 });
-              });
-            }
+              }
+            });
           }
 
           return { suggestions: suggestions };
@@ -1280,7 +1371,7 @@ toggleProfileDropdown(event: Event): void {
 
           const cleanWord = wordInfo.word.replace(/[:<>]/g, '').toLowerCase();
 
-          const field = this.sourceFields.find((f) => f.name.toLowerCase() === cleanWord);
+          const field = (this.allSourceFields.length > 0 ? this.allSourceFields : this.sourceFields).find((f) => f.name.toLowerCase() === cleanWord);
 
           if (field) {
             return {
@@ -2393,8 +2484,8 @@ onReviewPanelDragEnd(): void {
         return applySquiggle('Salesforce strictly requires single quotes (\') for text values. Do not use double quotes (").', '"');
       }
 
-      if (sqlLower.endsWith(';')) {
-         return applySquiggle('Do not end your query with a semicolon (;).', ';');
+      if (!this.allowOrderBy && /\border by\b/.test(sqlLower)) {
+        return applySquiggle('Do not use ORDER BY.', 'order by');
       } else if (sqlLower.endsWith(';')) {
         return applySquiggle('Do not end your query with a semicolon (;).', ';');
       }
@@ -2412,6 +2503,8 @@ onReviewPanelDragEnd(): void {
       }
 
       if (conditionPart.trim() !== '') {
+        // SOQL: = != < > <= >= LIKE IN NOT IN INCLUDES EXCLUDES, IS [NOT] NULL
+        // COQL: all of the above plus BETWEEN, STARTS WITH, ENDS WITH, CONTAINS (and their NOT forms)
         const hasOperator =
           /(=|<|>)/.test(conditionPart) ||
           /\b(like|in|includes|excludes|between|starts\s+with|ends\s+with|contains)\b/.test(conditionPart) ||
@@ -2427,6 +2520,7 @@ onReviewPanelDragEnd(): void {
       }
 
       if (hasSelect) {
+        // Use the TOP-LEVEL FROM so sub-selects like (SELECT Id FROM Contacts) aren't mistaken for the object.
         const objPart = this.getTopLevelFromObject(sqlLower);
         if (objPart && objPart.toLowerCase() !== this.selectedSourceObject.toLowerCase()) {
           return applySquiggle(
@@ -2448,6 +2542,8 @@ onReviewPanelDragEnd(): void {
           const rawPath = match[1];
           if (reservedWords.has(rawPath.toLowerCase())) continue;
 
+          // Relationship traversal (RecordType.Name, Owner.Profile.Name) cannot be validated
+          // against this object's describe; the CRM validates it server-side.
           if (rawPath.includes('.')) continue;
 
           const schemaField = this.allSourceFields.find((f) => f.name.toLowerCase() === rawPath.toLowerCase());
