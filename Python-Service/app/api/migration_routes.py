@@ -116,6 +116,53 @@ def _parse_session_id(session_id: str):
     obj = parts[1] if len(parts) > 1 else "unknown_object"
     return crm, obj
 
+def _iter_session_rows(db_path: str, is_valid: bool):
+    """Streams parsed record dicts for one validity bucket from a staging DB
+    without loading the whole set into memory. Opens its own connection so it
+    can be re-invoked for multi-pass exports."""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute("SELECT data FROM records WHERE is_valid = ?", (1 if is_valid else 0,))
+        while True:
+            batch = cur.fetchmany(1000)
+            if not batch:
+                break
+            for (data,) in batch:
+                yield json.loads(data)
+    finally:
+        conn.close()
+
+
+def _persist_validation_history(*, user_id, session_id, source_crm, target_crm, target_object,
+                                stats, db_path, auth_token):
+    """Saves the validation_history row + valid/invalid CSVs from the staging DB.
+    Never raises into the websocket flow, but failures are logged at ERROR with
+    the session id so they are no longer invisible."""
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute("SELECT id, data, errors FROM records WHERE is_valid = 0").fetchall()
+        finally:
+            conn.close()
+        invalid_records = [{"originalRow": json.loads(r[1]), "errors": r[2]} for r in rows]
+
+        AuditService.generate_and_save_validation_report(
+            user_id=user_id,
+            session_id=session_id,
+            source_crm=source_crm,
+            target_crm=target_crm,
+            target_object=target_object,
+            stats=stats,
+            invalid_records=invalid_records,
+            auth_token=auth_token,
+            valid_records_factory=lambda: _iter_session_rows(db_path, True),
+        )
+        return True
+    except Exception:
+        logger.exception("[VALIDATION HISTORY] Failed to persist history for session %s", session_id)
+        return False
+
+
 def chunk_dataset(data: list, chunk_size: int = 5000):
     for i in range(0, len(data), chunk_size):
         yield data[i:i + chunk_size]
@@ -696,28 +743,16 @@ async def websocket_validate_stream(websocket: WebSocket):
             cursor.execute("SELECT id, data, errors FROM records WHERE is_valid = 0 LIMIT 500")
             all_invalid_records = [{"originalRow": dict(json.loads(row[1]), _db_id=row[0]), "errors": row[2]} for row in cursor.fetchall()]
 
-            # Full (uncapped) invalid set for the permanent report/CSV -- the
-            # 500-row query above is just the UI preview.
-            cursor.execute("SELECT id, data, errors FROM records WHERE is_valid = 0")
-            full_invalid_records = [{"originalRow": dict(json.loads(row[1]), _db_id=row[0]), "errors": row[2]} for row in cursor.fetchall()]
             conn.close()
 
             validation_stats = {"total": total_count, "valid": valid_count, "invalid": invalid_count, "duplicates": chunk_result["stats"].get("duplicates", 0)}
 
-            try:
-                parsed_source_crm, parsed_object = _parse_session_id(session_id)
-                AuditService.generate_and_save_validation_report(
-                    user_id=user_id,
-                    session_id=session_id,
-                    source_crm=parsed_source_crm,
-                    target_crm=target_crm,
-                    target_object=parsed_object,
-                    stats=validation_stats,
-                    invalid_records=full_invalid_records,
-                    auth_token=auth_token,
-                )
-            except Exception as e:
-                logger.exception("Failed to persist re-validation history for session %s", session_id)
+            parsed_source_crm, parsed_object = _parse_session_id(session_id)
+            _persist_validation_history(
+                user_id=user_id, session_id=session_id,
+                source_crm=parsed_source_crm, target_crm=target_crm, target_object=parsed_object,
+                stats=validation_stats, db_path=db_path, auth_token=auth_token,
+            )
 
             await websocket.send_json({
                 "log": f"Re-validation Complete: Fixed {len(valid_inserts)} records.",
@@ -791,6 +826,12 @@ async def websocket_validate_stream(websocket: WebSocket):
                     conn.commit()
                 
                 if not raw_records:
+                    conn.close()
+                    _persist_validation_history(
+                        user_id=user_id, session_id=session_id,
+                        source_crm=source_crm, target_crm=target_crm, target_object=obj_name,
+                        stats=aggregate_stats, db_path=db_path, auth_token=auth_token,
+                    )
                     await send_log("No records found matching criteria.", "Validation Passed")
                     await websocket.close()
                     return
@@ -825,23 +866,13 @@ async def websocket_validate_stream(websocket: WebSocket):
         all_invalid_records = [{"originalRow": dict(json.loads(row[1]), _db_id=row[0]), "errors": row[2]} for row in cursor.fetchall()]
 
 
-        cursor.execute("SELECT id, data, errors FROM records WHERE is_valid = 0")
-        full_invalid_records = [{"originalRow": dict(json.loads(row[1]), _db_id=row[0]), "errors": row[2]} for row in cursor.fetchall()]
         conn.close()
 
-        try:
-            AuditService.generate_and_save_validation_report(
-                user_id=user_id,
-                session_id=session_id,
-                source_crm=source_crm,
-                target_crm=target_crm,
-                target_object=obj_name,
-                stats=aggregate_stats,
-                invalid_records=full_invalid_records,
-                auth_token=auth_token,
-            )
-        except Exception as e:
-            logger.exception("Failed to persist validation history for session %s", session_id)
+        _persist_validation_history(
+            user_id=user_id, session_id=session_id,
+            source_crm=source_crm, target_crm=target_crm, target_object=obj_name,
+            stats=aggregate_stats, db_path=db_path, auth_token=auth_token,
+        )
 
         await websocket.send_json({
             "log": f"Stream Validation Complete: {aggregate_stats['total']} total records.",

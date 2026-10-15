@@ -5,6 +5,7 @@ import csv
 import logging
 from datetime import datetime, timezone
 from collections import Counter
+from typing import Callable, Iterable, Iterator, Optional
 from fpdf import FPDF
 from supabase import create_client
 from app.utils.config import supabase, SUPABASE_URL, SUPABASE_KEY
@@ -264,6 +265,61 @@ class AuditService:
         return url
 
     # ==========================================
+    # SCOPED SUPABASE CLIENT
+    # ==========================================
+    @staticmethod
+    def _scoped_client(auth_token: str):
+        """Client that sends the user's JWT to PostgREST so RLS policies on the
+        history tables see auth.uid(). Uses postgrest.auth() instead of
+        auth.set_session(refresh_token=""), which validates/refreshes the session
+        client-side and can raise on an empty refresh token."""
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        client.postgrest.auth(auth_token)
+        return client
+
+    @staticmethod
+    def _upload_csv_stream(
+        rows_factory: Callable[[], Iterable[dict]],
+        storage_path: str,
+        leading_columns: Optional[list] = None,
+        bucket: str = "migration_reports",
+    ) -> Optional[str]:
+        """Two-pass streaming CSV export: pass 1 collects the column union,
+        pass 2 writes. rows_factory must return a fresh iterator on each call
+        so large staged sessions never have to be fully held in memory.
+        Returns None when there are no rows."""
+        leading = list(leading_columns or [])
+        columns = list(leading)
+        seen = set(columns)
+        has_rows = False
+        for row in rows_factory():
+            has_rows = True
+            for key in row.keys():
+                if key not in seen:
+                    seen.add(key)
+                    columns.append(key)
+        if not has_rows:
+            return None
+
+        filename = os.path.basename(storage_path)
+        tmp_path = os.path.join(tempfile.gettempdir(), filename)
+        try:
+            with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=columns, quoting=csv.QUOTE_MINIMAL, restval="")
+                writer.writeheader()
+                for row in rows_factory():
+                    writer.writerow(row)
+            return AuditService._upload_file(
+                tmp_path, storage_path,
+                content_type="text/csv; charset=utf-8",
+                disposition="attachment",
+                bucket=bucket,
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    # ==========================================
     # MIGRATION REPORTS
     # ==========================================
     @staticmethod
@@ -412,8 +468,7 @@ class AuditService:
         # ==========================================
         # 4. SAVE TO DATABASE
         # ==========================================
-        scoped_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        scoped_client.auth.set_session(access_token=auth_token, refresh_token="")
+        scoped_client = AuditService._scoped_client(auth_token)
 
         scoped_client.table("migration_history").insert({
             "user_id": user_id,
@@ -445,27 +500,34 @@ class AuditService:
         target_crm: str,
         target_object: str,
         stats: dict,
-        invalid_records: list,
+        invalid_records: Iterable[dict],
         auth_token: str,
+        valid_records_factory: Optional[Callable[[], Iterable[dict]]] = None,
     ):
+        """Persists one validation_history row plus both log files:
+        - invalid_csv_url: every failed row + Validation_Errors column
+        - valid_csv_url:   every passed row (previously never generated)
+        invalid_records is a list (needed for error_summary); valid_records_factory
+        is a zero-arg callable returning a fresh iterator of valid row dicts."""
         invalid_csv_url = None
         valid_csv_url = None
+        invalid_records = list(invalid_records or [])
         error_like = [{"record": rec.get("originalRow", {}), "error": rec.get("errors", "")} for rec in invalid_records]
         error_summary = AuditService.build_error_summary(error_like)
 
         try:
             if invalid_records:
-                flat_rows = []
-                for rec in invalid_records:
-                    flat_rec = dict(rec.get("originalRow", {}))
-                    flat_rec.pop("_db_id", None)
-                    flat_rec["Validation_Errors"] = rec.get("errors", "")
-                    flat_rows.append(flat_rec)
+                def _invalid_rows() -> Iterator[dict]:
+                    for rec in invalid_records:
+                        flat = dict(rec.get("originalRow", {}))
+                        flat.pop("_db_id", None)
+                        flat["Validation_Errors"] = rec.get("errors", "")
+                        yield flat
 
-                fieldnames = ["Validation_Errors"] + [k for k in flat_rows[0].keys() if k != "Validation_Errors"]
-                invalid_csv_url = AuditService._upload_csv(
-                    flat_rows, fieldnames, f"{user_id}/{session_id}_validation_invalid.csv",
-                    bucket="migration_reports",
+                invalid_csv_url = AuditService._upload_csv_stream(
+                    _invalid_rows,
+                    f"{user_id}/{session_id}_validation_invalid.csv",
+                    leading_columns=["Validation_Errors"],
                 )
         except Exception:
             logger.exception(
@@ -473,14 +535,29 @@ class AuditService:
                 "continuing without it so the history row still gets saved.", session_id
             )
 
-        scoped_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        scoped_client.auth.set_session(access_token=auth_token, refresh_token="")
+        try:
+            if valid_records_factory is not None and stats.get("valid", 0) > 0:
+                def _valid_rows() -> Iterator[dict]:
+                    for rec in valid_records_factory():
+                        flat = dict(rec)
+                        flat.pop("_db_id", None)
+                        yield flat
+
+                valid_csv_url = AuditService._upload_csv_stream(
+                    _valid_rows,
+                    f"{user_id}/{session_id}_validation_valid.csv",
+                )
+        except Exception:
+            logger.exception(
+                "[AUDIT] Valid-records CSV generation/upload failed for session %s -- "
+                "continuing without it so the history row still gets saved.", session_id
+            )
 
         row = {
             "user_id": user_id,
             "session_id": session_id,
-            "source_crm": source_crm,
-            "target_crm": target_crm,
+            "source_crm": (source_crm or "").lower(),
+            "target_crm": (target_crm or "").lower(),
             "target_object": target_object,
             "total_records": stats.get("total", 0),
             "valid_count": stats.get("valid", 0),
@@ -491,9 +568,10 @@ class AuditService:
             "error_summary": error_summary,
         }
 
+        scoped_client = AuditService._scoped_client(auth_token)
         AuditService._save_validation_row(scoped_client, session_id, row)
 
-        return {"invalid_csv_url": invalid_csv_url,"valid_csv_url": valid_csv_url, "error_summary": error_summary}
+        return {"invalid_csv_url": invalid_csv_url, "valid_csv_url": valid_csv_url, "error_summary": error_summary}
 
     @staticmethod
     def _save_validation_row(scoped_client, session_id: str, row: dict) -> None:
