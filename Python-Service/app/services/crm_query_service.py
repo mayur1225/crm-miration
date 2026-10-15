@@ -15,6 +15,7 @@ from app.services.time_filter_service import (
 )
 from app.services.query_field_utils import ensure_fields_selected
 from app.services.coql_query_builder import build_coql
+from app.services.sql_utils import build_count_query, has_limit
 
 class CrmQueryService:
 
@@ -28,28 +29,35 @@ class CrmQueryService:
         except TimeFilterError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        if query.lower().startswith("select "):
+        query = (query or "").strip().rstrip(";").strip()
+
+        # `\s` (not a literal space) so "SELECT\n  Id,\n  Name\nFROM Account" is recognised too.
+        if re.match(r'(?i)^select\s', query):
             soql = query
             if time_clause:
                 soql = merge_time_clause(soql, time_clause, where_kw="WHERE", and_kw="AND")
-                    
-            if " * " in soql.lower() or soql.lower().startswith("select *"):
+
+            if re.match(r'(?i)^select\s+\*\s+from\b', soql):
                 safe_fields = headers_list[:40] if headers_list else ["Id", "Name"]
                 fields_str = ", ".join(safe_fields)
-                soql = re.sub(r'(?i)select\s+\*\s+from', f'SELECT {fields_str} FROM', soql)
+                soql = re.sub(r'(?i)^select\s+\*\s+from\b', f'SELECT {fields_str} FROM', soql, count=1)
             else:
                 soql = ensure_fields_selected(soql, headers_list)
-            
-            if "limit " not in soql.lower():
+
+            if not has_limit(soql):
                 soql += f" LIMIT {limit}"
         else:
             fields_str = ", ".join(headers_list) if headers_list else "Id, Name"
-            
+
+            # A bare condition may be typed with its own leading WHERE -- strip it so we
+            # don't generate "WHERE (WHERE ...)".
+            condition = re.sub(r'(?i)^where\s+', '', query).strip()
+
             where_parts = []
-            if query: where_parts.append(f"({query})")
+            if condition: where_parts.append(f"({condition})")
             if time_clause: where_parts.append(time_clause)
             where_combined = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-            
+
             soql = f"SELECT {fields_str} FROM {obj_name}{where_combined} LIMIT {limit}"
         
         safe_soql = urllib.parse.quote(soql)
@@ -348,17 +356,16 @@ class CrmQueryService:
         except TimeFilterError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        stripped = (query or "").strip()
+        stripped = (query or "").strip().rstrip(";").strip()
 
-        if stripped.lower().startswith("select "):
-            count_soql = re.sub(r'(?i)^select\s+.*?\s+from\s+', 'SELECT COUNT() FROM ', stripped, count=1)
-            count_soql = re.sub(r'(?i)\blimit\b\s+\d+', '', count_soql).strip()
-            if time_clause:
-                count_soql = merge_time_clause(count_soql, time_clause, where_kw="WHERE", and_kw="AND")
+        if re.match(r'(?i)^select\s', stripped):
+            # Top-level-FROM aware, multi-line safe; drops ORDER BY / LIMIT / OFFSET.
+            count_soql = build_count_query(stripped, "COUNT()", time_clause, where_kw="WHERE", and_kw="AND")
         else:
+            condition = re.sub(r'(?i)^where\s+', '', stripped).strip()
             where_parts = []
-            if stripped:
-                where_parts.append(f"({stripped})")
+            if condition:
+                where_parts.append(f"({condition})")
             if time_clause:
                 where_parts.append(time_clause)
             where_combined = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
@@ -371,56 +378,6 @@ class CrmQueryService:
             if res.status_code != 200:
                 raise HTTPException(status_code=400, detail=f"Salesforce rejected count query: {res.text}")
             return res.json().get("totalSize", 0)
-
-    @staticmethod
-    async def _zoho_count(creds: dict, obj_name: str, query: str = "", time_filter: dict = None) -> int:
-        zoho_token = creds.get("access_token")
-        domain = (creds.get("api_domain") or "https://www.zohoapis.com").rstrip('/')
-        if not domain.startswith("http"):
-            domain = f"https://{domain}"
-
-        headers = {"Authorization": f"Zoho-oauthtoken {zoho_token}"}
-
-        try:
-            time_clause = build_zoho_time_clause(time_filter)
-        except TimeFilterError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        stripped = (query or "").strip()
-
-        if not stripped and not time_clause:
-            url = f"{domain}/crm/v6/{obj_name}/actions/count"
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                res = await client.get(url, headers=headers)
-                if res.status_code != 200:
-                    raise HTTPException(status_code=400, detail=f"Zoho rejected count request: {res.text}")
-                return res.json().get("count", 0)
-
-        
-        if stripped.lower().startswith("select "):
-            coql_query = re.sub(r'(?i)^select\s+.*?\s+from\s+', 'select COUNT(id) from ', stripped, count=1)
-            coql_query = re.sub(r'(?i)\blimit\b\s+\d+', '', coql_query).strip()
-            if time_clause:
-                coql_query = merge_time_clause(coql_query, time_clause, where_kw="where", and_kw="and")
-        else:
-            where_parts = []
-            if stripped:
-                where_parts.append(f"({stripped})")
-            if time_clause:
-                where_parts.append(time_clause)
-            coql_query = f"select COUNT(id) from {obj_name} where {' and '.join(where_parts)}"
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(f"{domain}/crm/v6/coql", headers=headers, json={"select_query": coql_query})
-            if res.status_code != 200:
-                raise HTTPException(status_code=400, detail=f"Zoho rejected count query: {res.text}")
-            rows = res.json().get("data", [])
-            if not rows:
-                return 0
-            for value in rows[0].values():
-                if isinstance(value, (int, float)):
-                    return int(value)
-            return 0
 
     @staticmethod
     async def _zendesk_count(creds: dict, obj_name: str, query: str = "", time_filter: dict = None) -> int:

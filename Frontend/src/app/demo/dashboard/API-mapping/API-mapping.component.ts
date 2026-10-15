@@ -562,6 +562,28 @@ private showSchemaLoader(): void {
     return (query || '').replace(/\s+/g, ' ').trim();
   }
 
+  private getTopLevelFromObject(sql: string): string | null {
+    let depth = 0;
+    let inString = false;
+
+    for (let i = 0; i < sql.length; i++) {
+      const ch = sql[i];
+
+      if (ch === "'" && sql[i - 1] !== '\\') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+
+      if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && sql.startsWith(' from ', i)) {
+        return sql.slice(i + 6).trim().split(/[\s,)]/)[0] || null;
+      }
+    }
+    return null;
+  }
+
   private splitTopLevel(input: string, delimiter: string): string[] {
     const parts: string[] = [];
     let depth = 0;
@@ -2367,12 +2389,12 @@ onReviewPanelDragEnd(): void {
       // Multi-line pasted queries ("SELECT\n Id,\n Name\nFROM Account") must validate like single-line ones.
       const sqlLower = this.normalizeSql(this.customQuery).toLowerCase();
 
-      if (this.customQuery.includes('"')) {
+      if (this.customQuery.replace(/'(?:[^'\\]|\\.)*'/g, "''").includes('"')) {
         return applySquiggle('Salesforce strictly requires single quotes (\') for text values. Do not use double quotes (").', '"');
       }
 
-      if (/\border by\b/.test(sqlLower)) {
-        return applySquiggle('Do not use ORDER BY.', 'order by');
+      if (sqlLower.endsWith(';')) {
+         return applySquiggle('Do not end your query with a semicolon (;).', ';');
       } else if (sqlLower.endsWith(';')) {
         return applySquiggle('Do not end your query with a semicolon (;).', ';');
       }
@@ -2390,20 +2412,22 @@ onReviewPanelDragEnd(): void {
       }
 
       if (conditionPart.trim() !== '') {
-        if (
-          !conditionPart.includes('=') &&
-          !conditionPart.includes('<') &&
-          !conditionPart.includes('>') &&
-          !conditionPart.includes('like') &&
-          !conditionPart.includes(' is ')
-        ) {
-          return applySquiggle('Invalid Syntax: Missing SQL operators (e.g., =, <, >, LIKE).', conditionPart.trim().split(' ')[0]);
+        const hasOperator =
+          /(=|<|>)/.test(conditionPart) ||
+          /\b(like|in|includes|excludes|between|starts\s+with|ends\s+with|contains)\b/.test(conditionPart) ||
+          /\bis\s+(not\s+)?null\b/.test(conditionPart) ||
+          conditionPart.includes(' is ');
+
+        if (!hasOperator) {
+          return applySquiggle(
+            'Invalid Syntax: Missing SQL operators (e.g., =, <, >, LIKE, IN, BETWEEN).',
+            conditionPart.trim().split(' ')[0]
+          );
         }
       }
 
-      if (hasSelect && sqlLower.includes(' from ')) {
-        const fromParts = sqlLower.split(' from ');
-        const objPart = fromParts[1].trim().split(' ')[0];
+      if (hasSelect) {
+        const objPart = this.getTopLevelFromObject(sqlLower);
         if (objPart && objPart.toLowerCase() !== this.selectedSourceObject.toLowerCase()) {
           return applySquiggle(
             `Object Mismatch: You selected '${this.selectedSourceObject}', but your query says FROM '${objPart}'.`,
@@ -2414,7 +2438,7 @@ onReviewPanelDragEnd(): void {
 
       const sqlRegex = /\b([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*)(?:\s*(?:<>|!=|<=|>=|=|<|>)|\s+(?:like|is(?:\s+not)?))\s*('(?:[^'\\]|\\.)*'|[^\s()',]+)/gi;
       const reservedWords = new Set(['select', 'from', 'where', 'and', 'or', 'null', 'is', 'like', 'not']);
-      const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent']);
+      const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent', 'long', 'bigint', 'decimal', 'float']);
 
       // Skip until describe metadata has loaded, otherwise every field would be flagged invalid.
       if (this.allSourceFields.length > 0) {
@@ -2424,8 +2448,6 @@ onReviewPanelDragEnd(): void {
           const rawPath = match[1];
           if (reservedWords.has(rawPath.toLowerCase())) continue;
 
-          // Relationship traversal (RecordType.Name, Owner.Profile.Name) cannot be validated
-          // against this object's describe; the CRM validates it server-side.
           if (rawPath.includes('.')) continue;
 
           const schemaField = this.allSourceFields.find((f) => f.name.toLowerCase() === rawPath.toLowerCase());
