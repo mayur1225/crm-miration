@@ -65,8 +65,7 @@ def get_salesforce_url(side: str, environment: str = "production", current_user 
         "prompt": "login consent"
     }
     
-    # &prompt=login forces Salesforce account chooser
-    auth_url = f"https://{domain}/services/oauth2/authorize?{urllib.parse.urlencode(params)}&prompt=login"
+    auth_url = f"https://{domain}/services/oauth2/authorize?{urllib.parse.urlencode(params)}"
     return {"url": auth_url}
 
 @router.get("/auth/salesforce/callback")
@@ -80,6 +79,7 @@ async def salesforce_callback(code: str = None, state: str = None, error: str = 
     except Exception:
         return RedirectResponse(url=f"http://vm-sureshift.ecamapps.net/connection?status=error")
 
+    environment = (environment or "production").lower()
     domain = "test.salesforce.com" if environment == "sandbox" else "login.salesforce.com"
     token_url = f"https://{domain}/services/oauth2/token"
 
@@ -122,8 +122,7 @@ async def salesforce_callback(code: str = None, state: str = None, error: str = 
 @router.get("/auth/zoho/login")
 def get_zoho_url(side: str, region: str = "IN", current_user = Depends(get_current_user)):
     custom_state = f"{side}::{current_user.id}::{region}"
-    
-    
+
     scopes = [
         "ZohoCRM.modules.ALL", 
         "ZohoCRM.bulk.READ", 
@@ -143,7 +142,8 @@ def get_zoho_url(side: str, region: str = "IN", current_user = Depends(get_curre
         "state": custom_state
     }
     
-    auth_url = f"https://accounts.zoho.com/oauth/v2/auth?{urllib.parse.urlencode(params)}"
+    accounts_base = ZOHO_REGIONS.get((region or "us").lower(), ZOHO_REGIONS["us"])
+    auth_url = f"{accounts_base}/oauth/v2/auth?{urllib.parse.urlencode(params)}"
     return {"url": auth_url}
 
 @router.get("/auth/zoho/callback")
@@ -314,10 +314,12 @@ async def hubspot_callback(code: str, state: str):
 # CORE CONNECTIONS MANAGEMENT
 # =========================================================
 @router.get("/connections")
-def get_connections(current_user = Depends(get_current_user)):
-    return CrmService.get_user_connections(current_user.id)
+async def get_connections(current_user = Depends(get_current_user)):
+    return await CrmService.get_connections_with_status(current_user.id)
 
 @router.delete("/connections/{side}")
 def disconnect_crm(side: str, current_user = Depends(get_current_user)):
+    if side not in ("source", "target"):
+        raise HTTPException(status_code=400, detail="side must be 'source' or 'target'.")
     CrmService.delete_connection(current_user.id, side)
     return {"success": True}

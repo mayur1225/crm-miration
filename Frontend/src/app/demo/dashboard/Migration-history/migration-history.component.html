@@ -254,7 +254,7 @@
     <div class="col-sm-12">
       <div class="card shadow-sm border-0 rounded-3">
         <div class="card-header bg-white border-0 pt-3 px-3 pb-0">
-          <ul class="nav nav-tabs card-header-tabs">
+          <ul class="nav nav-tabs history-tabs">
             <li class="nav-item">
               <a class="nav-link" [class.active]="activeTab() === 'migrations'" (click)="setTab('migrations')"
                 role="button">
@@ -270,7 +270,7 @@
           </ul>
         </div>
 
-        <div class="card-body p-0">
+        <div class="card-body px-0 pt-3 pb-0">
 
           @if (isLoading()) {
           <div class="d-flex flex-column align-items-center justify-content-center p-5 text-muted">

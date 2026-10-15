@@ -4,6 +4,24 @@ from fastapi import HTTPException
 
 client = httpx.AsyncClient(timeout=30.0)
 
+
+def _session_expired(crm: str) -> HTTPException:
+    return HTTPException(
+        status_code=401,
+        detail={
+            "code": "CRM_SESSION_EXPIRED",
+            "crm": crm,
+            "message": f"Your {crm} session has expired. Please log in again.",
+        },
+    )
+
+
+def _upstream_error(e: "httpx.HTTPStatusError", crm: str, message: str) -> HTTPException:
+    """Upstream 401 == dead CRM token -> coded error the frontend turns into a re-login redirect."""
+    if e.response.status_code == 401:
+        return _session_expired(crm)
+    return HTTPException(status_code=e.response.status_code, detail=message)
+
 class CrmMetadataService:
     
     # =========================================================
@@ -12,7 +30,7 @@ class CrmMetadataService:
     @staticmethod
     async def fetch_salesforce_objects(sf_token: str, instance_url: str):
         if not sf_token or not instance_url:
-            raise HTTPException(status_code=401, detail="Missing Salesforce session credentials.")
+            raise _session_expired("salesforce")
         
         headers = {"Authorization": f"Bearer {sf_token}", "Content-Type": "application/json"}
         url = f"{instance_url.rstrip('/')}/services/data/v60.0/sobjects"
@@ -38,14 +56,14 @@ class CrmMetadataService:
                 return sorted(objects, key=lambda x: x["label"])
                 
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Salesforce rejected object request: {e.response.text}")
+            raise _upstream_error(e, "salesforce", f"Salesforce rejected object request: {e.response.text}")
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Network error connecting to Salesforce: {str(e)}")
 
     @staticmethod
     async def fetch_salesforce_fields(sf_token: str, instance_url: str, object_name: str):
         if not sf_token or not instance_url:
-            raise HTTPException(status_code=401, detail="Missing Salesforce session credentials.")
+            raise _session_expired("salesforce")
             
         headers = {"Authorization": f"Bearer {sf_token}", "Content-Type": "application/json"}
         base_url = instance_url.rstrip('/')
@@ -107,7 +125,7 @@ class CrmMetadataService:
                 }
                 
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Salesforce schema error: {e.response.text}")
+            raise _upstream_error(e, "salesforce", f"Salesforce schema error: {e.response.text}")
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Network error connecting to Salesforce: {str(e)}")
 
@@ -154,7 +172,7 @@ class CrmMetadataService:
     @staticmethod
     async def fetch_zendesk_fields(zd_token: str, subdomain: str, object_name: str):
         if not zd_token or not subdomain:
-            raise HTTPException(status_code=401, detail="Missing active Zendesk session parameters.")
+            raise _session_expired("zendesk")
             
         headers = {"Authorization": f"Bearer {zd_token}", "Content-Type": "application/json"}
         base_url = f"https://{subdomain}.zendesk.com/api/v2"
@@ -293,7 +311,7 @@ class CrmMetadataService:
             }
             
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Zendesk data fetch error for '{object_name}': {e.response.text}")
+            raise _upstream_error(e, "zendesk", f"Zendesk data fetch error for '{object_name}': {e.response.text}")
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Zendesk network connection failed: {str(e)}")
 
@@ -305,7 +323,7 @@ class CrmMetadataService:
     @staticmethod
     async def fetch_zoho_objects(zoho_token: str, api_domain: str):
         if not zoho_token or not api_domain:
-            raise HTTPException(status_code=401, detail="Missing Zoho session credentials.")
+            raise _session_expired("zoho")
 
         headers = {"Authorization": f"Zoho-oauthtoken {zoho_token}"}
         
@@ -330,14 +348,14 @@ class CrmMetadataService:
                 return sorted(objects, key=lambda x: x["label"])
 
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Zoho rejected module request: {e.response.text}")
+            raise _upstream_error(e, "zoho", f"Zoho rejected module request: {e.response.text}")
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Network error connecting to Zoho: {str(e)}")
 
     @staticmethod
     async def fetch_zoho_fields(zoho_token: str, api_domain: str, module_name: str):
         if not zoho_token or not api_domain:
-            raise HTTPException(status_code=401, detail="Missing Zoho session credentials.")
+            raise _session_expired("zoho")
 
         headers = {"Authorization": f"Zoho-oauthtoken {zoho_token}"}
         
@@ -416,7 +434,7 @@ class CrmMetadataService:
                 }
 
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Zoho schema error: {e.response.text}")
+            raise _upstream_error(e, "zoho", f"Zoho schema error: {e.response.text}")
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Network error connecting to Zoho: {str(e)}")
 
@@ -427,7 +445,7 @@ class CrmMetadataService:
     @staticmethod
     async def fetch_hubspot_objects(hs_token: str, api_domain: str = "https://api.hubapi.com"):
         if not hs_token:
-            raise HTTPException(status_code=401, detail="Missing HubSpot session credentials.")
+            raise _session_expired("hubspot")
 
         headers = {
             "Authorization": f"Bearer {hs_token}",
@@ -467,14 +485,14 @@ class CrmMetadataService:
                 return sorted(objects, key=lambda x: x["label"])
 
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"HubSpot rejected object request: {e.response.text}")
+            raise _upstream_error(e, "hubspot", f"HubSpot rejected object request: {e.response.text}")
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Network error connecting to HubSpot: {str(e)}")
 
     @staticmethod
     async def fetch_hubspot_fields(hs_token: str, api_domain: str, object_name: str):
         if not hs_token:
-            raise HTTPException(status_code=401, detail="Missing HubSpot session credentials.")
+            raise _session_expired("hubspot")
 
         headers = {
             "Authorization": f"Bearer {hs_token}",
@@ -551,6 +569,6 @@ class CrmMetadataService:
                 }
 
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"HubSpot schema error for '{object_name}': {e.response.text}")
+            raise _upstream_error(e, "hubspot", f"HubSpot schema error for '{object_name}': {e.response.text}")
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"Network error connecting to HubSpot: {str(e)}")

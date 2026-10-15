@@ -1,7 +1,9 @@
 import logging
+import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
+from datetime import datetime, timezone
 
 import httpx
 
@@ -10,23 +12,23 @@ from app.services.crm_service import CrmService
 logger = logging.getLogger(__name__)
 
 PICKLIST_TYPES = {"picklist", "multipicklist"}
-# Metadata API requires StandardValue child elements in alphabetical order (fullName first).
 _SVS_ENTRY_FIELDS = [
     "fullName", "allowEmail", "closed", "color", "converted", "cssExposed", "default",
     "description", "forecastCategory", "groupingString", "highPriority", "isActive",
     "label", "probability", "reverseRole", "reviewed", "won",
 ]
 
-# object (lower) -> field API name -> StandardValueSet name. Extend per object as needed.
-STANDARD_VALUE_SET_NAMES: Dict[str, Dict[str, str]] = {
-    "account": {
-        "Industry": "Industry",
-        "Type": "AccountType",
-        "Rating": "AccountRating",
-        "Ownership": "AccountOwnership",
-        "AccountSource": "LeadSource",
-    },
+
+_SVS_NEW_ENTRY_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "opportunitystage": {"closed": False, "won": False, "probability": 10, "forecastCategory": "Pipeline"},
+    "casestatus": {"closed": False},
+    "leadstatus": {"converted": False},
+    "taskstatus": {"closed": False},
+    "taskpriority": {"highPriority": False},
 }
+
+_GLOBAL_VALUE_SET_ID = re.compile(r"^0Nt[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?$")
+_MAX_OVERLAP_CANDIDATES = 5
 
 
 class PicklistSyncError(Exception):
@@ -37,19 +39,38 @@ def _soql_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+def _active_values(field_meta: Dict[str, Any]) -> set:
+    return {
+        str(v.get("value", "")).strip().lower()
+        for v in (field_meta.get("picklistValues") or [])
+        if v.get("active", True) and str(v.get("value", "")).strip()
+    }
+
+
 class _SalesforceSession:
     API_VERSION = "v60.0"
 
-    def __init__(self, client: httpx.AsyncClient, creds: Dict[str, Any], user_id: str, role: str):
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        creds: Dict[str, Any],
+        user_id: str,
+        role: str,
+    ):
         self.client = client
         self.token: str = creds.get("access_token") or ""
         self.instance_url: str = (creds.get("instance_url") or "").rstrip("/")
         self.user_id = user_id
         self.role = role
         self._describe_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self.svs_names: Optional[List[str]] = None
+        self.svs_resolution_cache: Dict[Tuple[str, str], str] = {}
 
         if not self.token or not self.instance_url:
             raise PicklistSyncError(f"Missing Salesforce credentials for {role} org.")
+
+    async def _refresh_token(self) -> str:
+        return await CrmService.refresh_crm_token(self.user_id, "salesforce", self.role)
 
     async def request(self, method: str, path: str, **kwargs) -> httpx.Response:
         url = f"{self.instance_url}/services/data/{self.API_VERSION}{path}"
@@ -61,15 +82,15 @@ class _SalesforceSession:
                 **kwargs,
             )
             if res.status_code == 401 and attempt == 0:
-                self.token = await CrmService.refresh_crm_token(self.user_id, "salesforce", self.role)
+                self.token = await self._refresh_token()
                 continue
             if res.status_code >= 400:
                 raise PicklistSyncError(f"{method} {path} -> {res.status_code}: {res.text[:500]}")
             return res
         raise PicklistSyncError(f"{method} {path} failed after token refresh.")
 
-    async def describe_fields(self, object_name: str) -> Dict[str, Dict[str, Any]]:
-        if object_name not in self._describe_cache:
+    async def describe_fields(self, object_name: str, refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        if refresh or object_name not in self._describe_cache:
             res = await self.request("GET", f"/sobjects/{object_name}/describe")
             self._describe_cache[object_name] = {f["name"]: f for f in res.json().get("fields", [])}
         return self._describe_cache[object_name]
@@ -80,6 +101,61 @@ class _SalesforceSession:
 
     async def tooling_patch_metadata(self, sobject: str, record_id: str, metadata: Dict[str, Any]) -> None:
         await self.request("PATCH", f"/tooling/sobjects/{sobject}/{record_id}", json={"Metadata": metadata})
+
+    # ------------------------------------------------------------------
+    # Metadata SOAP API
+    # ------------------------------------------------------------------
+    async def _soap(self, body_xml: str) -> ET.Element:
+        url = f"{self.instance_url}/services/Soap/m/{self.API_VERSION.lstrip('v')}"
+
+        res: Optional[httpx.Response] = None
+        for attempt in range(2):
+            envelope = (
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/" '
+                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+                'xmlns:meta="http://soap.sforce.com/2006/04/metadata">'
+                f"<env:Header><meta:SessionHeader><meta:sessionId>{xml_escape(self.token)}</meta:sessionId>"
+                "</meta:SessionHeader></env:Header>"
+                f"<env:Body>{body_xml}</env:Body></env:Envelope>"
+            )
+            res = await self.client.post(
+                url,
+                content=envelope.encode("utf-8"),
+                headers={"Content-Type": "text/xml; charset=UTF-8", "SOAPAction": '""'},
+            )
+            if "INVALID_SESSION_ID" in res.text and attempt == 0:
+                self.token = await self._refresh_token()
+                continue
+            break
+
+        if res is None:
+            raise PicklistSyncError("Metadata API request was never sent.")
+
+        try:
+            root = ET.fromstring(res.text)
+        except ET.ParseError:
+            raise PicklistSyncError(f"Metadata API returned an unreadable response ({res.status_code}): {res.text[:300]}")
+
+        faults = self._texts(root, "faultstring")
+        if faults:
+            raise PicklistSyncError(f"Metadata API fault: {faults[0]}")
+        return root
+
+    @staticmethod
+    def _texts(root: ET.Element, tag: str) -> List[str]:
+        return [(el.text or "").strip() for el in root.iter() if el.tag.split("}")[-1] == tag]
+
+    async def metadata_list_names(self, metadata_type: str) -> List[str]:
+        """listMetadata is the only supported way to enumerate StandardValueSet names
+        (the Tooling StandardValueSet object cannot be queried without a filter)."""
+        root = await self._soap(
+            "<meta:listMetadata><meta:queries>"
+            f"<meta:type>{xml_escape(metadata_type)}</meta:type>"
+            f"</meta:queries><meta:asOfVersion>{self.API_VERSION.lstrip('v')}</meta:asOfVersion>"
+            "</meta:listMetadata>"
+        )
+        return sorted({name for name in self._texts(root, "fullName") if name})
 
     @staticmethod
     def _svs_entry_xml(entry: Dict[str, Any]) -> str:
@@ -99,46 +175,18 @@ class _SalesforceSession:
     async def metadata_update_standard_value_set(
         self, full_name: str, sorted_flag: bool, entries: List[Dict[str, Any]]
     ) -> None:
-        url = f"{self.instance_url}/services/Soap/m/{self.API_VERSION.lstrip('v')}"
-
-        for attempt in range(2):
-            envelope = (
-                '<?xml version="1.0" encoding="utf-8"?>'
-                '<env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/" '
-                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
-                'xmlns:meta="http://soap.sforce.com/2006/04/metadata">'
-                f"<env:Header><meta:SessionHeader><meta:sessionId>{xml_escape(self.token)}</meta:sessionId>"
-                "</meta:SessionHeader></env:Header>"
-                "<env:Body><meta:updateMetadata>"
-                '<meta:metadata xsi:type="meta:StandardValueSet">'
-                f"<meta:fullName>{xml_escape(full_name)}</meta:fullName>"
-                f"<meta:sorted>{'true' if sorted_flag else 'false'}</meta:sorted>"
-                f"{''.join(self._svs_entry_xml(e) for e in entries)}"
-                "</meta:metadata></meta:updateMetadata></env:Body></env:Envelope>"
+        root = await self._soap(
+            "<meta:updateMetadata>"
+            '<meta:metadata xsi:type="meta:StandardValueSet">'
+            f"<meta:fullName>{xml_escape(full_name)}</meta:fullName>"
+            f"<meta:sorted>{'true' if sorted_flag else 'false'}</meta:sorted>"
+            f"{''.join(self._svs_entry_xml(e) for e in entries)}"
+            "</meta:metadata></meta:updateMetadata>"
+        )
+        if "true" not in [s.lower() for s in self._texts(root, "success")]:
+            raise PicklistSyncError(
+                f"updateMetadata failed: {'; '.join(self._texts(root, 'message')) or 'no success flag returned'}"
             )
-            res = await self.client.post(
-                url,
-                content=envelope.encode("utf-8"),
-                headers={"Content-Type": "text/xml; charset=UTF-8", "SOAPAction": '""'},
-            )
-            if "INVALID_SESSION_ID" in res.text and attempt == 0:
-                self.token = await CrmService.refresh_crm_token(self.user_id, "salesforce", self.role)
-                continue
-            break
-
-        try:
-            root = ET.fromstring(res.text)
-        except ET.ParseError:
-            raise PicklistSyncError(f"Metadata API returned an unreadable response ({res.status_code}): {res.text[:300]}")
-
-        def texts(tag: str) -> List[str]:
-            return [(el.text or "").strip() for el in root.iter() if el.tag.split("}")[-1] == tag]
-
-        faults = texts("faultstring")
-        if faults:
-            raise PicklistSyncError(f"Metadata API fault: {faults[0]}")
-        if "true" not in [s.lower() for s in texts("success")]:
-            raise PicklistSyncError(f"updateMetadata failed: {'; '.join(texts('message')) or res.text[:300]}")
 
 
 class PicklistSyncService:
@@ -170,7 +218,20 @@ class PicklistSyncService:
         return missing
 
     @staticmethod
-    def _append_entries(entries: List[Dict[str, Any]], missing: List[Dict[str, str]]) -> List[str]:
+    def _append_entries(
+        entries: List[Dict[str, Any]],
+        missing: List[Dict[str, str]],
+        extras: Optional[Dict[str, Any]] = None,
+        added_by: Optional[str] = None,
+        requested_by: Optional[str] = None,
+    ) -> List[str]:
+        for e in entries:
+            if e.get("isActive") is None:
+                e["isActive"] = True
+
+        who = f" (requested by {requested_by})" if requested_by else ""
+        stamp = f"Added by SureShift Migration{who} on {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
+
         index = {str(e.get("valueName", "")).strip().lower(): e for e in entries}
         added = []
         for m in missing:
@@ -179,6 +240,8 @@ class PicklistSyncService:
             if existing is not None:
                 if existing.get("isActive") is False:
                     existing["isActive"] = True
+                    if stamp:
+                        existing["description"] = stamp
                     added.append(m["value"])
                 continue
             entries.append({
@@ -187,11 +250,143 @@ class PicklistSyncService:
                 "default": False,
                 "isActive": True,
                 "color": None,
-                "description": None,
+                "description": stamp,
+                **(extras or {}),
             })
             added.append(m["value"])
         return added
 
+    # ------------------------------------------------------------------
+    # Dynamic StandardValueSet resolution
+    # ------------------------------------------------------------------
+    @classmethod
+    async def _standard_value_set_exists(cls, session: _SalesforceSession, name: str) -> bool:
+        recs = await session.tooling_query(
+            f"SELECT Id FROM StandardValueSet WHERE MasterLabel = '{_soql_escape(name)}'"
+        )
+        return bool(recs)
+
+    @classmethod
+    async def _list_standard_value_set_names(cls, session: _SalesforceSession) -> List[str]:
+        if session.svs_names is None:
+            try:
+                session.svs_names = await session.metadata_list_names("StandardValueSet")
+            except PicklistSyncError as e:
+                logger.warning("listMetadata(StandardValueSet) failed: %s", e)
+                session.svs_names = []
+        return session.svs_names
+
+    @classmethod
+    async def _resolve_via_entity_particle(
+        cls, session: _SalesforceSession, obj: str, field_name: str
+    ) -> Optional[str]:
+        """EntityParticle.ValueTypeId carries the value-set name for standard picklists.
+        The candidate is verified with a filtered StandardValueSet query before use."""
+        try:
+            recs = await session.tooling_query(
+                "SELECT ValueTypeId FROM EntityParticle "
+                f"WHERE EntityDefinition.QualifiedApiName = '{_soql_escape(obj)}' "
+                f"AND QualifiedApiName = '{_soql_escape(field_name)}'"
+            )
+        except PicklistSyncError as e:
+            logger.debug("EntityParticle lookup failed for %s.%s: %s", obj, field_name, e)
+            return None
+
+        value_type = ((recs[0].get("ValueTypeId") if recs else None) or "").strip()
+        if not value_type or _GLOBAL_VALUE_SET_ID.match(value_type):
+            return None
+        try:
+            return value_type if await cls._standard_value_set_exists(session, value_type) else None
+        except PicklistSyncError as e:
+            logger.debug("StandardValueSet verification failed for %s: %s", value_type, e)
+            return None
+
+    @classmethod
+    async def _resolve_by_value_overlap(
+        cls,
+        session: _SalesforceSession,
+        obj: str,
+        field_name: str,
+        field_meta: Dict[str, Any],
+    ) -> Optional[str]:
+        """Probes likely value-set names directly with filtered Tooling queries (no dependency on
+        listMetadata), then widens with listMetadata names. A candidate is accepted only if the
+        destination field's live active values overlap its entries."""
+        obj_l, field_l = obj.lower(), field_name.lower()
+
+        guesses: List[str] = []
+        for g in (
+            f"{obj}{field_name}",
+            f"{obj}{field_name[:-4]}" if field_name.endswith("Name") else "",
+            field_name,
+            f"{obj}{field_name}s",
+        ):
+            if g and g not in guesses:
+                guesses.append(g)
+
+        names = await cls._list_standard_value_set_names(session)
+        lookup = {n.lower(): n for n in names}
+        candidates: List[str] = [lookup.get(g.lower(), g) for g in guesses]
+
+        fuzzy = [
+            n for n in names
+            if n not in candidates and (field_l in n.lower() or (n.lower() in field_l and len(n) > 3))
+        ]
+        fuzzy.sort(key=lambda n: (not n.lower().startswith(obj_l), len(n)))
+        candidates = (candidates + fuzzy)[: _MAX_OVERLAP_CANDIDATES + len(guesses)]
+
+        target_values = _active_values(field_meta)
+        tried: List[str] = []
+        for name in candidates:
+            try:
+                recs = await session.tooling_query(
+                    f"SELECT Id, Metadata FROM StandardValueSet WHERE MasterLabel = '{_soql_escape(name)}'"
+                )
+            except PicklistSyncError as e:
+                tried.append(f"{name} (query error: {str(e)[:120]})")
+                continue
+            if not recs:
+                tried.append(f"{name} (not found)")
+                continue
+
+            set_values = {
+                str(e.get("valueName", "")).strip().lower()
+                for e in (recs[0].get("Metadata") or {}).get("standardValue") or []
+            }
+            if not target_values:
+                return name
+            overlap = len(target_values & set_values) / len(target_values)
+            if overlap >= 0.5:
+                return name
+            tried.append(f"{name} (overlap {overlap:.0%})")
+
+        logger.warning("Value-set resolution for %s.%s tried: %s", obj, field_name, "; ".join(tried) or "nothing")
+        return None
+
+    @classmethod
+    async def _resolve_standard_value_set(
+        cls, session: _SalesforceSession, obj: str, field_name: str, field_meta: Dict[str, Any]
+    ) -> str:
+        cache_key = (obj.lower(), field_name)
+        if cache_key in session.svs_resolution_cache:
+            return session.svs_resolution_cache[cache_key]
+
+        resolved = (
+            await cls._resolve_via_entity_particle(session, obj, field_name)
+            or await cls._resolve_by_value_overlap(session, obj, field_name, field_meta)
+        )
+        if not resolved:
+            raise PicklistSyncError(
+                f"'{obj}.{field_name}' is a standard picklist but no matching StandardValueSet could be "
+                f"resolved in the destination org. Check the server log line "
+                f"'Value-set resolution for {obj}.{field_name} tried: ...' for the candidates and why each failed."
+            )
+        session.svs_resolution_cache[cache_key] = resolved
+        return resolved
+
+    # ------------------------------------------------------------------
+    # Value-set writers
+    # ------------------------------------------------------------------
     @classmethod
     async def _add_to_global_value_set(cls, session: _SalesforceSession, name: str, missing) -> List[str]:
         recs = await session.tooling_query(
@@ -201,7 +396,7 @@ class PicklistSyncService:
             raise PicklistSyncError(f"Global value set '{name}' not found in destination org.")
         metadata = recs[0]["Metadata"]
         metadata["customValue"] = metadata.get("customValue") or []
-        added = cls._append_entries(metadata["customValue"], missing)
+        added = cls._append_entries(metadata["customValue"], missing, added_by=str(session.user_id))
         if added:
             await session.tooling_patch_metadata("GlobalValueSet", recs[0]["Id"], metadata)
         return added
@@ -216,7 +411,8 @@ class PicklistSyncService:
 
         metadata = recs[0]["Metadata"]
         entries = metadata.get("standardValue") or []
-        added = cls._append_entries(entries, missing)
+        extras = _SVS_NEW_ENTRY_DEFAULTS.get(name.lower())
+        added = cls._append_entries(entries, missing, extras, added_by=str(session.user_id))
         if added:
             await session.metadata_update_standard_value_set(
                 name, bool(metadata.get("sorted", False)), entries
@@ -244,7 +440,7 @@ class PicklistSyncService:
 
         definition = value_set.get("valueSetDefinition") or {"sorted": False, "value": []}
         definition["value"] = definition.get("value") or []
-        added = cls._append_entries(definition["value"], missing)
+        added = cls._append_entries(definition["value"], missing, added_by=str(session.user_id))
         if added:
             value_set["valueSetDefinition"] = definition
             metadata["valueSet"] = value_set
@@ -252,15 +448,18 @@ class PicklistSyncService:
         return added
 
     @classmethod
-    async def _add_values(cls, session: _SalesforceSession, obj: str, field_name: str, missing) -> List[str]:
-        std_set = STANDARD_VALUE_SET_NAMES.get(obj.lower(), {}).get(field_name)
-        if std_set:
-            return await cls._add_to_standard_value_set(session, std_set, missing)
-        if field_name.endswith("__c"):
+    async def _add_values(
+        cls,
+        session: _SalesforceSession,
+        obj: str,
+        field_name: str,
+        missing,
+        field_meta: Dict[str, Any],
+    ) -> List[str]:
+        if field_meta.get("custom") or field_name.endswith("__c"):
             return await cls._add_to_custom_field(session, obj, field_name, missing)
-        raise PicklistSyncError(
-            f"'{obj}.{field_name}' is a standard picklist without a known StandardValueSet mapping."
-        )
+        std_set = await cls._resolve_standard_value_set(session, obj, field_name, field_meta)
+        return await cls._add_to_standard_value_set(session, std_set, missing)
 
     @classmethod
     async def sync(
@@ -273,8 +472,9 @@ class PicklistSyncService:
         target_object: str,
         mappings: List[Dict[str, Any]],
         send_log,
-    ) -> Dict[str, List[str]]:
+    ) -> Dict[str, Dict[str, Any]]:
         created: Dict[str, List[str]] = {}
+        failed: Dict[str, str] = {}
         try:
             source = _SalesforceSession(client, source_creds, user_id, "source")
             target = _SalesforceSession(client, target_creds, user_id, "target")
@@ -282,10 +482,11 @@ class PicklistSyncService:
             target_fields = await target.describe_fields(target_object)
         except PicklistSyncError as e:
             await send_log(f"[{target_object}] Picklist Sync skipped: {e}")
-            return created
+            return {"created": created, "failed": {"*": str(e)}}
 
         for m in mappings:
-            src_name, tgt_name = m.get("sourceField"), m.get("targetField")
+            src_name = m.get("sourceField") or m.get("csvField")
+            tgt_name = m.get("targetField") or m.get("sfField")
             src_meta, tgt_meta = source_fields.get(src_name), target_fields.get(tgt_name)
 
             if not src_meta or not tgt_meta:
@@ -305,11 +506,27 @@ class PicklistSyncService:
                 f"{', '.join(v['value'] for v in missing)}"
             )
             try:
-                added = await cls._add_values(target, target_object, tgt_name, missing)
+                added = await cls._add_values(target, target_object, tgt_name, missing, tgt_meta)
                 created[tgt_name] = added
                 await send_log(f"[{target_object}] Picklist Sync: {tgt_name} updated ({len(added)} value(s) added).")
-            except PicklistSyncError as e:
+
+                fresh = (await target.describe_fields(target_object, refresh=True)).get(tgt_name) or {}
+                live = {
+                    str(v.get("value", "")).strip().lower(): v.get("active", True)
+                    for v in fresh.get("picklistValues") or []
+                }
+                not_active = [v for v in added if live.get(v.strip().lower()) is not True]
+                if not_active:
+                    failed[tgt_name] = f"not active after write: {', '.join(not_active)}"
+                    await send_log(
+                        f"[{target_object}] Picklist Sync WARNING: {tgt_name} values not active after write: "
+                        f"{', '.join(not_active)}"
+                    )
+                else:
+                    await send_log(f"[{target_object}] Picklist Sync: verified {tgt_name} values are active.")
+            except (PicklistSyncError, httpx.HTTPError) as e:
+                failed[tgt_name] = str(e)
                 logger.warning("Picklist sync failed for %s.%s: %s", target_object, tgt_name, e)
                 await send_log(f"[{target_object}] Picklist Sync failed for {tgt_name}: {e}")
 
-        return created
+        return {"created": created, "failed": failed}

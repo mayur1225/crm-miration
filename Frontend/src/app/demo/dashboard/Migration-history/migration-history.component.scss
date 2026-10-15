@@ -143,6 +143,21 @@
 // ==========================================
 // TABS
 // ==========================================
+// Tab bar sits fully above the table (no negative card-header margins).
+.history-tabs {
+  flex-wrap: nowrap;
+  margin: 0;
+  position: relative;
+  z-index: 2;
+  border-bottom: 1px solid #dee2e6;
+}
+
+.history-tabs .nav-link {
+  white-space: nowrap;
+  padding: 0.6rem 1rem;
+  margin-bottom: -1px;
+}
+
 .nav-tabs .nav-link {
   cursor: pointer;
   color: #6c757d;

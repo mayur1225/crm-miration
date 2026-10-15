@@ -29,6 +29,8 @@ import re
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
+from app.services.sql_utils import split_query
+
 DEFAULT_SALESFORCE_DATE_FIELD = "LastModifiedDate"
 DEFAULT_ZOHO_DATE_FIELD = "Modified_Time"
 DEFAULT_ZENDESK_DATE_FIELD = "updated"        # Zendesk Search API query token
@@ -47,34 +49,25 @@ class TimeFilterError(ValueError):
 def merge_time_clause(base_query: str, time_clause: str, where_kw: str = "WHERE", and_kw: str = "AND") -> str:
     """
     Safely merges a time_clause into a query that already starts with SELECT.
-    Handles three cases:
-      - no WHERE at all             -> appends "WHERE <time_clause>"
-      - WHERE with a real condition -> "WHERE <time_clause> AND <condition>"
+    Handles:
+      - no WHERE at all             -> adds "WHERE <time_clause>"
+      - WHERE with a real condition -> "WHERE <time_clause> AND (<condition>)"
+        (the user's condition is parenthesised so `a = 1 OR b = 2` can't escape
+        the date filter through AND/OR precedence)
       - a *dangling* WHERE with     -> just fills it in, no trailing AND/and
-        nothing after it (e.g. a
-        cleared filter box that left
-        "...WHERE " behind)
-    Splits off any trailing LIMIT first so the "is there a real condition"
-    check isn't fooled by the limit clause itself.
+        nothing after it
+    The query is split with the paren/quote-aware splitter in sql_utils, so:
+      - a WHERE inside a sub-select is never mistaken for the outer WHERE,
+      - GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET stay AFTER the WHERE,
+      - keywords inside quoted values are ignored, and multi-line queries work.
     """
     if not time_clause:
         return base_query
 
-    limit_match = re.search(r'(?i)\blimit\b.*$', base_query)
-    head = base_query[:limit_match.start()] if limit_match else base_query
-    tail = base_query[limit_match.start():] if limit_match else ""
-
-    where_match = re.search(r'(?i)\bwhere\b', head)
-    if where_match:
-        existing_condition = head[where_match.end():].strip()
-        if existing_condition:
-            new_head = f"{head[:where_match.end()]} {time_clause} {and_kw} {existing_condition}"
-        else:
-            new_head = f"{head[:where_match.end()]} {time_clause}"
-    else:
-        new_head = f"{head.rstrip()} {where_kw} {time_clause}"
-
-    return f"{new_head} {tail}".strip() if tail else new_head.strip()
+    head, condition, tail = split_query(base_query)
+    where = f"{time_clause} {and_kw} ({condition})" if condition else time_clause
+    merged = f"{head} {where_kw} {where}"
+    return f"{merged} {tail}".strip() if tail else merged.strip()
 
 
 def _parse_date_range(

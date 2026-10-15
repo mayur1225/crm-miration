@@ -20,6 +20,8 @@ shows up for a given set of mappings.
 import re
 from typing import List
 
+from app.services.sql_utils import find_top_level_from, split_top_level_commas
+
 
 def ensure_fields_selected(select_query: str, required_fields: List[str]) -> str:
     """
@@ -29,28 +31,35 @@ def ensure_fields_selected(select_query: str, required_fields: List[str]) -> str
     present (case-insensitive, whitespace-trimmed comparison). Leaves
     FROM/WHERE/LIMIT and everything else untouched.
 
+    The FROM that ends the select list is the TOP-LEVEL one, and the list is split
+    on top-level commas only, so a sub-select such as
+    `SELECT Id, (SELECT Id FROM Contacts) FROM Account` is treated as one column
+    and never mistaken for the end of the list.
+
     No-ops (returns the query unchanged) if:
       - `required_fields` is empty -- nothing to guarantee
       - `select_query` doesn't actually start with SELECT
       - it's already a wildcard `SELECT *` -- the caller is expected to
         have already expanded `*` into a real field list before calling
         this, since a wildcard already implies "everything mapped"
+      - there is no top-level FROM
     """
     if not required_fields:
         return select_query
-    if not re.match(r'(?i)^\s*select\s+', select_query):
+    select_match = re.match(r'(?i)^\s*select\s+', select_query)
+    if not select_match:
         return select_query
     if re.match(r'(?i)^\s*select\s+\*\s', select_query):
         return select_query
 
-    select_clause = re.split(r'(?i)\s+from\s+', select_query, maxsplit=1)[0]
-    existing = {
-        f.strip().lower()
-        for f in re.sub(r'(?i)^\s*select\s+', '', select_clause).split(',')
-        if f.strip()
-    }
+    from_idx = find_top_level_from(select_query)
+    if from_idx is None:
+        return select_query
+
+    select_list = select_query[select_match.end():from_idx]
+    existing = {f.strip().lower() for f in split_top_level_commas(select_list) if f.strip()}
     missing = [f for f in required_fields if f.strip().lower() not in existing]
     if not missing:
         return select_query
 
-    return re.sub(r'(?i)^(\s*select\s+)', rf"\1{', '.join(missing)}, ", select_query, count=1)
+    return f"{select_query[:select_match.end()]}{', '.join(missing)}, {select_query[select_match.end():]}"

@@ -2,8 +2,8 @@ import { CommonModule } from '@angular/common';
 import { Component, OnInit, inject, ChangeDetectorRef, NgZone, HostListener, OnDestroy } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
-import { forkJoin, Subject } from 'rxjs';
-import { takeUntil } from 'rxjs/operators';
+import { forkJoin, of, Subject } from 'rxjs';
+import { takeUntil, catchError } from 'rxjs/operators';
 import { MappingApiService } from 'src/app/services/mapping-api.service';
 import { ToastrService } from 'ngx-toastr';
 import Swal from 'sweetalert2';
@@ -11,6 +11,15 @@ import { EditorComponent } from 'ngx-monaco-editor-v2';
 import { environment } from 'src/environments/environment';
 import { HttpClient } from '@angular/common/http';
 import { AuthService } from 'src/app/demo/Services/auth.service';
+import { CrmAuthService } from 'src/app/services/CrmAuthService.service';
+import {
+  CrmSide,
+  getExpiredSidesFromError,
+  getSocketExpiredSides,
+  isAuthExpiredError,
+  isConnectionExpired,
+  isSocketAuthExpired
+} from 'src/app/services/crm-session.util';
 declare const monaco: any;
 interface FieldMeta {
   name: string;
@@ -104,6 +113,8 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
   private zone = inject(NgZone);
   private toastr = inject(ToastrService);
   private authService = inject(AuthService);
+  private crmAuthService = inject(CrmAuthService);
+  private isRedirectingToLogin = false;
   private validationSocket: WebSocket | null = null;
   private migrationSocket: WebSocket | null = null;
   private http = inject(HttpClient);
@@ -112,6 +123,13 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
 
   /** Unfiltered source describe result. Used only for query validation; `sourceFields` is the writable subset used for mapping. */
   private allSourceFields: FieldMeta[] = [];
+
+  /**
+   * Single switch for ORDER BY in the Salesforce/Zoho query editor. While false, the validator rejects it AND the
+   * autocomplete hides ORDER BY / ASC / DESC, so the editor never suggests something it will then flag as an error.
+   * Flip to true once salesforce_migrator.py / zoho_migrator.py are confirmed to tolerate it.
+   */
+  private readonly allowOrderBy = true;
   private readonly PICKLIST_TYPES = ['picklist', 'multipicklist'];
 
   private readonly SYSTEM_MANAGED_FIELDS = new Set<string>([
@@ -316,49 +334,118 @@ get fileMigrationNotes(): string[] {
     renderLineHighlight: 'none',
     fontSize: 13,
     padding: { top: 10, bottom: 10 },
-    suggestOnTriggerCharacters: true
+    suggestOnTriggerCharacters: true,
+    automaticLayout: true // re-fits the editor when its container is resized/expanded
   };
+
+  // --- EXPANDABLE QUERY EDITOR ---
+  isQueryEditorExpanded = false;
+  queryEditorHeight = 120; // px; also changes when the user drags the resize handle
+
+  toggleQueryEditorSize(): void {
+    this.isQueryEditorExpanded = !this.isQueryEditorExpanded;
+    this.queryEditorHeight = this.isQueryEditorExpanded ? 350 : 120;
+    setTimeout(() => this.monacoEditorInstance?.layout(), 0);
+  }
 
   monacoEditorInstance: any;
   completionProvider: any;
+  hoverProvider: any;
 
   recoverableSessions: any[] = [];
   isSessionsLoading = false;
 
   ngOnInit(): void {
-    this.getUserData();
-// this.fetchRecoverableSessions();
-// this.preloadEntirePage();
-    const navState = history.state;
-    this.sourceCrmId = navState?.sourceCrm || localStorage.getItem('source_crm_slot');
-    this.targetCrmId = navState?.targetCrm || localStorage.getItem('target_crm_slot');
+  this.getUserData();
 
-    if (!this.sourceCrmId || !this.targetCrmId) {
-      this.toastr.warning('Please connect your Source and Target systems first.', 'Connections Required');
-      this.router.navigate(['/connection']);
-      return;
-    }
+  const navState = history.state;
+  this.sourceCrmId = navState?.sourceCrm || localStorage.getItem('source_crm_slot');
+  this.targetCrmId = navState?.targetCrm || localStorage.getItem('target_crm_slot');
 
-    this.sourceSystem = this.sourceCrmId;
-    this.targetSystem = this.targetCrmId;
-    this.migrationTimeFilter.field = this.timeFilterFieldOptions[0]?.value || '';
-    this.batchSize = this.batchConfig.default;
+  if (!this.sourceCrmId || !this.targetCrmId) {
+    this.toastr.warning('Please connect your Source and Target systems first.', 'Connections Required');
+    this.router.navigate(['/connection']);
+    return;
+  }
 
-    localStorage.setItem('source_crm_slot', this.sourceCrmId);
-    localStorage.setItem('target_crm_slot', this.targetCrmId);
+  this.sourceSystem = this.sourceCrmId;
+  this.targetSystem = this.targetCrmId;
+  this.migrationTimeFilter.field = this.timeFilterFieldOptions[0]?.value || '';
+  this.batchSize = this.batchConfig.default;
 
-    this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
+  localStorage.setItem('source_crm_slot', this.sourceCrmId);
+  localStorage.setItem('target_crm_slot', this.targetCrmId);
 
-    this.fetchRecoverableSessions();
+  this.recentQueries = JSON.parse(localStorage.getItem('crm_query_history') || '[]');
 
-    this.preloadEntirePage();
+  this.showSchemaLoader();
+  this.verifyCrmSessions(() => this.fetchRecoverableSessions());
+  this.preloadEntirePage();
+}
+
+private showSchemaLoader(): void {
+  this.isLoading = true;
+  this.isGlobalLoading = true;
+  this.globalLoadingText = 'Fetching Live Schemas...';
+  this.globalLoadingSubText = 'Please wait while we sync the CRM engines';
+}
+
+  // ==========================================
+  //  CRM SESSION EXPIRY
+  // ==========================================
+  private verifyCrmSessions(onValid: () => void): void {
+    this.crmAuthService.getUserConnections().subscribe({
+      next: (connections: any[]) => {
+        const isLive = (role: 'source' | 'target') =>
+          connections.some((c) => c.connection_role === role && !isConnectionExpired(c));
+
+        const expiredSides = (['source', 'target'] as const).filter((role) => !isLive(role));
+        if (expiredSides.length) {
+          this.handleSessionExpired(expiredSides);
+          return;
+        }
+        onValid();
+      },
+      error: (err) => {
+        if (isAuthExpiredError(err)) {
+          this.handleSessionExpired(getExpiredSidesFromError(err));
+        } else {
+          onValid(); 
+        }
+      }
+    });
+  }
+
+  handleSessionExpired(sides?: CrmSide[]): void {
+    if (this.isRedirectingToLogin) return;
+    this.isRedirectingToLogin = true;
+
+    const expiredSides: CrmSide[] = sides && sides.length ? sides : ['source', 'target'];
+
+    this.mappingCancel$.next();
+    this.closeSocket(this.validationSocket);
+    this.closeSocket(this.migrationSocket);
+    this.validationSocket = null;
+    this.migrationSocket = null;
+    this.isLoading = false;
+    this.isGlobalLoading = false;
+    this.isValidating = false;
+    this.pendingFileMigrationBudget = null;
+
+    Swal.close();
+
+    window.dispatchEvent(new Event('connections-updated'));
+
+    this.zone.run(() => {
+      this.router.navigate(['/connection'], { replaceUrl: true, state: { expiredSides } });
+    });
   }
 
   ngOnDestroy() {
     this.mappingCancel$.next();
     this.mappingCancel$.complete();
 
-    if (this.pendingFileMigrationBudget && this.migrationSocket) {
+    if (this.pendingFileMigrationBudget && this.migrationSocket && this.migrationSocket.readyState === WebSocket.OPEN) {
       this.sendFileMigrationDecision(this.migrationSocket, this.pendingFileMigrationBudget.jobRef, 'skip');
       this.pendingFileMigrationBudget = null;
     }
@@ -369,8 +456,22 @@ get fileMigrationNotes(): string[] {
     this.validationSocket = null;
     this.migrationSocket = null;
 
-    if (this.monacoEditorInstance) {
-      this.monacoEditorInstance.dispose();
+    if (this.completionProvider) {
+      this.completionProvider.dispose();
+      this.completionProvider = null;
+    }
+    if (this.hoverProvider) {
+      this.hoverProvider.dispose();
+      this.hoverProvider = null;
+    }
+    this.monacoEditorInstance = null;
+  }
+
+  @HostListener('window:unhandledrejection', ['$event'])
+  onUnhandledRejection(event: PromiseRejectionEvent): void {
+    const reason: any = event.reason;
+    if (reason && reason.name === 'Canceled' && reason.message === 'Canceled') {
+      event.preventDefault();
     }
   }
 
@@ -381,17 +482,32 @@ get fileMigrationNotes(): string[] {
     }
   }
 
-  fetchRecoverableSessions() {
-    this.isSessionsLoading = true;
-    fetch(`${environment.apiUrl}/api/validation/sessions`)
-      .then((res) => res.json())
-      .then((data) => {
-        this.recoverableSessions = data.sessions || [];
-        this.isSessionsLoading = false;
-        this.cdr.detectChanges();
-      })
-      .catch(() => (this.isSessionsLoading = false));
+  async fetchRecoverableSessions(): Promise<void> {
+  this.isSessionsLoading = true;
+  try {
+    const response = await fetch(`${environment.apiUrl}/api/validation/sessions`, {
+      headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` }
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      if (isAuthExpiredError({ status: response.status, error: errorData })) {
+        this.handleSessionExpired();
+        return;
+      }
+      throw new Error(errorData.detail || `Failed to load sessions (${response.status})`);
+    }
+
+    const data = await response.json();
+    this.recoverableSessions = data.sessions || [];
+  } catch (error) {
+    console.error('Failed to fetch recoverable sessions:', error);
+    this.recoverableSessions = [];
+  } finally {
+    this.isSessionsLoading = false;
+    this.cdr.detectChanges();
   }
+}
 
   resumeSession(sessionId: string, crm: string, object: string) {
     this.currentSessionId = sessionId;
@@ -449,21 +565,133 @@ get fileMigrationNotes(): string[] {
     }
   }
 
-  private parseSqlStyleSelectedFields(query: string): string[] | null {
-    const queryLower = query.toLowerCase();
-    if (!queryLower.startsWith('select ')) return null;
+  private normalizeSql(query: string): string {
+    return (query || '').replace(/\s+/g, ' ').trim();
+  }
 
-    const fromIdx = queryLower.indexOf(' from ');
+  /**
+   * Returns the object name after the FROM that belongs to the outer SELECT, ignoring FROMs inside
+   * parentheses (sub-selects) and inside quoted text values. Expects whitespace-normalised, lower-cased SQL.
+   */
+  private getTopLevelFromObject(sql: string): string | null {
+    let depth = 0;
+    let inString = false;
+
+    for (let i = 0; i < sql.length; i++) {
+      const ch = sql[i];
+
+      if (ch === "'" && sql[i - 1] !== '\\') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+
+      if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && sql.startsWith(' from ', i)) {
+        return sql.slice(i + 6).trim().split(/[\s,)]/)[0] || null;
+      }
+    }
+    return null;
+  }
+
+  private splitTopLevel(input: string, delimiter: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let inString = false;
+    let current = '';
+
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+
+      if (inString) {
+        current += ch;
+        if (ch === '\\' && i + 1 < input.length) {
+          current += input[++i];
+        } else if (ch === "'") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === "'") {
+        inString = true;
+      } else if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
+        depth = Math.max(0, depth - 1);
+      } else if (ch === delimiter && depth === 0) {
+        parts.push(current);
+        current = '';
+        continue;
+      }
+      current += ch;
+    }
+
+    parts.push(current);
+    return parts;
+  }
+
+  /** Index of the top-level FROM keyword (ignores FROM inside sub-selects / string literals), or -1. */
+  private findTopLevelFrom(sql: string, searchFrom: number): number {
+    let depth = 0;
+    let inString = false;
+
+    for (let i = searchFrom; i < sql.length; i++) {
+      const ch = sql[i];
+
+      if (inString) {
+        if (ch === '\\') i++;
+        else if (ch === "'") inString = false;
+        continue;
+      }
+
+      if (ch === "'") inString = true;
+      else if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && /^from(\s|$)/i.test(sql.slice(i, i + 5)) && (i === 0 || /[\s)]/.test(sql[i - 1]))) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private parseSqlStyleSelectedFields(query: string): string[] | null {
+    const sql = this.normalizeSql(query);
+
+    const selectMatch = /^select\s+/i.exec(sql);
+    if (!selectMatch) return null;
+
+    const selectStart = selectMatch[0].length;
+    const fromIdx = this.findTopLevelFrom(sql, selectStart);
     if (fromIdx === -1) return null;
 
-    const selectClause = query.substring(7, fromIdx).trim();
-    if (selectClause === '*') return null;
+    const selectClause = sql.substring(selectStart, fromIdx).trim();
+    if (!selectClause) return null;
 
-    const fields = selectClause
-      .split(',')
-      .map((f) => f.trim())
-      .filter((f) => f.length > 0)
-      .map((f) => f.split('.')[0]);
+    const seen = new Set<string>();
+    const fields: string[] = [];
+
+    for (const rawItem of this.splitTopLevel(selectClause, ',')) {
+      const item = rawItem.trim();
+      if (!item) continue;
+
+      // SELECT * / FIELDS(ALL|STANDARD|CUSTOM) => every field, so no narrowing.
+      if (item === '*' || /^fields\s*\(/i.test(item)) return null;
+
+      // Child-relationship sub-select, e.g. (SELECT Id FROM Contacts) -- not a field of this object.
+      if (item.startsWith('(')) continue;
+
+      // Unwrap single-argument functions: toLabel(Status), FORMAT(Amount), convertCurrency(Amount)
+      const fnMatch = /^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*([A-Za-z0-9_.]+)\s*\)/.exec(item);
+      const expression = fnMatch ? fnMatch[1] : item.split(/\s+/)[0];
+
+      const root = expression.split('.')[0].trim();
+      if (!root || seen.has(root.toLowerCase())) continue;
+
+      seen.add(root.toLowerCase());
+      fields.push(root);
+    }
 
     return fields.length > 0 ? fields : null;
   }
@@ -727,6 +955,10 @@ get isEligibleForTimeFilter(): boolean {
     }
 
     return filtered;
+  }
+
+  get showMigrationFilter(): boolean {
+    return this.isEligibleForTimeFilter && (!this.restrictMappingToQueryFields || this.getQuerySelectedFields() === null);
   }
 
   get isQueryFieldFilterActive(): boolean {
@@ -993,6 +1225,14 @@ toggleProfileDropdown(event: Event): void {
           //  SALESFORCE & ZOHO (SQL) MODE
           // ------------------------------------
           else {
+            const isSalesforce = crm === 'salesforce';
+            const snippet = monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+            const kinds = monaco.languages.CompletionItemKind;
+
+            // Autocomplete offers EVERY queryable field (Id, CreatedDate, OwnerId, formula/read-only fields...), not just
+            // the writable/mapped subset in sourceFields -- those are exactly the fields people filter on in a WHERE.
+            const queryFields: FieldMeta[] = this.allSourceFields.length > 0 ? this.allSourceFields : this.sourceFields;
+
             const snippetFields =
               this.sourceFields && this.sourceFields.length > 0
                 ? this.sourceFields.slice(0, 15).map((f) => f.name).join(', ')
@@ -1000,49 +1240,121 @@ toggleProfileDropdown(event: Event): void {
 
             suggestions.push({
               label: 'SELECT (Basic)',
-              kind: monaco.languages.CompletionItemKind.Snippet,
-              insertText: `SELECT ${snippetFields} FROM ${this.selectedSourceObject || 'Object'} WHERE `,
-              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-              documentation: 'Auto-generates a SELECT query using real field names for the current object.',
+              kind: kinds.Snippet,
+              insertText: `SELECT ${snippetFields} FROM ${this.selectedSourceObject || 'Object'} WHERE \${1:${isSalesforce ? 'Id' : 'id'}} = '\${2:value}'`,
+              insertTextRules: snippet,
+              documentation: 'Auto-generates a SELECT query using real field names for the current object, with a WHERE ready to fill in.',
               range: range
             });
 
-            const sqlKeywords = [
-              'SELECT',
-              'FROM',
-              'WHERE',
-              'AND',
-              'OR',
-              'LIKE',
-              'LIMIT',
-              'ORDER BY',
-              'ASC',
-              'DESC',
-              'NULL',
-              'IS',
-              'NOT',
-              'IN'
+            // --- Context-aware operators: right after a known field name, offer the operators valid for ITS type ---
+            const lineText: string = model.getLineContent(position.lineNumber);
+            const beforeWord = lineText.substring(0, word.startColumn - 1);
+            const prevToken = beforeWord.match(/([A-Za-z0-9_.]+)\s+$/);
+            const prevField = prevToken
+              ? queryFields.find((f) => f.name.toLowerCase() === prevToken[1].toLowerCase())
+              : undefined;
+
+            if (prevField) {
+              const t = (prevField.type || 'string').toLowerCase();
+              const isNumeric = ['number', 'integer', 'int', 'double', 'currency', 'percent', 'float', 'long', 'bigint', 'decimal'].includes(t);
+              const isDate = t.includes('date') || t.includes('time');
+              const isBool = t === 'boolean';
+
+              let ops: string[];
+              if (isBool) {
+                ops = ['=', '!='];
+              } else {
+                ops = ['=', '!=', 'IN', 'NOT IN', 'IS NULL', 'IS NOT NULL'];
+                if (isNumeric || isDate) {
+                  ops.push('<', '<=', '>', '>=');
+                  if (!isSalesforce) ops.push('BETWEEN', 'NOT BETWEEN');
+                } else {
+                  ops.push('LIKE', 'NOT LIKE');
+                  if (!isSalesforce) ops.push('STARTS WITH', 'ENDS WITH', 'CONTAINS', 'NOT CONTAINS');
+                  if (isSalesforce && t.includes('multipicklist')) ops.push('INCLUDES', 'EXCLUDES');
+                }
+              }
+              ops.forEach((op) =>
+                suggestions.push({
+                  label: op,
+                  kind: kinds.Operator,
+                  insertText: op + ' ',
+                  detail: `Operator for ${prevField.name} (${prevField.type || 'string'})`,
+                  sortText: '0_' + op,
+                  range: range
+                })
+              );
+            }
+
+            // --- Keywords (only things the editor accepts AND the migration can run) ---
+            const keywords = [
+              'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT',
+              'LIKE', 'NOT LIKE', 'IN', 'NOT IN', 'IS NULL', 'IS NOT NULL',
+              'NULL', 'TRUE', 'FALSE', 'LIMIT',
+              ...(isSalesforce ? ['INCLUDES', 'EXCLUDES'] : ['BETWEEN', 'NOT BETWEEN', 'STARTS WITH', 'ENDS WITH', 'CONTAINS', 'NOT CONTAINS']),
+              ...(this.allowOrderBy ? ['ORDER BY', 'ASC', 'DESC'] : [])
             ];
-            sqlKeywords.forEach((kw) => {
-              suggestions.push({
-                label: kw,
-                kind: monaco.languages.CompletionItemKind.Keyword,
-                insertText: kw + ' ',
-                range: range
-              });
+            keywords.forEach((kw) => {
+              suggestions.push({ label: kw, kind: kinds.Keyword, insertText: kw + ' ', range: range });
             });
 
-            if (this.sourceFields && this.sourceFields.length > 0) {
-              this.sourceFields.forEach((field) => {
+            // --- Value / shape snippets ---
+            const snippets: Array<{ label: string; text: string; doc: string }> = [
+              { label: "IN ('…', '…')", text: "IN ('${1:value1}', '${2:value2}')", doc: 'Match any value in a list.' },
+              { label: "LIKE '%…%'", text: "LIKE '%${1:text}%'", doc: 'Text contains a value.' }
+            ];
+            if (!isSalesforce) {
+              snippets.push(
+                { label: 'BETWEEN … AND …', text: 'BETWEEN ${1:min} AND ${2:max}', doc: 'Zoho COQL range filter.' },
+                { label: 'Datetime literal (Zoho)', text: "'${1:2026-01-01}T00:00:00+00:00'", doc: 'Zoho COQL datetime format: YYYY-MM-DDThh:mm:ss+hh:mm' }
+              );
+            }
+            snippets.forEach((s) =>
+              suggestions.push({ label: s.label, kind: kinds.Snippet, insertText: s.text, insertTextRules: snippet, documentation: s.doc, range: range })
+            );
+
+            // --- Salesforce date literals (SOQL only) ---
+            if (isSalesforce) {
+              ['TODAY', 'YESTERDAY', 'TOMORROW', 'THIS_WEEK', 'LAST_WEEK', 'THIS_MONTH', 'LAST_MONTH',
+               'THIS_QUARTER', 'LAST_QUARTER', 'THIS_YEAR', 'LAST_YEAR'].forEach((d) =>
+                suggestions.push({ label: d, kind: kinds.Constant, insertText: d + ' ', detail: 'SOQL date literal', range: range })
+              );
+              ['LAST_N_DAYS', 'NEXT_N_DAYS', 'LAST_N_WEEKS', 'LAST_N_MONTHS', 'LAST_N_YEARS'].forEach((d) =>
                 suggestions.push({
-                  label: field.name,
-                  detail: `${field.label} (${field.type})`,
-                  kind: monaco.languages.CompletionItemKind.Field,
-                  insertText: field.name,
+                  label: d + ':n',
+                  kind: kinds.Constant,
+                  insertText: d + ':${1:30}',
+                  insertTextRules: snippet,
+                  detail: 'SOQL date literal',
+                  range: range
+                })
+              );
+            }
+
+            // --- Fields ---
+            const seenRelationships = new Set<string>();
+            queryFields.forEach((field) => {
+              suggestions.push({
+                label: field.name,
+                detail: `${field.label} (${field.type})`,
+                kind: kinds.Field,
+                insertText: field.name,
+                range: range
+              });
+
+              // Parent traversal, e.g. Account.Name / Owner.Email (Salesforce)
+              if (isSalesforce && field.relationshipName && !seenRelationships.has(field.relationshipName)) {
+                seenRelationships.add(field.relationshipName);
+                suggestions.push({
+                  label: field.relationshipName + '.',
+                  detail: `Parent relationship (${(field.referenceTo || []).join(', ') || 'lookup'})`,
+                  kind: kinds.Reference,
+                  insertText: field.relationshipName + '.',
                   range: range
                 });
-              });
-            }
+              }
+            });
           }
 
           return { suggestions: suggestions };
@@ -1052,14 +1364,14 @@ toggleProfileDropdown(event: Event): void {
       // ==========================================
       //  SMART HOVER TOOLTIPS
       // ==========================================
-      monaco.languages.registerHoverProvider('sql', {
+      this.hoverProvider = monaco.languages.registerHoverProvider('sql', {
         provideHover: (model: any, position: any) => {
           const wordInfo = model.getWordAtPosition(position);
           if (!wordInfo) return null;
 
           const cleanWord = wordInfo.word.replace(/[:<>]/g, '').toLowerCase();
 
-          const field = this.sourceFields.find((f) => f.name.toLowerCase() === cleanWord);
+          const field = (this.allSourceFields.length > 0 ? this.allSourceFields : this.sourceFields).find((f) => f.name.toLowerCase() === cleanWord);
 
           if (field) {
             return {
@@ -1648,6 +1960,7 @@ onReviewPanelDragEnd(): void {
           this.cdr.detectChanges();
         },
         error: (err) => {
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
           console.error('Failed to load parent object metadata for External ID matching:', err);
           this.isLoadingParentFields = false;
           this.toastr.warning(
@@ -1956,6 +2269,10 @@ onReviewPanelDragEnd(): void {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Unknown Server Error' }));
+        if (isAuthExpiredError({ status: response.status, error: errorData }, true)) {
+          this.handleSessionExpired(getExpiredSidesFromError({ error: errorData }));
+          return;
+        }
         throw new Error(errorData.detail || 'Failed to fetch filtered data.');
       }
 
@@ -2001,7 +2318,14 @@ onReviewPanelDragEnd(): void {
         { headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` } }
       );
 
-      if (!response.ok) throw new Error('Failed to fetch object count.');
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        if (isAuthExpiredError({ status: response.status, error: errBody }, true)) {
+          this.handleSessionExpired(getExpiredSidesFromError({ error: errBody }));
+          return;
+        }
+        throw new Error('Failed to fetch object count.');
+      }
 
       const data = await response.json();
       this.selectedSourceObjectCount = typeof data.count === 'number' ? data.count : null;
@@ -2153,43 +2477,51 @@ onReviewPanelDragEnd(): void {
     //  SALESFORCE & ZOHO SQL VALIDATION
     // ==========================================
     else if (crm === 'salesforce' || crm === 'zoho') {
-      if (this.customQuery.includes('"')) {
+      // Multi-line pasted queries ("SELECT\n Id,\n Name\nFROM Account") must validate like single-line ones.
+      const sqlLower = this.normalizeSql(this.customQuery).toLowerCase();
+
+      if (this.customQuery.replace(/'(?:[^'\\]|\\.)*'/g, "''").includes('"')) {
         return applySquiggle('Salesforce strictly requires single quotes (\') for text values. Do not use double quotes (").', '"');
       }
 
-      if (queryLower.includes('order by ')) {
+      if (!this.allowOrderBy && /\border by\b/.test(sqlLower)) {
         return applySquiggle('Do not use ORDER BY.', 'order by');
-      } else if (queryLower.endsWith(';')) {
+      } else if (sqlLower.endsWith(';')) {
         return applySquiggle('Do not end your query with a semicolon (;).', ';');
       }
 
-      const hasSelect = queryLower.startsWith('select ');
-      const hasWhere = queryLower.includes(' where ');
+      const hasSelect = sqlLower.startsWith('select ');
+      const hasWhere = sqlLower.includes(' where ');
       let conditionPart = '';
 
       if (hasSelect) {
         if (hasWhere) {
-          conditionPart = queryLower.split(' where ')[1];
+          conditionPart = sqlLower.split(' where ')[1];
         }
       } else {
-        conditionPart = queryLower;
+        conditionPart = sqlLower;
       }
 
       if (conditionPart.trim() !== '') {
-        if (
-          !conditionPart.includes('=') &&
-          !conditionPart.includes('<') &&
-          !conditionPart.includes('>') &&
-          !conditionPart.includes('like') &&
-          !conditionPart.includes(' is ')
-        ) {
-          return applySquiggle('Invalid Syntax: Missing SQL operators (e.g., =, <, >, LIKE).', conditionPart.trim().split(' ')[0]);
+        // SOQL: = != < > <= >= LIKE IN NOT IN INCLUDES EXCLUDES, IS [NOT] NULL
+        // COQL: all of the above plus BETWEEN, STARTS WITH, ENDS WITH, CONTAINS (and their NOT forms)
+        const hasOperator =
+          /(=|<|>)/.test(conditionPart) ||
+          /\b(like|in|includes|excludes|between|starts\s+with|ends\s+with|contains)\b/.test(conditionPart) ||
+          /\bis\s+(not\s+)?null\b/.test(conditionPart) ||
+          conditionPart.includes(' is ');
+
+        if (!hasOperator) {
+          return applySquiggle(
+            'Invalid Syntax: Missing SQL operators (e.g., =, <, >, LIKE, IN, BETWEEN).',
+            conditionPart.trim().split(' ')[0]
+          );
         }
       }
 
-      if (hasSelect && queryLower.includes(' from ')) {
-        const fromParts = queryLower.split(' from ');
-        const objPart = fromParts[1].trim().split(' ')[0];
+      if (hasSelect) {
+        // Use the TOP-LEVEL FROM so sub-selects like (SELECT Id FROM Contacts) aren't mistaken for the object.
+        const objPart = this.getTopLevelFromObject(sqlLower);
         if (objPart && objPart.toLowerCase() !== this.selectedSourceObject.toLowerCase()) {
           return applySquiggle(
             `Object Mismatch: You selected '${this.selectedSourceObject}', but your query says FROM '${objPart}'.`,
@@ -2198,14 +2530,9 @@ onReviewPanelDragEnd(): void {
         }
       }
 
-      // Deep Field & Type Validation
-      // Group 1: field (or dotted relationship path). Group 2: operator. Group 3: exactly ONE value token
-      // (a quoted literal, or an unquoted token that stops at whitespace/parens/commas), so trailing
-      // clauses like "0 and Type" can never be swallowed into the value.
-      // Word operators (like / is [not]) require leading whitespace so "Dislike" isn't parsed as "Dis" + "like".
       const sqlRegex = /\b([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*)(?:\s*(?:<>|!=|<=|>=|=|<|>)|\s+(?:like|is(?:\s+not)?))\s*('(?:[^'\\]|\\.)*'|[^\s()',]+)/gi;
       const reservedWords = new Set(['select', 'from', 'where', 'and', 'or', 'null', 'is', 'like', 'not']);
-      const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent']);
+      const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent', 'long', 'bigint', 'decimal', 'float']);
 
       // Skip until describe metadata has loaded, otherwise every field would be flagged invalid.
       if (this.allSourceFields.length > 0) {
@@ -2265,12 +2592,15 @@ onReviewPanelDragEnd(): void {
     this.isGlobalLoading = true;
     this.globalLoadingText = 'Fetching Live Schemas...';
     this.globalLoadingSubText = 'Please wait while we sync the CRM engines';
+    this.showSchemaLoader();
     this.cdr.detectChanges();
 
     forkJoin({
       sourceObjs: this.mappingApi.getObjects(this.sourceCrmId, 'source'),
       targetObjs: this.mappingApi.getObjects(this.targetCrmId, 'target')
-    }).subscribe({
+    })
+    .pipe(takeUntil(this.mappingCancel$))
+    .subscribe({
       next: ({ sourceObjs, targetObjs }) => {
         this.sourceEntities = sourceObjs || [];
         this.targetEntities = targetObjs || [];
@@ -2303,6 +2633,7 @@ onReviewPanelDragEnd(): void {
         this.cdr.detectChanges();
       },
       error: (err) => {
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
         console.error('Failed to preload base entity dropdowns:', err);
         this.logMessages.unshift(`Configuration Error: Could not fetch core CRM schemas.`);
         this.isLoading = false;
@@ -2395,6 +2726,7 @@ onReviewPanelDragEnd(): void {
           }
         },
         error: (err) => {
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
           console.error('Metadata payload extraction failed:', err);
           this.logMessages.unshift(`API Error: Unable to fetch live dataset metrics from ${this.sourceSystem}.`);
           this.isLoading = false;
@@ -2667,6 +2999,7 @@ onReviewPanelDragEnd(): void {
             processNextChunk();
           },
           error: (error: any) => {
+        if (isAuthExpiredError(error)) { this.handleSessionExpired(getExpiredSidesFromError(error)); return; }
             console.error('[FRONTEND ERROR]: AI Chunk failed:', error);
             this.isAutoMapping = false;
 
@@ -2927,6 +3260,11 @@ onReviewPanelDragEnd(): void {
       this.zone.run(() => {
         const data = JSON.parse(event.data);
 
+        if (isSocketAuthExpired(data)) {
+          this.handleSessionExpired(getSocketExpiredSides(data));
+          return;
+        }
+
         if (data.log) {
           this.logMessages.push(data.log);
           if (this.logMessages.length > 50) this.logMessages.shift();
@@ -3090,11 +3428,19 @@ onReviewPanelDragEnd(): void {
         }
 
 
-        localStorage.removeItem('source_crm_slot');
-        localStorage.removeItem('target_crm_slot');
+        // Remove saved CRM connections on the server BEFORE logging out (the app token is still valid here),
+        // so nothing shows as "Connected" the next time someone logs in.
+        forkJoin([
+          this.crmAuthService.disconnectCrm('source').pipe(catchError(() => of(null))),
+          this.crmAuthService.disconnectCrm('target').pipe(catchError(() => of(null)))
+        ]).subscribe(() => {
+          localStorage.removeItem('source_crm_slot');
+          localStorage.removeItem('target_crm_slot');
+          window.dispatchEvent(new Event('connections-updated'));
 
-        this.toastr.success('You have been securely logged out.', 'Goodbye!');
-        this.authService.logout();
+          this.toastr.success('You have been securely logged out.', 'Goodbye!');
+          this.authService.logout();
+        });
       }
     });
   }
@@ -3243,13 +3589,13 @@ onReviewPanelDragEnd(): void {
 
     if (warnings.missingFields.length > 0) {
       warningHtml += `<p class="text-danger fw-bold mb-1"><i class="feather icon-alert-triangle"></i> Missing Required Fields:</p>
-                       <ul class="small mb-3 text-muted"><li class="mb-0">${warnings.missingFields.join('</li><li_item>')}</li></ul>`;
+                       <ul class="small mb-3 text-muted"><li class="mb-0">${warnings.missingFields.join('</li><li class="mb-0">')}</li></ul>`;
     }
 
     if (warnings.incompleteRefs.length > 0) {
       warningHtml += `<p class="text-warning text-dark fw-bold mb-1"><i class="feather icon-link"></i> Incomplete Lookups:</p>
                        <p class="small mb-1 text-muted">You mapped these relational fields but left the <strong>Parent Ext ID</strong> blank (Defaults to 'Id'):</p>
-                       <ul class="small mb-0 text-muted"><li class="mb-0">${warnings.incompleteRefs.join('</li><li_item>')}</li></ul>`;
+                       <ul class="small mb-0 text-muted"><li class="mb-0">${warnings.incompleteRefs.join('</li><li class="mb-0">')}</li></ul>`;
     }
     warningHtml += '</div>';
 
@@ -3407,6 +3753,7 @@ onReviewPanelDragEnd(): void {
         this.cdr.detectChanges();
       },
       error: (err) => {
+        if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
         this.fileMigrationBudgetPreview = null;
         this.fileMigrationBudgetPreviewError =
           err?.error?.detail || 'Could not check the API Limit for this migration. You can still proceed -- the live guard during the run will catch this if needed.';
@@ -3611,6 +3958,11 @@ onReviewPanelDragEnd(): void {
     ws.onmessage = (event) => {
       this.zone.run(() => {
         const data = JSON.parse(event.data);
+
+        if (isSocketAuthExpired(data)) {
+          this.handleSessionExpired(getSocketExpiredSides(data));
+          return;
+        }
 
         if (data.log) {
           this.logMessages = [...this.logMessages, data.log];
