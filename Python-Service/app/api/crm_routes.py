@@ -28,46 +28,6 @@ ZD_CLIENT_ID = os.getenv("ZD_CLIENT_ID", "").strip()
 ZD_CLIENT_SECRET = os.getenv("ZD_CLIENT_SECRET", "").strip()
 ZD_REDIRECT_URI = f"{FASTAPI_BACKEND_URL}/api/crm/auth/zendesk/callback"
 
-# ---- org identity captured at OAuth time (needs: alter table crm_connections add column org_id text;) ----
-def _sf_org_id(token_data: dict):
-    """Salesforce token `id` = https://<login>/id/<18-char org id>/<user id>"""
-    parts = [p for p in (token_data.get("id") or "").rstrip("/").split("/") if p]
-    return parts[-2] if len(parts) >= 2 else None
-
-
-async def _zoho_org_id(api_domain: str, access_token: str):
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.get(f"{api_domain.rstrip('/')}/crm/v6/org", headers={"Authorization": f"Zoho-oauthtoken {access_token}"})
-        if res.status_code == 200:
-            orgs = res.json().get("org") or []
-            return str(orgs[0].get("id")) if orgs and orgs[0].get("id") else None
-    except Exception:
-        pass
-    return None  # without it Zoho runs stay owner-only (the API host is shared by all customers)
-
-
-async def _hubspot_hub_id(access_token: str):
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.get(f"https://api.hubapi.com/oauth/v1/access-tokens/{access_token}")
-        if res.status_code == 200 and res.json().get("hub_id"):
-            return str(res.json()["hub_id"])
-    except Exception:
-        pass
-    return None
-
-
-def _insert_connection(row: dict) -> None:
-    """Insert the connection; if the org_id column has not been added yet, save it without so login keeps working."""
-    try:
-        supabase.table("crm_connections").insert(row).execute()
-    except Exception:
-        if row.get("org_id") is None:
-            raise
-        supabase.table("crm_connections").insert({k: v for k, v in row.items() if k != "org_id"}).execute()
-
-
 ZOHO_REGIONS = {
     "us": "https://accounts.zoho.com",
     "in": "https://accounts.zoho.in",
@@ -142,8 +102,7 @@ async def salesforce_callback(code: str = None, state: str = None, error: str = 
     try:
         supabase.table("crm_connections").delete().eq("user_id", user_id).eq("connection_role", side).execute()
         
-        _insert_connection({
-            "org_id": _sf_org_id(token_data),
+        supabase.table("crm_connections").insert({
             "user_id": user_id,
             "crm_type": "salesforce",
             "connection_role": side,
@@ -151,7 +110,7 @@ async def salesforce_callback(code: str = None, state: str = None, error: str = 
             "refresh_token": token_data.get("refresh_token", ""),
             "instance_url": token_data.get("instance_url", ""),
             "environment": environment
-        })
+        }).execute()
     except Exception:
         return RedirectResponse(url=f"{ANGULAR_FRONTEND_URL}/connection?status=error")
 
@@ -163,29 +122,28 @@ async def salesforce_callback(code: str = None, state: str = None, error: str = 
 @router.get("/auth/zoho/login")
 def get_zoho_url(side: str, region: str = "IN", current_user = Depends(get_current_user)):
     custom_state = f"{side}::{current_user.id}::{region}"
-    accounts_url = ZOHO_REGIONS.get(region.lower(), ZOHO_REGIONS["us"])
 
     scopes = [
-        "ZohoCRM.modules.ALL",       # records + attachments
-        "ZohoCRM.bulk.READ",
-        "ZohoCRM.files.CREATE",
-        "ZohoCRM.files.READ",
-        "ZohoCRM.settings.ALL",      # fields/modules metadata + picklist value updates
-        "ZohoCRM.coql.READ",
-        "ZohoCRM.org.READ",          # org id, so two users of the same org can recover each other's runs
+        "ZohoCRM.modules.ALL", 
+        "ZohoCRM.bulk.READ", 
+        "ZohoCRM.settings.FIELDS.READ",
+        "ZohoCRM.settings.modules.READ",
+        "ZohoCRM.settings.ALL",
+        "ZohoCRM.coql.READ"
     ]
-
+    
     params = {
         "scope": ",".join(scopes),
         "client_id": ZOHO_CLIENT_ID,
         "response_type": "code",
         "access_type": "offline",
         "redirect_uri": ZOHO_REDIRECT_URI,
-        "prompt": "consent",
-        "state": custom_state,
+        "prompt": "consent", 
+        "state": custom_state
     }
-
-    auth_url = f"{accounts_url}/oauth/v2/auth?{urllib.parse.urlencode(params)}"
+    
+    accounts_base = ZOHO_REGIONS.get((region or "us").lower(), ZOHO_REGIONS["us"])
+    auth_url = f"{accounts_base}/oauth/v2/auth?{urllib.parse.urlencode(params)}"
     return {"url": auth_url}
 
 @router.get("/auth/zoho/callback")
@@ -214,9 +172,7 @@ async def zoho_callback(code: str, state: str, request: Request):
     try:
         supabase.table("crm_connections").delete().eq("user_id", user_id).eq("connection_role", side).execute()
         
-        zoho_api_domain = token_data.get("api_domain", "https://www.zohoapis.com")
-        _insert_connection({
-            "org_id": await _zoho_org_id(zoho_api_domain, token_data.get("access_token")),
+        supabase.table("crm_connections").insert({
             "user_id": user_id,
             "crm_type": "zoho",
             "connection_role": side,
@@ -225,7 +181,7 @@ async def zoho_callback(code: str, state: str, request: Request):
             "api_domain": token_data.get("api_domain", "https://www.zohoapis.com"),
             "accounts_server": accounts_server,
             "region": reg_key
-        })
+        }).execute()
     except Exception:
         return RedirectResponse(url=f"{ANGULAR_FRONTEND_URL}/connection?status=error")
 
@@ -291,27 +247,6 @@ async def zendesk_callback(code: str, state: str):
 # =========================================================
 # HUBSPOT OAUTH FLOW
 # =========================================================
-
-HUBSPOT_SCOPES = [
-    "oauth",
-    "crm.objects.contacts.read",
-    "crm.objects.contacts.write",
-    "crm.objects.companies.read",
-    "crm.objects.companies.write",
-    "crm.objects.deals.read",
-    "crm.objects.deals.write",
-    "tickets",
-    "files.read",
-    "files.write",
-    "files.ui_hidden.read",
-]
-
-HUBSPOT_OPTIONAL_SCOPES = [
-    "crm.schemas.contacts.write",
-    "crm.schemas.companies.write",
-    "crm.schemas.deals.write",
-    "crm.schemas.custom.write",
-]
 @router.get("/auth/hubspot/login")
 def get_hubspot_url(side: str, current_user = Depends(get_current_user)):
     import urllib.parse
@@ -319,13 +254,16 @@ def get_hubspot_url(side: str, current_user = Depends(get_current_user)):
     HS_CLIENT_ID = os.getenv("HS_CLIENT_ID", "").strip()
     HS_REDIRECT_URI = os.getenv("HS_REDIRECT_URI", f"{FASTAPI_BACKEND_URL}/api/crm/auth/hubspot/callback")
 
+    custom_state = f"{side}::{current_user.id}"
+
+    scopes = "crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read crm.objects.companies.write crm.objects.deals.read crm.objects.deals.write tickets"
     params = {
         "client_id": HS_CLIENT_ID,
         "redirect_uri": HS_REDIRECT_URI,
-        "scope": " ".join(HUBSPOT_SCOPES),
-        "optional_scope": " ".join(HUBSPOT_OPTIONAL_SCOPES),
-        "state": f"{side}::{current_user.id}",
+        "scope": scopes,
+        "state": custom_state
     }
+
     auth_url = f"https://app.hubspot.com/oauth/authorize?{urllib.parse.urlencode(params)}"
     return {"url": auth_url}
 
@@ -358,15 +296,14 @@ async def hubspot_callback(code: str, state: str):
     try:
         supabase.table("crm_connections").delete().eq("user_id", user_id).eq("connection_role", side).execute()
         
-        _insert_connection({
-            "org_id": await _hubspot_hub_id(token_data.get("access_token")),
+        supabase.table("crm_connections").insert({
             "user_id": user_id,
             "crm_type": "hubspot",
             "connection_role": side,
             "access_token": token_data.get("access_token"),
             "refresh_token": token_data.get("refresh_token", ""),
             "api_domain": "https://api.hubapi.com" 
-        })
+        }).execute()
     except Exception as e:
         print(f"Hubspot DB Insert Error: {e}")
         return RedirectResponse(url=f"{ANGULAR_FRONTEND_URL}/connection?status=error")

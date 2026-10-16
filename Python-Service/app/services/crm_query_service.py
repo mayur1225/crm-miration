@@ -15,6 +15,7 @@ from app.services.time_filter_service import (
 )
 from app.services.query_field_utils import ensure_fields_selected
 from app.services.coql_query_builder import build_coql
+from app.services.sql_utils import build_count_query, has_limit
 
 class CrmQueryService:
 
@@ -28,28 +29,33 @@ class CrmQueryService:
         except TimeFilterError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        if query.lower().startswith("select "):
+        query = (query or "").strip().rstrip(";").strip()
+        query = re.sub(r'(?i)\s+where\s*$', '', query)
+
+        if re.match(r'(?i)^select\s', query):
             soql = query
             if time_clause:
                 soql = merge_time_clause(soql, time_clause, where_kw="WHERE", and_kw="AND")
-                    
-            if " * " in soql.lower() or soql.lower().startswith("select *"):
+
+            if re.match(r'(?i)^select\s+\*\s+from\b', soql):
                 safe_fields = headers_list[:40] if headers_list else ["Id", "Name"]
                 fields_str = ", ".join(safe_fields)
-                soql = re.sub(r'(?i)select\s+\*\s+from', f'SELECT {fields_str} FROM', soql)
+                soql = re.sub(r'(?i)^select\s+\*\s+from\b', f'SELECT {fields_str} FROM', soql, count=1)
             else:
                 soql = ensure_fields_selected(soql, headers_list)
-            
-            if "limit " not in soql.lower():
+
+            if not has_limit(soql):
                 soql += f" LIMIT {limit}"
         else:
             fields_str = ", ".join(headers_list) if headers_list else "Id, Name"
-            
+
+            condition = re.sub(r'(?i)^where\b\s*', '', query).strip()
+
             where_parts = []
-            if query: where_parts.append(f"({query})")
+            if condition: where_parts.append(f"({condition})")
             if time_clause: where_parts.append(time_clause)
             where_combined = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-            
+
             soql = f"SELECT {fields_str} FROM {obj_name}{where_combined} LIMIT {limit}"
         
         safe_soql = urllib.parse.quote(soql)
@@ -91,6 +97,10 @@ class CrmQueryService:
                 url = f"https://{zd_subdomain}.zendesk.com/api/v2/search.json?query={urllib.parse.quote(full_query)}&per_page={limit}"
                 res = await client.get(url, headers=headers)
                 
+                if res.status_code != 200:
+                    raise HTTPException(status_code=400, detail=f"Zendesk Error: {res.text}")
+                return {"records": res.json().get("results", []), "queryUsed": full_query}
+                
             else:
                 explicit_fields = None
                 had_explicit_query = bool(query.strip())
@@ -111,7 +121,7 @@ class CrmQueryService:
                 if custom_time_filters:
                     json_payload = CrmQueryService._merge_zendesk_custom_filter(json_payload, custom_time_filters)
 
-                if json_payload:
+                if had_explicit_query or custom_time_filters:
                     url = f"https://{zd_subdomain}.zendesk.com/api/v2/custom_objects/{safe_obj}/records/search?page[size]={limit}"
                     res = await client.post(url, headers=headers, json=json_payload)
                 else:
@@ -120,7 +130,7 @@ class CrmQueryService:
 
                 if res.status_code != 200:
                     raise HTTPException(status_code=400, detail=f"Zendesk Custom Object Error: {res.text}")
-
+                
                 flattened_records = []
                 for rec in res.json().get("custom_object_records", []):
                     flat_rec = {}
@@ -129,13 +139,13 @@ class CrmQueryService:
                             for cf in v: flat_rec[f"custom_field_{cf['id']}"] = cf.get("value")
                         elif k == "custom_object_fields" and isinstance(v, dict):
                             for cf_key, cf_val in v.items(): flat_rec[cf_key] = cf_val
-                        elif not isinstance(v, (dict, list)):
+                        elif not isinstance(v, (dict, list)): 
                             flat_rec[k] = v
                     if explicit_fields is not None:
                         always_keep = {"id", "name", "external_id"}
                         flat_rec = {k: v for k, v in flat_rec.items() if k in explicit_fields or k in always_keep}
                     flattened_records.append(flat_rec)
-                return {"records": flattened_records, "queryUsed": json.dumps(json_payload, sort_keys=True) if json_payload else None}
+                return {"records": flattened_records}
 
     @staticmethod
     def _merge_zendesk_custom_filter(payload: dict, extra_clauses: list) -> dict:
@@ -248,7 +258,7 @@ class CrmQueryService:
     async def execute_hubspot_query(creds: dict, obj_name: str, query: str, headers_list: list, limit: int, time_filter: dict = None):
         hs_token = creds.get("access_token")
         domain = (creds.get("api_domain") or "https://api.hubapi.com").rstrip('/')
-
+        
         headers = {
             "Authorization": f"Bearer {hs_token}",
             "Content-Type": "application/json"
@@ -258,16 +268,16 @@ class CrmQueryService:
             time_filters = build_hubspot_time_filters(time_filter)
         except TimeFilterError as e:
             raise HTTPException(status_code=400, detail=str(e))
-
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
             properties = headers_list[:50] if headers_list else ["hs_object_id", "createdate", "lastmodifieddate"]
             url = f"{domain}/crm/v3/objects/{obj_name}/search"
-
+            
             payload = {
                 "limit": limit,
                 "properties": properties
             }
-
+            
             if query and query.strip():
                 try:
                     query_dict = json.loads(query)
@@ -286,16 +296,14 @@ class CrmQueryService:
 
             if time_filters:
                 payload["filterGroups"] = CrmQueryService._merge_hubspot_time_filters(payload.get("filterGroups"), time_filters)
-
-            effective_query = json.dumps(payload, sort_keys=True)
-
+            
             res = await client.post(url, headers=headers, json=payload)
-
+            
             if res.status_code != 200:
                 raise HTTPException(status_code=400, detail=f"HubSpot rejected search query: {res.text}")
-
+                
             raw_results = res.json().get("results", [])
-
+            
             flattened_records = []
             for r in raw_results:
                 flat_rec = {"id": r.get("id")}
@@ -304,8 +312,8 @@ class CrmQueryService:
                     for k, v in props.items():
                         flat_rec[k] = v
                 flattened_records.append(flat_rec)
-
-            return {"records": flattened_records, "queryUsed": effective_query}
+                
+            return {"records": flattened_records}
 
     @staticmethod
     def _merge_hubspot_time_filters(filter_groups, time_filters: list) -> list:
@@ -346,17 +354,16 @@ class CrmQueryService:
         except TimeFilterError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        stripped = (query or "").strip()
+        stripped = (query or "").strip().rstrip(";").strip()
+        stripped = re.sub(r'(?i)\s+where\s*$', '', stripped)
 
-        if stripped.lower().startswith("select "):
-            count_soql = re.sub(r'(?i)^select\s+.*?\s+from\s+', 'SELECT COUNT() FROM ', stripped, count=1)
-            count_soql = re.sub(r'(?i)\blimit\b\s+\d+', '', count_soql).strip()
-            if time_clause:
-                count_soql = merge_time_clause(count_soql, time_clause, where_kw="WHERE", and_kw="AND")
+        if re.match(r'(?i)^select\s', stripped):
+            count_soql = build_count_query(stripped, "COUNT()", time_clause, where_kw="WHERE", and_kw="AND")
         else:
+            condition = re.sub(r'(?i)^where\b\s*', '', stripped).strip()
             where_parts = []
-            if stripped:
-                where_parts.append(f"({stripped})")
+            if condition:
+                where_parts.append(f"({condition})")
             if time_clause:
                 where_parts.append(time_clause)
             where_combined = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
@@ -369,56 +376,6 @@ class CrmQueryService:
             if res.status_code != 200:
                 raise HTTPException(status_code=400, detail=f"Salesforce rejected count query: {res.text}")
             return res.json().get("totalSize", 0)
-
-    @staticmethod
-    async def _zoho_count(creds: dict, obj_name: str, query: str = "", time_filter: dict = None) -> int:
-        zoho_token = creds.get("access_token")
-        domain = (creds.get("api_domain") or "https://www.zohoapis.com").rstrip('/')
-        if not domain.startswith("http"):
-            domain = f"https://{domain}"
-
-        headers = {"Authorization": f"Zoho-oauthtoken {zoho_token}"}
-
-        try:
-            time_clause = build_zoho_time_clause(time_filter)
-        except TimeFilterError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        stripped = (query or "").strip()
-
-        if not stripped and not time_clause:
-            url = f"{domain}/crm/v6/{obj_name}/actions/count"
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                res = await client.get(url, headers=headers)
-                if res.status_code != 200:
-                    raise HTTPException(status_code=400, detail=f"Zoho rejected count request: {res.text}")
-                return res.json().get("count", 0)
-
-        
-        if stripped.lower().startswith("select "):
-            coql_query = re.sub(r'(?i)^select\s+.*?\s+from\s+', 'select COUNT(id) from ', stripped, count=1)
-            coql_query = re.sub(r'(?i)\blimit\b\s+\d+', '', coql_query).strip()
-            if time_clause:
-                coql_query = merge_time_clause(coql_query, time_clause, where_kw="where", and_kw="and")
-        else:
-            where_parts = []
-            if stripped:
-                where_parts.append(f"({stripped})")
-            if time_clause:
-                where_parts.append(time_clause)
-            coql_query = f"select COUNT(id) from {obj_name} where {' and '.join(where_parts)}"
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(f"{domain}/crm/v6/coql", headers=headers, json={"select_query": coql_query})
-            if res.status_code != 200:
-                raise HTTPException(status_code=400, detail=f"Zoho rejected count query: {res.text}")
-            rows = res.json().get("data", [])
-            if not rows:
-                return 0
-            for value in rows[0].values():
-                if isinstance(value, (int, float)):
-                    return int(value)
-            return 0
 
     @staticmethod
     async def _zendesk_count(creds: dict, obj_name: str, query: str = "", time_filter: dict = None) -> int:

@@ -2414,11 +2414,11 @@
         <i class="feather icon-refresh-cw"></i> Retry failed records
       </button>
       }
-      @if (activeRun.status !== 'running' && activeRun.status !== 'superseded') {
+      <!-- @if (activeRun.status !== 'running' && activeRun.status !== 'superseded') {
       <button class="btn btn-sm btn-outline-danger" (click)="restartFromPanel()" [disabled]="isGlobalLoading">
         <i class="feather icon-rotate-ccw"></i> Start over
       </button>
-      }
+      } -->
       <button class="btn btn-sm btn-success fw-bold ms-auto" (click)="saveRunEdits()"
         [disabled]="dirtyRowCount === 0 || isSavingEdits || activeRun.status === 'running'">
         <i class="feather icon-save"></i> Save {{ dirtyRowCount }} edited record(s)

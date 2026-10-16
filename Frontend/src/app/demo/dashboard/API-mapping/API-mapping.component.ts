@@ -127,6 +127,7 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
   private mappingCancel$ = new Subject<void>();
 
   private allSourceFields: FieldMeta[] = [];
+  private readonly allowOrderBy = true;
   private readonly PICKLIST_TYPES_BY_CRM: Record<string, string[]> = {
     salesforce: ['picklist', 'multipicklist'],
     hubspot: ['picklist'],
@@ -578,6 +579,28 @@ private showSchemaLoader(): void {
 
   private normalizeSql(query: string): string {
     return (query || '').replace(/\s+/g, ' ').trim();
+  }
+
+  private getTopLevelFromObject(sql: string): string | null {
+    let depth = 0;
+    let inString = false;
+
+    for (let i = 0; i < sql.length; i++) {
+      const ch = sql[i];
+
+      if (ch === "'" && sql[i - 1] !== '\\') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+
+      if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && sql.startsWith(' from ', i)) {
+        return sql.slice(i + 6).trim().split(/[\s,)]/)[0] || null;
+      }
+    }
+    return null;
   }
 
   private splitTopLevel(input: string, delimiter: string): string[] {
@@ -1210,6 +1233,12 @@ toggleProfileDropdown(event: Event): void {
           //  SALESFORCE & ZOHO (SQL) MODE
           // ------------------------------------
           else {
+            const isSalesforce = crm === 'salesforce';
+            const snippet = monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+            const kinds = monaco.languages.CompletionItemKind;
+
+            const queryFields: FieldMeta[] = this.allSourceFields.length > 0 ? this.allSourceFields : this.sourceFields;
+
             const snippetFields =
               this.sourceFields && this.sourceFields.length > 0
                 ? this.sourceFields.slice(0, 15).map((f) => f.name).join(', ')
@@ -1217,49 +1246,121 @@ toggleProfileDropdown(event: Event): void {
 
             suggestions.push({
               label: 'SELECT (Basic)',
-              kind: monaco.languages.CompletionItemKind.Snippet,
-              insertText: `SELECT ${snippetFields} FROM ${this.selectedSourceObject || 'Object'} WHERE `,
-              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-              documentation: 'Auto-generates a SELECT query using real field names for the current object.',
+              kind: kinds.Snippet,
+              insertText: `SELECT ${snippetFields} FROM ${this.selectedSourceObject || 'Object'} WHERE \${1:${isSalesforce ? 'Id' : 'id'}} = '\${2:value}'`,
+              insertTextRules: snippet,
+              documentation: 'Auto-generates a SELECT query using real field names for the current object, with a WHERE ready to fill in.',
               range: range
             });
 
-            const sqlKeywords = [
-              'SELECT',
-              'FROM',
-              'WHERE',
-              'AND',
-              'OR',
-              'LIKE',
-              'LIMIT',
-              'ORDER BY',
-              'ASC',
-              'DESC',
-              'NULL',
-              'IS',
-              'NOT',
-              'IN'
+            // --- Context-aware operators: right after a known field name, offer the operators valid for ITS type ---
+            const lineText: string = model.getLineContent(position.lineNumber);
+            const beforeWord = lineText.substring(0, word.startColumn - 1);
+            const prevToken = beforeWord.match(/([A-Za-z0-9_.]+)\s+$/);
+            const prevField = prevToken
+              ? queryFields.find((f) => f.name.toLowerCase() === prevToken[1].toLowerCase())
+              : undefined;
+
+            if (prevField) {
+              const t = (prevField.type || 'string').toLowerCase();
+              const isNumeric = ['number', 'integer', 'int', 'double', 'currency', 'percent', 'float', 'long', 'bigint', 'decimal'].includes(t);
+              const isDate = t.includes('date') || t.includes('time');
+              const isBool = t === 'boolean';
+
+              let ops: string[];
+              if (isBool) {
+                ops = ['=', '!='];
+              } else {
+                ops = ['=', '!=', 'IN', 'NOT IN', 'IS NULL', 'IS NOT NULL'];
+                if (isNumeric || isDate) {
+                  ops.push('<', '<=', '>', '>=');
+                  if (!isSalesforce) ops.push('BETWEEN', 'NOT BETWEEN');
+                } else {
+                  ops.push('LIKE', 'NOT LIKE');
+                  if (!isSalesforce) ops.push('STARTS WITH', 'ENDS WITH', 'CONTAINS', 'NOT CONTAINS');
+                  if (isSalesforce && t.includes('multipicklist')) ops.push('INCLUDES', 'EXCLUDES');
+                }
+              }
+              ops.forEach((op) =>
+                suggestions.push({
+                  label: op,
+                  kind: kinds.Operator,
+                  insertText: op + ' ',
+                  detail: `Operator for ${prevField.name} (${prevField.type || 'string'})`,
+                  sortText: '0_' + op,
+                  range: range
+                })
+              );
+            }
+
+            // --- Keywords (only things the editor accepts AND the migration can run) ---
+            const keywords = [
+              'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT',
+              'LIKE', 'NOT LIKE', 'IN', 'NOT IN', 'IS NULL', 'IS NOT NULL',
+              'NULL', 'TRUE', 'FALSE', 'LIMIT',
+              ...(isSalesforce ? ['INCLUDES', 'EXCLUDES'] : ['BETWEEN', 'NOT BETWEEN', 'STARTS WITH', 'ENDS WITH', 'CONTAINS', 'NOT CONTAINS']),
+              ...(this.allowOrderBy ? ['ORDER BY', 'ASC', 'DESC'] : [])
             ];
-            sqlKeywords.forEach((kw) => {
-              suggestions.push({
-                label: kw,
-                kind: monaco.languages.CompletionItemKind.Keyword,
-                insertText: kw + ' ',
-                range: range
-              });
+            keywords.forEach((kw) => {
+              suggestions.push({ label: kw, kind: kinds.Keyword, insertText: kw + ' ', range: range });
             });
 
-            if (this.sourceFields && this.sourceFields.length > 0) {
-              this.sourceFields.forEach((field) => {
+            // --- Value / shape snippets ---
+            const snippets: Array<{ label: string; text: string; doc: string }> = [
+              { label: "IN ('…', '…')", text: "IN ('${1:value1}', '${2:value2}')", doc: 'Match any value in a list.' },
+              { label: "LIKE '%…%'", text: "LIKE '%${1:text}%'", doc: 'Text contains a value.' }
+            ];
+            if (!isSalesforce) {
+              snippets.push(
+                { label: 'BETWEEN … AND …', text: 'BETWEEN ${1:min} AND ${2:max}', doc: 'Zoho COQL range filter.' },
+                { label: 'Datetime literal (Zoho)', text: "'${1:2026-01-01}T00:00:00+00:00'", doc: 'Zoho COQL datetime format: YYYY-MM-DDThh:mm:ss+hh:mm' }
+              );
+            }
+            snippets.forEach((s) =>
+              suggestions.push({ label: s.label, kind: kinds.Snippet, insertText: s.text, insertTextRules: snippet, documentation: s.doc, range: range })
+            );
+
+            // --- Salesforce date literals (SOQL only) ---
+            if (isSalesforce) {
+              ['TODAY', 'YESTERDAY', 'TOMORROW', 'THIS_WEEK', 'LAST_WEEK', 'THIS_MONTH', 'LAST_MONTH',
+               'THIS_QUARTER', 'LAST_QUARTER', 'THIS_YEAR', 'LAST_YEAR'].forEach((d) =>
+                suggestions.push({ label: d, kind: kinds.Constant, insertText: d + ' ', detail: 'SOQL date literal', range: range })
+              );
+              ['LAST_N_DAYS', 'NEXT_N_DAYS', 'LAST_N_WEEKS', 'LAST_N_MONTHS', 'LAST_N_YEARS'].forEach((d) =>
                 suggestions.push({
-                  label: field.name,
-                  detail: `${field.label} (${field.type})`,
-                  kind: monaco.languages.CompletionItemKind.Field,
-                  insertText: field.name,
+                  label: d + ':n',
+                  kind: kinds.Constant,
+                  insertText: d + ':${1:30}',
+                  insertTextRules: snippet,
+                  detail: 'SOQL date literal',
+                  range: range
+                })
+              );
+            }
+
+            // --- Fields ---
+            const seenRelationships = new Set<string>();
+            queryFields.forEach((field) => {
+              suggestions.push({
+                label: field.name,
+                detail: `${field.label} (${field.type})`,
+                kind: kinds.Field,
+                insertText: field.name,
+                range: range
+              });
+
+              // Parent traversal, e.g. Account.Name / Owner.Email (Salesforce)
+              if (isSalesforce && field.relationshipName && !seenRelationships.has(field.relationshipName)) {
+                seenRelationships.add(field.relationshipName);
+                suggestions.push({
+                  label: field.relationshipName + '.',
+                  detail: `Parent relationship (${(field.referenceTo || []).join(', ') || 'lookup'})`,
+                  kind: kinds.Reference,
+                  insertText: field.relationshipName + '.',
                   range: range
                 });
-              });
-            }
+              }
+            });
           }
 
           return { suggestions: suggestions };
@@ -2406,43 +2507,47 @@ onReviewPanelDragEnd(): void {
       // Multi-line pasted queries ("SELECT\n Id,\n Name\nFROM Account") must validate like single-line ones.
       const sqlLower = this.normalizeSql(this.customQuery).toLowerCase();
 
-      if (this.customQuery.includes('"')) {
+      if (this.customQuery.replace(/'(?:[^'\\]|\\.)*'/g, "''").includes('"')) {
         return applySquiggle('Salesforce strictly requires single quotes (\') for text values. Do not use double quotes (").', '"');
       }
 
-      if (queryLower.includes('order by ')) {
+      if (!this.allowOrderBy && /\border by\b/.test(sqlLower)) {
         return applySquiggle('Do not use ORDER BY.', 'order by');
-      } else if (queryLower.endsWith(';')) {
+      } else if (sqlLower.endsWith(';')) {
         return applySquiggle('Do not end your query with a semicolon (;).', ';');
       }
 
-      const hasSelect = queryLower.startsWith('select ');
-      const hasWhere = queryLower.includes(' where ');
+      const hasSelect = sqlLower.startsWith('select ');
+      const hasWhere = sqlLower.includes(' where ');
       let conditionPart = '';
 
       if (hasSelect) {
         if (hasWhere) {
-          conditionPart = queryLower.split(' where ')[1];
+          conditionPart = sqlLower.split(' where ')[1];
         }
       } else {
-        conditionPart = queryLower;
+        conditionPart = sqlLower;
       }
 
       if (conditionPart.trim() !== '') {
-        if (
-          !conditionPart.includes('=') &&
-          !conditionPart.includes('<') &&
-          !conditionPart.includes('>') &&
-          !conditionPart.includes('like') &&
-          !conditionPart.includes(' is ')
-        ) {
-          return applySquiggle('Invalid Syntax: Missing SQL operators (e.g., =, <, >, LIKE).', conditionPart.trim().split(' ')[0]);
+        // SOQL: = != < > <= >= LIKE IN NOT IN INCLUDES EXCLUDES, IS [NOT] NULL
+        // COQL: all of the above plus BETWEEN, STARTS WITH, ENDS WITH, CONTAINS (and their NOT forms)
+        const hasOperator =
+          /(=|<|>)/.test(conditionPart) ||
+          /\b(like|in|includes|excludes|between|starts\s+with|ends\s+with|contains)\b/.test(conditionPart) ||
+          /\bis\s+(not\s+)?null\b/.test(conditionPart) ||
+          conditionPart.includes(' is ');
+
+        if (!hasOperator) {
+          return applySquiggle(
+            'Invalid Syntax: Missing SQL operators (e.g., =, <, >, LIKE, IN, BETWEEN).',
+            conditionPart.trim().split(' ')[0]
+          );
         }
       }
 
-      if (hasSelect && queryLower.includes(' from ')) {
-        const fromParts = queryLower.split(' from ');
-        const objPart = fromParts[1].trim().split(' ')[0];
+      if (hasSelect) {
+        const objPart = this.getTopLevelFromObject(sqlLower);
         if (objPart && objPart.toLowerCase() !== this.selectedSourceObject.toLowerCase()) {
           return applySquiggle(
             `Object Mismatch: You selected '${this.selectedSourceObject}', but your query says FROM '${objPart}'.`,
@@ -2453,7 +2558,7 @@ onReviewPanelDragEnd(): void {
 
       const sqlRegex = /\b([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*)(?:\s*(?:<>|!=|<=|>=|=|<|>)|\s+(?:like|is(?:\s+not)?))\s*('(?:[^'\\]|\\.)*'|[^\s()',]+)/gi;
       const reservedWords = new Set(['select', 'from', 'where', 'and', 'or', 'null', 'is', 'like', 'not']);
-      const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent']);
+      const numericTypes = new Set(['number', 'currency', 'double', 'int', 'integer', 'percent', 'long', 'bigint', 'decimal', 'float']);
 
       // Skip until describe metadata has loaded, otherwise every field would be flagged invalid.
       if (this.allSourceFields.length > 0) {

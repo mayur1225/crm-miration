@@ -2,7 +2,6 @@ import os
 import json
 import tempfile
 import csv
-import sqlite3
 import logging
 from datetime import datetime, timezone
 from collections import Counter
@@ -14,7 +13,7 @@ from app.utils.config import supabase, SUPABASE_URL, SUPABASE_KEY
 logger = logging.getLogger(__name__)
 
 LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/images")
-LOGO_CANDIDATES = ["logo.png"]
+LOGO_CANDIDATES = ["gemini-svg.svg", "logo.png"]
 
 
 def _resolve_logo_path():
@@ -174,10 +173,9 @@ class AuditService:
     # EFFECTIVE QUERY RECONSTRUCTION 
     # ==========================================
     @staticmethod
-    def _build_effective_query(source_crm: str, target_object: str, extraction_query: str, time_filter: dict = None, source_object: str = None) -> str:
+    def _build_effective_query(source_crm: str, target_object: str, extraction_query: str, time_filter: dict = None) -> str:
         query = (extraction_query or "").strip()
         no_query_label = "(no query filter -- CSV export)"
-        queried_object = source_object or target_object
 
         if not time_filter:
             return query or no_query_label
@@ -185,8 +183,8 @@ class AuditService:
         try:
             from app.services.time_filter_service import (
                 build_salesforce_time_clause, build_zoho_time_clause,
-                build_zendesk_time_clause, build_zendesk_custom_object_time_filter,
-                build_hubspot_time_filters, merge_time_clause,
+                build_zendesk_time_clause, build_hubspot_time_filters,
+                merge_time_clause,
             )
 
             crm = (source_crm or "").lower()
@@ -198,7 +196,7 @@ class AuditService:
                 if query.lower().startswith("select "):
                     return merge_time_clause(query, time_clause, where_kw="WHERE", and_kw="AND")
                 where_parts = [p for p in [f"({query})" if query else None, time_clause] if p]
-                return f"SELECT * FROM {queried_object} WHERE {' AND '.join(where_parts)}"
+                return f"SELECT * FROM {target_object} WHERE {' AND '.join(where_parts)}"
 
             elif crm == "zoho":
                 time_clause = build_zoho_time_clause(time_filter)
@@ -207,34 +205,12 @@ class AuditService:
                 if query.lower().startswith("select "):
                     return merge_time_clause(query, time_clause, where_kw="where", and_kw="and")
                 where_parts = [p for p in [f"({query})" if query else None, time_clause] if p]
-                return f"select * from {queried_object} where {' and '.join(where_parts)}"
+                return f"select * from {target_object} where {' and '.join(where_parts)}"
 
             elif crm == "zendesk":
-                safe_obj = (queried_object or "").strip().lower()
-                standard_objects = ["tickets", "users", "organizations", "groups", "macros", "triggers", "views"]
-                is_standard = safe_obj in standard_objects or f"{safe_obj}s" in standard_objects
-
-                if is_standard:
-                    time_clause = build_zendesk_time_clause(time_filter)
-                    parts = [p for p in [query, time_clause] if p]
-                    return " ".join(parts) if parts else no_query_label
-
-                custom_filters = build_zendesk_custom_object_time_filter(time_filter)
-                if not custom_filters:
-                    return query or no_query_label
-                try:
-                    base_payload = json.loads(query) if query else {}
-                except json.JSONDecodeError:
-                    base_payload = {}
-                existing = base_payload.get("filter")
-                if isinstance(existing, dict) and isinstance(existing.get("and"), list):
-                    and_list = list(existing["and"]) + custom_filters
-                elif isinstance(existing, dict) and existing:
-                    and_list = [existing] + custom_filters
-                else:
-                    and_list = list(custom_filters)
-                base_payload["filter"] = {"and": and_list}
-                return json.dumps(base_payload, sort_keys=True)
+                time_clause = build_zendesk_time_clause(time_filter)
+                parts = [p for p in [query, time_clause] if p]
+                return " ".join(parts) if parts else no_query_label
 
             elif crm == "hubspot":
                 time_filters = build_hubspot_time_filters(time_filter)
@@ -243,13 +219,6 @@ class AuditService:
 
             else:
                 return query or no_query_label
-
-        except Exception:
-            logger.warning(
-                "[AUDIT] Could not reconstruct effective query for source_crm=%s -- "
-                "falling back to raw extraction_query.", source_crm, exc_info=True
-            )
-            return query or no_query_label
 
         except Exception:
             logger.warning(
@@ -281,53 +250,65 @@ class AuditService:
         filename = os.path.basename(storage_path)
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
 
-        try:
-            with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
-                writer.writeheader()
-                writer.writerows(rows)
+        with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            writer.writerows(rows)
 
-            return AuditService._upload_file(
-                tmp_path, storage_path,
-                content_type="text/csv; charset=utf-8",
-                disposition="attachment",
-                bucket=bucket,
-            )
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        url = AuditService._upload_file(
+            tmp_path, storage_path,
+            content_type="text/csv; charset=utf-8",
+            disposition="attachment",
+            bucket=bucket,
+        )
+        os.remove(tmp_path)
+        return url
+
+    # ==========================================
+    # SCOPED SUPABASE CLIENT
+    # ==========================================
+    @staticmethod
+    def _scoped_client(auth_token: str):
+        """Client that sends the user's JWT to PostgREST so RLS policies on the
+        history tables see auth.uid(). Uses postgrest.auth() instead of
+        auth.set_session(refresh_token=""), which validates/refreshes the session
+        client-side and can raise on an empty refresh token."""
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        client.postgrest.auth(auth_token)
+        return client
 
     @staticmethod
-    def _upload_csv_from_iter(
+    def _upload_csv_stream(
         rows_factory: Callable[[], Iterable[dict]],
         storage_path: str,
-        leading_fields: tuple = (),
+        leading_columns: Optional[list] = None,
         bucket: str = "migration_reports",
     ) -> Optional[str]:
-        """Streams rows to a temp CSV without holding the dataset in memory.
-
-        `rows_factory` is called twice: pass 1 builds the header as the ordered
-        UNION of keys across every row (a header taken from the first row alone makes
-        csv.DictWriter raise ValueError as soon as a later row has an extra key),
-        pass 2 writes the rows. Returns None when there are no rows."""
-        fieldnames: dict = {name: None for name in leading_fields}
-        row_count = 0
+        """Two-pass streaming CSV export: pass 1 collects the column union,
+        pass 2 writes. rows_factory must return a fresh iterator on each call
+        so large staged sessions never have to be fully held in memory.
+        Returns None when there are no rows."""
+        leading = list(leading_columns or [])
+        columns = list(leading)
+        seen = set(columns)
+        has_rows = False
         for row in rows_factory():
-            row_count += 1
+            has_rows = True
             for key in row.keys():
-                fieldnames.setdefault(key, None)
-        if row_count == 0:
+                if key not in seen:
+                    seen.add(key)
+                    columns.append(key)
+        if not has_rows:
             return None
 
         filename = os.path.basename(storage_path)
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
         try:
             with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=list(fieldnames), quoting=csv.QUOTE_MINIMAL)
+                writer = csv.DictWriter(f, fieldnames=columns, quoting=csv.QUOTE_MINIMAL, restval="")
                 writer.writeheader()
                 for row in rows_factory():
                     writer.writerow(row)
-
             return AuditService._upload_file(
                 tmp_path, storage_path,
                 content_type="text/csv; charset=utf-8",
@@ -338,30 +319,11 @@ class AuditService:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    @staticmethod
-    def _iter_staged_records(staging_db_path: str, is_valid: bool) -> Iterator[dict]:
-        """Yields one flat dict per staged record (valid or invalid) straight from
-        the session's SQLite staging DB, so full-size reports never sit in memory."""
-        conn = sqlite3.connect(staging_db_path)
-        try:
-            cursor = conn.execute(
-                "SELECT data, errors FROM records WHERE is_valid = ? ORDER BY id",
-                (1 if is_valid else 0,),
-            )
-            for data, errors in cursor:
-                record = json.loads(data)
-                record.pop("_db_id", None)
-                if not is_valid:
-                    record["Validation_Errors"] = errors or ""
-                yield record
-        finally:
-            conn.close()
-
     # ==========================================
     # MIGRATION REPORTS
     # ==========================================
     @staticmethod
-    def generate_and_save_reports(user_id: str, session_id: str, source_crm: str, target_crm: str, target_object: str, success_data: list, error_data: list, auth_token: str, extraction_query: str = "", time_filter: dict = None, op_mode: str = "", user_email: str = None, user_name: str = None, migration_mode: str = None, source_mode: str = None, actual_query_used: str = None, source_object: str = None):
+    def generate_and_save_reports(user_id: str, session_id: str, source_crm: str, target_crm: str, target_object: str, success_data: list, error_data: list, auth_token: str, extraction_query: str = "", time_filter: dict = None, op_mode: str = "", user_email: str = None, user_name: str = None, migration_mode: str = None, source_mode: str = None, actual_query_used: str = None):
         success_count = len(success_data)
         error_count = len(error_data)
         total = success_count + error_count
@@ -372,7 +334,7 @@ class AuditService:
         run_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %I:%M:%S %p UTC")
         migration_mode_display = migration_mode or ("CSV / Excel Upload" if (source_crm or "").lower() == "csv" else "Direct API Sync")
 
-        effective_query = actual_query_used or AuditService._build_effective_query(source_crm, target_object, extraction_query, time_filter, source_object=source_object)
+        effective_query = actual_query_used or AuditService._build_effective_query(source_crm, target_object, extraction_query, time_filter)
 
         # ==========================================
         # 1. GENERATE & UPLOAD PDF SUMMARY
@@ -506,8 +468,7 @@ class AuditService:
         # ==========================================
         # 4. SAVE TO DATABASE
         # ==========================================
-        scoped_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        scoped_client.auth.set_session(access_token=auth_token, refresh_token="")
+        scoped_client = AuditService._scoped_client(auth_token)
 
         scoped_client.table("migration_history").insert({
             "user_id": user_id,
@@ -532,91 +493,6 @@ class AuditService:
     # VALIDATION REPORTS
     # ==========================================
     @staticmethod
-    def _build_validation_pdf(
-        session_id: str,
-        user_id: str,
-        source_crm: str,
-        target_crm: str,
-        target_object: str,
-        stats: dict,
-        error_summary: list,
-        user_email: str = None,
-        user_name: str = None,
-    ) -> str:
-        s = AuditService._sanitize_pdf_text
-        total = stats.get("total", 0)
-        valid = stats.get("valid", 0)
-        invalid = stats.get("invalid", 0)
-        duplicates = stats.get("duplicates", 0)
-        pass_rate = round((valid / total) * 100, 1) if total else 0.0
-        run_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %I:%M:%S %p UTC")
-
-        pdf = SureShiftPDF()
-        pdf.report_title = "Validation Audit Report"
-        pdf.alias_nb_pages()
-        pdf.set_auto_page_break(auto=True, margin=22)
-        pdf.add_page()
-
-        pdf.set_font("Arial", "B", 40)
-        pdf.set_text_color(240, 240, 240)
-        pdf.text(25, 165, s("SureShift Validation"))
-        pdf.set_text_color(0, 0, 0)
-
-        pdf.set_fill_color(245, 245, 245)
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 8, txt=s(" Validation Run Details"), ln=True, fill=True)
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(95, 7, txt=s(f"  User Name: {user_name or 'N/A'}"))
-        pdf.cell(95, 7, txt=s(f"  User Email: {user_email or 'N/A'}"), ln=True)
-        pdf.cell(95, 7, txt=s(f"  Generated At: {run_timestamp}"), ln=True)
-        pdf.ln(5)
-
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 8, txt=s(" Validation Scope"), ln=True, fill=True)
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(95, 7, txt=s(f"  Source: {(source_crm or '').capitalize()}"))
-        pdf.cell(95, 7, txt=s(f"  Target: {(target_crm or '').capitalize()}"), ln=True)
-        pdf.cell(95, 7, txt=s(f"  Object: {target_object}"), ln=True)
-        pdf.ln(5)
-
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 8, txt=s(" Validation Results"), ln=True, fill=True)
-        pdf.set_font("Arial", "B", 10)
-        pdf.cell(60, 7, txt=s(f"  Total Records: {total}"))
-        pdf.set_text_color(39, 174, 96)
-        pdf.cell(60, 7, txt=s(f"  Valid: {valid}"))
-        pdf.set_text_color(192, 57, 43)
-        pdf.cell(60, 7, txt=s(f"  Invalid: {invalid}"), ln=True)
-        pdf.set_text_color(0, 0, 0)
-        pdf.cell(60, 7, txt=s(f"  Duplicates: {duplicates}"))
-        pdf.cell(60, 7, txt=s(f"  Pass Rate: {pass_rate}%"), ln=True)
-        pdf.ln(5)
-
-        if error_summary:
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 8, txt=s(" Top Error Categories"), ln=True, fill=True)
-            pdf.set_font("Arial", "B", 10)
-            pdf.set_fill_color(220, 220, 220)
-            pdf.cell(140, 7, txt=s("Error Category"), border=1, fill=True)
-            pdf.cell(50, 7, txt=s("Count"), border=1, ln=True, align="C", fill=True)
-            pdf.set_font("Arial", "", 10)
-            for item in error_summary:
-                pdf.cell(140, 7, txt=s(item["category"]), border=1)
-                pdf.cell(50, 7, txt=s(str(item["count"])), border=1, ln=True, align="C")
-
-        temp_pdf = os.path.join(tempfile.gettempdir(), f"{session_id}_validation_report.pdf")
-        try:
-            pdf.output(temp_pdf)
-            return AuditService._upload_file(
-                temp_pdf, f"{user_id}/{session_id}_validation_report.pdf",
-                content_type="application/pdf",
-                disposition="inline",
-            )
-        finally:
-            if os.path.exists(temp_pdf):
-                os.remove(temp_pdf)
-
-    @staticmethod
     def generate_and_save_validation_report(
         user_id: str,
         session_id: str,
@@ -624,35 +500,51 @@ class AuditService:
         target_crm: str,
         target_object: str,
         stats: dict,
-        invalid_records: list,
+        invalid_records: Iterable[dict],
         auth_token: str,
-        staging_db_path: str = None,
-        user_email: str = None,
-        user_name: str = None,
+        valid_records_factory: Optional[Callable[[], Iterable[dict]]] = None,
     ):
+        """Persists one validation_history row plus both log files:
+        - invalid_csv_url: every failed row + Validation_Errors column
+        - valid_csv_url:   every passed row (previously never generated)
+        invalid_records is a list (needed for error_summary); valid_records_factory
+        is a zero-arg callable returning a fresh iterator of valid row dicts."""
         invalid_csv_url = None
         valid_csv_url = None
-        pdf_url = None
+        invalid_records = list(invalid_records or [])
         error_like = [{"record": rec.get("originalRow", {}), "error": rec.get("errors", "")} for rec in invalid_records]
         error_summary = AuditService.build_error_summary(error_like)
 
-        # 1. PDF summary (generated for every run, including 100% valid ones)
         try:
-            pdf_url = AuditService._build_validation_pdf(
-                session_id, user_id, source_crm, target_crm, target_object,
-                stats, error_summary, user_email=user_email, user_name=user_name,
-            )
+            if invalid_records:
+                def _invalid_rows() -> Iterator[dict]:
+                    for rec in invalid_records:
+                        flat = dict(rec.get("originalRow", {}))
+                        flat.pop("_db_id", None)
+                        flat["Validation_Errors"] = rec.get("errors", "")
+                        yield flat
+
+                invalid_csv_url = AuditService._upload_csv_stream(
+                    _invalid_rows,
+                    f"{user_id}/{session_id}_validation_invalid.csv",
+                    leading_columns=["Validation_Errors"],
+                )
         except Exception:
             logger.exception(
-                "[AUDIT] Validation PDF generation/upload failed for session %s -- "
+                "[AUDIT] Invalid-records CSV generation/upload failed for session %s -- "
                 "continuing without it so the history row still gets saved.", session_id
             )
 
-        # 2. Valid-records CSV (streamed from the staging DB)
         try:
-            if stats.get("valid", 0) > 0 and staging_db_path:
-                valid_csv_url = AuditService._upload_csv_from_iter(
-                    lambda: AuditService._iter_staged_records(staging_db_path, is_valid=True),
+            if valid_records_factory is not None and stats.get("valid", 0) > 0:
+                def _valid_rows() -> Iterator[dict]:
+                    for rec in valid_records_factory():
+                        flat = dict(rec)
+                        flat.pop("_db_id", None)
+                        yield flat
+
+                valid_csv_url = AuditService._upload_csv_stream(
+                    _valid_rows,
                     f"{user_id}/{session_id}_validation_valid.csv",
                 )
         except Exception:
@@ -661,35 +553,11 @@ class AuditService:
                 "continuing without it so the history row still gets saved.", session_id
             )
 
-        # 3. Invalid-records CSV
-        try:
-            if invalid_records:
-                def _invalid_rows() -> Iterator[dict]:
-                    for rec in invalid_records:
-                        flat_rec = dict(rec.get("originalRow", {}))
-                        flat_rec.pop("_db_id", None)
-                        flat_rec["Validation_Errors"] = rec.get("errors", "")
-                        yield flat_rec
-
-                invalid_csv_url = AuditService._upload_csv_from_iter(
-                    _invalid_rows,
-                    f"{user_id}/{session_id}_validation_invalid.csv",
-                    leading_fields=("Validation_Errors",),
-                )
-        except Exception:
-            logger.exception(
-                "[AUDIT] Invalid-records CSV generation/upload failed for session %s -- "
-                "continuing without it so the history row still gets saved.", session_id
-            )
-
-        scoped_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        scoped_client.auth.set_session(access_token=auth_token, refresh_token="")
-
         row = {
             "user_id": user_id,
             "session_id": session_id,
-            "source_crm": source_crm,
-            "target_crm": target_crm,
+            "source_crm": (source_crm or "").lower(),
+            "target_crm": (target_crm or "").lower(),
             "target_object": target_object,
             "total_records": stats.get("total", 0),
             "valid_count": stats.get("valid", 0),
@@ -697,29 +565,13 @@ class AuditService:
             "duplicate_count": stats.get("duplicates", 0),
             "invalid_csv_url": invalid_csv_url,
             "valid_csv_url": valid_csv_url,
-            "pdf_url": pdf_url,
             "error_summary": error_summary,
         }
 
-        try:
-            AuditService._save_validation_row(scoped_client, session_id, row)
-        except Exception as e:
-            if "pdf_url" not in str(e):
-                raise
-            logger.warning(
-                "[AUDIT] validation_history has no pdf_url column -- saving session %s without it. Run "
-                "`ALTER TABLE validation_history ADD COLUMN pdf_url text;` to persist the PDF link.",
-                session_id,
-            )
-            row.pop("pdf_url")
-            AuditService._save_validation_row(scoped_client, session_id, row)
+        scoped_client = AuditService._scoped_client(auth_token)
+        AuditService._save_validation_row(scoped_client, session_id, row)
 
-        return {
-            "invalid_csv_url": invalid_csv_url,
-            "valid_csv_url": valid_csv_url,
-            "pdf_url": pdf_url,
-            "error_summary": error_summary,
-        }
+        return {"invalid_csv_url": invalid_csv_url, "valid_csv_url": valid_csv_url, "error_summary": error_summary}
 
     @staticmethod
     def _save_validation_row(scoped_client, session_id: str, row: dict) -> None:

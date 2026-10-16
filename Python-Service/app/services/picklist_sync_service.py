@@ -3,6 +3,7 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
+from datetime import datetime, timezone
 
 import httpx
 
@@ -49,7 +50,13 @@ def _active_values(field_meta: Dict[str, Any]) -> set:
 class _SalesforceSession:
     API_VERSION = "v60.0"
 
-    def __init__(self, client: httpx.AsyncClient, creds: Dict[str, Any], user_id: str, role: str):
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        creds: Dict[str, Any],
+        user_id: str,
+        role: str,
+    ):
         self.client = client
         self.token: str = creds.get("access_token") or ""
         self.instance_url: str = (creds.get("instance_url") or "").rstrip("/")
@@ -62,6 +69,9 @@ class _SalesforceSession:
         if not self.token or not self.instance_url:
             raise PicklistSyncError(f"Missing Salesforce credentials for {role} org.")
 
+    async def _refresh_token(self) -> str:
+        return await CrmService.refresh_crm_token(self.user_id, "salesforce", self.role)
+
     async def request(self, method: str, path: str, **kwargs) -> httpx.Response:
         url = f"{self.instance_url}/services/data/{self.API_VERSION}{path}"
         for attempt in range(2):
@@ -72,7 +82,7 @@ class _SalesforceSession:
                 **kwargs,
             )
             if res.status_code == 401 and attempt == 0:
-                self.token = await CrmService.refresh_crm_token(self.user_id, "salesforce", self.role)
+                self.token = await self._refresh_token()
                 continue
             if res.status_code >= 400:
                 raise PicklistSyncError(f"{method} {path} -> {res.status_code}: {res.text[:500]}")
@@ -115,7 +125,7 @@ class _SalesforceSession:
                 headers={"Content-Type": "text/xml; charset=UTF-8", "SOAPAction": '""'},
             )
             if "INVALID_SESSION_ID" in res.text and attempt == 0:
-                self.token = await CrmService.refresh_crm_token(self.user_id, "salesforce", self.role)
+                self.token = await self._refresh_token()
                 continue
             break
 
@@ -212,11 +222,15 @@ class PicklistSyncService:
         entries: List[Dict[str, Any]],
         missing: List[Dict[str, str]],
         extras: Optional[Dict[str, Any]] = None,
+        added_by: Optional[str] = None,
+        requested_by: Optional[str] = None,
     ) -> List[str]:
- 
         for e in entries:
             if e.get("isActive") is None:
                 e["isActive"] = True
+
+        who = f" (requested by {requested_by})" if requested_by else ""
+        stamp = f"Added by SureShift Migration{who} on {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
 
         index = {str(e.get("valueName", "")).strip().lower(): e for e in entries}
         added = []
@@ -226,6 +240,8 @@ class PicklistSyncService:
             if existing is not None:
                 if existing.get("isActive") is False:
                     existing["isActive"] = True
+                    if stamp:
+                        existing["description"] = stamp
                     added.append(m["value"])
                 continue
             entries.append({
@@ -234,7 +250,7 @@ class PicklistSyncService:
                 "default": False,
                 "isActive": True,
                 "color": None,
-                "description": None,
+                "description": stamp,
                 **(extras or {}),
             })
             added.append(m["value"])
@@ -380,7 +396,7 @@ class PicklistSyncService:
             raise PicklistSyncError(f"Global value set '{name}' not found in destination org.")
         metadata = recs[0]["Metadata"]
         metadata["customValue"] = metadata.get("customValue") or []
-        added = cls._append_entries(metadata["customValue"], missing)
+        added = cls._append_entries(metadata["customValue"], missing, added_by=str(session.user_id))
         if added:
             await session.tooling_patch_metadata("GlobalValueSet", recs[0]["Id"], metadata)
         return added
@@ -396,7 +412,7 @@ class PicklistSyncService:
         metadata = recs[0]["Metadata"]
         entries = metadata.get("standardValue") or []
         extras = _SVS_NEW_ENTRY_DEFAULTS.get(name.lower())
-        added = cls._append_entries(entries, missing, extras)
+        added = cls._append_entries(entries, missing, extras, added_by=str(session.user_id))
         if added:
             await session.metadata_update_standard_value_set(
                 name, bool(metadata.get("sorted", False)), entries
@@ -424,7 +440,7 @@ class PicklistSyncService:
 
         definition = value_set.get("valueSetDefinition") or {"sorted": False, "value": []}
         definition["value"] = definition.get("value") or []
-        added = cls._append_entries(definition["value"], missing)
+        added = cls._append_entries(definition["value"], missing, added_by=str(session.user_id))
         if added:
             value_set["valueSetDefinition"] = definition
             metadata["valueSet"] = value_set
