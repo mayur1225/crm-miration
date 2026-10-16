@@ -628,6 +628,274 @@
     transform: scale(0.92);
     background-color: #a52834 !important;
   }
+
+  /* =====================================================================
+     MIGRATION RECOVERY PANEL  (.rv)  — understand → fix → retry
+     ===================================================================== */
+  .rv {
+    --rv-ink: #141a26;
+    --rv-soft: #f4f6fb;
+    --rv-line: #e6e9f2;
+    --rv-muted: #6b7385;
+    --rv-brand: #4f46e5;
+    --rv-brand-2: #7c3aed;
+    --rv-red: #e5484d;     --rv-red-soft: #fff0f0;
+    --rv-amber: #c77700;   --rv-amber-soft: #fff6e5;
+    --rv-blue: #2f6fd6;    --rv-blue-soft: #eaf2ff;
+    --rv-violet: #7c3aed;  --rv-violet-soft: #f3edff;
+    --rv-green: #12a06a;   --rv-green-soft: #e8f8f1;
+    border-radius: 18px !important;
+    border: 1px solid rgba(20, 26, 38, .08) !important;
+    box-shadow: 0 30px 80px -20px rgba(20, 26, 38, .45), 0 8px 24px rgba(20, 26, 38, .12) !important;
+    background: #fff;
+    container-type: inline-size;
+    color: var(--rv-ink);
+  }
+  .rv .min-w-0 { min-width: 0; }
+  .rv.minimized { border-radius: 14px !important; }
+
+  /* ---------- header ---------- */
+  .rv-header {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 16px; flex-shrink: 0; color: #fff;
+    background: radial-gradient(120% 220% at 0% 0%, #3b3a8f 0%, #1c2033 55%, #12151f 100%);
+  }
+  .rv-header-icon {
+    width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center; flex-shrink: 0;
+    background: linear-gradient(135deg, var(--rv-brand), var(--rv-brand-2)); font-size: 18px;
+    box-shadow: 0 6px 16px rgba(79, 70, 229, .45);
+  }
+  .rv-header-title { font-weight: 700; font-size: 1rem; letter-spacing: .1px; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .rv-header-sub { font-size: .72rem; color: rgba(255, 255, 255, .6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rv-mini-badge { font-size: .68rem; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--rv-red); }
+  .rv-icon-btn {
+    width: 28px; height: 28px; border-radius: 9px; border: 0; display: grid; place-items: center; cursor: pointer;
+    background: rgba(255, 255, 255, .08); color: rgba(255, 255, 255, .85); transition: background .15s, transform .12s;
+  }
+  .rv-icon-btn:hover { background: rgba(255, 255, 255, .18); transform: translateY(-1px); }
+  .rv-icon-btn.rv-close { background: rgba(229, 72, 77, .9); color: #fff; }
+  .rv-icon-btn.rv-close:hover { background: #cf3338; }
+
+  /* ---------- body layout ---------- */
+  .rv-body { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; background: var(--rv-soft); }
+
+  /* ---------- hero ---------- */
+  .rv-hero {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center;
+    padding: 14px 18px; background: #fff; border-bottom: 1px solid var(--rv-line); flex-shrink: 0;
+  }
+  .rv-ring {
+    --pct: 0; width: 66px; height: 66px; border-radius: 50%; display: grid; place-items: center;
+    background: conic-gradient(var(--rv-green) calc(var(--pct) * 1%), #e9ecf4 0);
+    transition: background .6s ease;
+  }
+  .rv-ring-inner {
+    width: 52px; height: 52px; border-radius: 50%; background: #fff; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; line-height: 1;
+  }
+  .rv-ring-inner b { font-size: .95rem; }
+  .rv-ring-inner span { font-size: .58rem; color: var(--rv-muted); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+  .rv-hero-title { font-weight: 700; font-size: 1.02rem; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .rv-status { font-size: .66rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 3px 9px; border-radius: 999px; background: var(--rv-amber-soft); color: var(--rv-amber); }
+  .rv-status[data-status='completed'] { background: var(--rv-green-soft); color: var(--rv-green); }
+  .rv-status[data-status='running'] { background: var(--rv-blue-soft); color: var(--rv-blue); }
+  .rv-bar { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: #edf0f7; margin: 9px 0 7px; }
+  .rv-bar .seg { height: 100%; transition: width .6s cubic-bezier(.2, .8, .2, 1); }
+  .seg.ok, .dot.ok { background: var(--rv-green); }
+  .seg.err, .dot.err { background: var(--rv-red); }
+  .seg.skip, .dot.skip { background: #f0b429; }
+  .seg.wait, .dot.wait { background: #b8c0d4; }
+  .rv-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: .74rem; color: var(--rv-muted); }
+  .rv-legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .rv-legend b { color: var(--rv-ink); margin-right: 3px; }
+  .rv-position { font-size: .75rem; color: var(--rv-muted); margin-top: 6px; }
+  .rv-position i { color: var(--rv-brand); margin-right: 3px; }
+
+  /* stepper */
+  .rv-steps { list-style: none; margin: 0; padding: 0; display: flex; gap: 6px; }
+  .rv-steps li { display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 7px; border-radius: 999px; background: var(--rv-soft); color: var(--rv-muted); transition: all .25s ease; }
+  .rv-steps .n { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: .72rem; font-weight: 700; background: #dde2ee; color: #5b6478; }
+  .rv-steps .t { display: flex; flex-direction: column; line-height: 1.1; }
+  .rv-steps .t b { font-size: .76rem; color: inherit; }
+  .rv-steps .t small { font-size: .62rem; opacity: .8; }
+  .rv-steps li.active { background: linear-gradient(135deg, var(--rv-brand), var(--rv-brand-2)); color: #fff; box-shadow: 0 6px 16px rgba(79, 70, 229, .35); }
+  .rv-steps li.active .n { background: rgba(255, 255, 255, .25); color: #fff; }
+  .rv-steps li.done { background: var(--rv-green-soft); color: var(--rv-green); }
+  .rv-steps li.done .n { background: var(--rv-green); color: #fff; }
+
+  /* ---------- notices ---------- */
+  .rv-notices { display: flex; flex-direction: column; gap: 6px; padding: 10px 18px 0; flex-shrink: 0; max-height: 170px; overflow: auto; }
+  .rv-notice { display: flex; gap: 10px; align-items: flex-start; padding: 8px 12px; border-radius: 12px; font-size: .78rem; border: 1px solid transparent; animation: rvPop .25s ease; }
+  .rv-notice i { margin-top: 2px; }
+  .rv-notice.info { background: var(--rv-blue-soft); color: #1f4fa0; border-color: #cfe0fb; }
+  .rv-notice.warn { background: var(--rv-amber-soft); color: #8a5300; border-color: #f6dfb0; }
+  .rv-notice.danger { background: var(--rv-red-soft); color: #a52529; border-color: #f7c9cb; }
+
+  /* ---------- main grid ---------- */
+  .rv-main { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 14px; padding: 12px 18px 14px; flex: 1 1 auto; min-height: 0; }
+  .rv-side, .rv-records { min-width: 0; background: #fff; border: 1px solid var(--rv-line); border-radius: 16px; min-height: 0; display: flex; flex-direction: column; }
+  .rv-side { padding: 12px; overflow-y: auto; gap: 10px; }
+  .rv-side-head { display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--rv-muted); }
+  .rv-link { border: 0; background: none; color: var(--rv-brand); font-size: .74rem; font-weight: 600; text-transform: none; letter-spacing: 0; cursor: pointer; }
+  .rv-link:hover { text-decoration: underline; }
+  .rv-side-empty { font-size: .8rem; color: var(--rv-muted); padding: 10px; text-align: center; }
+
+  /* error groups */
+  .rv-groups { display: flex; flex-direction: column; gap: 7px; }
+  .rv-group {
+    --tone: var(--rv-red); --tone-soft: var(--rv-red-soft);
+    display: flex; align-items: center; gap: 10px; text-align: left; width: 100%; padding: 9px 10px;
+    border-radius: 13px; border: 1.5px solid var(--rv-line); background: #fff; cursor: pointer;
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease, background .15s ease;
+  }
+  .rv-group:hover { transform: translateY(-2px); box-shadow: 0 8px 18px -8px rgba(20, 26, 38, .25); border-color: var(--tone); }
+  .rv-group.active { border-color: var(--tone); background: var(--tone-soft); box-shadow: 0 0 0 3px color-mix(in srgb, var(--tone) 18%, transparent); }
+  .rv-group-icon { width: 30px; height: 30px; border-radius: 10px; display: grid; place-items: center; background: var(--tone-soft); color: var(--tone); flex-shrink: 0; }
+  .rv-group-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .rv-group-title { font-weight: 700; font-size: .8rem; }
+  .rv-group-msg { font-size: .68rem; color: var(--rv-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+  .rv-group-count { font-weight: 700; font-size: .72rem; min-width: 28px; text-align: center; padding: 3px 8px; border-radius: 999px; background: var(--tone); color: #fff; }
+  [data-tone='warn'] { --tone: var(--rv-amber); --tone-soft: var(--rv-amber-soft); }
+  [data-tone='info'] { --tone: var(--rv-blue); --tone-soft: var(--rv-blue-soft); }
+  [data-tone='link'] { --tone: var(--rv-violet); --tone-soft: var(--rv-violet-soft); }
+  [data-tone='danger'] { --tone: var(--rv-red); --tone-soft: var(--rv-red-soft); }
+
+  .rv-tip-card { --tone: var(--rv-red); --tone-soft: var(--rv-red-soft); border-radius: 13px; padding: 10px 12px; background: var(--tone-soft); border: 1px solid color-mix(in srgb, var(--tone) 25%, transparent); animation: rvPop .25s ease; }
+  .rv-tip-title { font-weight: 700; font-size: .76rem; color: var(--tone); margin-bottom: 3px; }
+  .rv-tip-card p { margin: 0; font-size: .78rem; line-height: 1.4; }
+
+  .rv-bulk { margin-top: auto; border-radius: 13px; padding: 11px; background: var(--rv-soft); border: 1px dashed #cfd5e4; }
+  .rv-bulk-title { font-weight: 700; font-size: .8rem; margin-bottom: 8px; }
+  .rv-bulk-title i { color: var(--rv-brand); margin-right: 4px; }
+  .rv-mini-label { display: block; font-size: .66rem; text-transform: uppercase; letter-spacing: .06em; color: var(--rv-muted); margin-bottom: 3px; font-weight: 600; }
+  .rv-bulk-note { display: block; margin-top: 8px; font-size: .68rem; color: var(--rv-muted); line-height: 1.35; }
+
+  /* ---------- records column ---------- */
+  .rv-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--rv-line); flex-shrink: 0; }
+  .rv-search { position: relative; flex: 1 1 220px; max-width: 360px; }
+  .rv-search > i { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--rv-muted); font-size: 14px; }
+  .rv-search input { width: 100%; height: 32px; padding: 0 30px 0 32px; border-radius: 10px; border: 1px solid var(--rv-line); background: var(--rv-soft); font-size: .8rem; outline: none; transition: all .15s; }
+  .rv-search input:focus { background: #fff; border-color: var(--rv-brand); box-shadow: 0 0 0 3px rgba(79, 70, 229, .15); }
+  .rv-search button { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); border: 0; background: #e3e7f1; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; cursor: pointer; }
+  .rv-total { font-size: .76rem; color: var(--rv-muted); font-weight: 600; }
+  .rv-seg { flex-shrink: 0; display: inline-flex; padding: 3px; background: var(--rv-soft); border-radius: 10px; }
+  .rv-seg button { border: 0; background: none; padding: 4px 10px; font-size: .74rem; font-weight: 600; border-radius: 8px; color: var(--rv-muted); cursor: pointer; transition: all .15s; }
+  .rv-seg button.on { background: #fff; color: var(--rv-brand); box-shadow: 0 2px 6px rgba(20, 26, 38, .12); }
+
+  .rv-scroll { flex: 1 1 auto; overflow: auto; min-height: 0; padding: 12px; background: #fbfcfe; }
+  .rv-cards { display: flex; flex-direction: column; gap: 12px; }
+
+  /* record card */
+  .rv-card {
+    --tone: var(--rv-red); --tone-soft: var(--rv-red-soft);
+    position: relative; background: #fff; border: 1px solid var(--rv-line); border-radius: 15px; padding: 12px 14px 12px 18px;
+    transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease; animation: rvPop .3s ease both;
+  }
+  .rv-card::before { content: ''; position: absolute; left: 0; top: 12px; bottom: 12px; width: 4px; border-radius: 0 4px 4px 0; background: var(--tone); transition: background .25s; }
+  .rv-card:hover { box-shadow: 0 12px 28px -14px rgba(20, 26, 38, .3); transform: translateY(-1px); }
+  .rv-card.fixed { border-color: #a9e2c9; background: linear-gradient(180deg, #f6fdf9, #fff 60%); }
+  .rv-card.fixed::before { background: var(--rv-green); }
+  .rv-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .rv-rownum { font-weight: 700; font-size: .8rem; padding: 2px 9px; border-radius: 8px; background: var(--rv-soft); }
+  .rv-pill { display: inline-flex; align-items: center; gap: 5px; font-size: .7rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; background: var(--tone-soft); color: var(--tone); }
+  .rv-pill.sm { font-size: .64rem; padding: 2px 8px; }
+  .rv-edited { font-size: .7rem; font-weight: 600; color: var(--rv-green); background: var(--rv-green-soft); padding: 3px 9px; border-radius: 999px; animation: rvPop .2s ease; }
+  .rv-copy { margin-left: auto; border: 0; background: none; color: var(--rv-muted); width: 26px; height: 26px; border-radius: 8px; cursor: pointer; }
+  .rv-copy:hover { background: var(--rv-soft); color: var(--rv-ink); }
+  .rv-raw { font-family: 'SFMono-Regular', Consolas, Menlo, monospace; font-size: .72rem; line-height: 1.45; padding: 8px 10px; border-radius: 10px; background: #16192a; color: #ffd7d9; max-height: 5.6em; overflow: auto; word-break: break-word; }
+  .rv-raw .lbl { display: inline-block; margin-right: 8px; padding: 0 6px; border-radius: 5px; background: rgba(255, 255, 255, .12); color: #fff; font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; font-family: 'Inter', sans-serif; }
+  .rv-fix { display: flex; gap: 8px; align-items: flex-start; margin: 8px 0 10px; font-size: .78rem; line-height: 1.4; color: #3a4256; }
+  .rv-fix i { color: var(--rv-amber); margin-top: 2px; }
+  .rv-fields-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; margin: 2px 0 8px; font-size: .72rem; font-weight: 700; color: var(--rv-muted); text-transform: uppercase; letter-spacing: .05em; }
+  .rv-fields-flag { color: var(--rv-red); text-transform: none; letter-spacing: 0; }
+  .rv-fields {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px;
+    max-height: clamp(180px, 36vh, 420px); overflow-y: auto; padding: 4px 8px 4px 2px; margin-right: -4px;
+    scrollbar-width: thin; scrollbar-color: #c7cde0 transparent;
+  }
+  .rv-fields::-webkit-scrollbar { width: 8px; }
+  .rv-fields::-webkit-scrollbar-thumb { background: #c7cde0; border-radius: 8px; }
+  .rv-fields::-webkit-scrollbar-thumb:hover { background: #a9b1cc; }
+  .rv-size { display: inline-flex; align-items: center; gap: 6px; margin: 0 6px 0 0; font-size: .72rem; color: var(--rv-muted); }
+  .rv-size select { border: 1px solid var(--rv-line); border-radius: 8px; font-size: .74rem; padding: 2px 4px; background: #fff; }
+  .rv-field { display: flex; flex-direction: column; gap: 3px; margin: 0; }
+  .rv-field-label { font-size: .68rem; font-weight: 700; color: #4b5368; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .rv-field-label small { font-weight: 500; color: var(--rv-muted); }
+  .rv-flag { font-style: normal; font-size: .6rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 1px 6px; border-radius: 5px; background: var(--rv-red); color: #fff; animation: rvPulse 1.8s infinite; }
+  .rv-input-wrap { position: relative; display: block; }
+  .rv-field .form-control { border-radius: 9px; font-size: .8rem; transition: all .15s; }
+  .rv-field.flag .form-control { border-color: var(--rv-red); background: var(--rv-red-soft); box-shadow: 0 0 0 3px rgba(229, 72, 77, .12); }
+  .rv-field.edited .form-control { border-color: var(--rv-green); background: var(--rv-green-soft); padding-right: 30px; }
+  .rv-undo { position: absolute; right: 5px; top: 50%; transform: translateY(-50%); border: 0; background: #fff; width: 22px; height: 22px; border-radius: 7px; font-size: 12px; color: var(--rv-muted); cursor: pointer; box-shadow: 0 1px 4px rgba(0, 0, 0, .15); }
+  .rv-undo:hover { color: var(--rv-red); }
+  .rv-more { margin-top: 9px; border: 0; background: none; color: var(--rv-brand); font-size: .74rem; font-weight: 600; cursor: pointer; padding: 0; }
+  .rv-more:hover { text-decoration: underline; }
+
+  /* table view */
+  .rv-table { font-size: .78rem; width: max-content; min-width: 100%; }
+  .rv-table th:nth-child(1), .rv-table td:nth-child(1) { position: sticky; left: 0; z-index: 1; background: #fff; }
+  .rv-table th:nth-child(2), .rv-table td:nth-child(2) { position: sticky; left: 50px; z-index: 1; background: #fff; box-shadow: 2px 0 0 var(--rv-line); }
+  .rv-table thead th:nth-child(1), .rv-table thead th:nth-child(2) { z-index: 3; background: #f1f3f9; }
+  .rv-table tr.row-fixed td:nth-child(1), .rv-table tr.row-fixed td:nth-child(2) { background: var(--rv-green-soft); }
+  .rv-table td:nth-child(2) { min-width: 300px; max-width: 360px; }
+  .rv-table thead th { position: sticky; top: 0; z-index: 2; background: #f1f3f9; font-size: .72rem; border-bottom: 1px solid var(--rv-line); }
+  .rv-table td, .rv-table th { vertical-align: top; }
+  .rv-table tr.row-fixed td { background: var(--rv-green-soft); }
+  .rv-table-err { color: var(--rv-red); font-size: .74rem; margin-top: 3px; }
+
+  /* pager */
+  .rv-pager { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-top: 1px solid var(--rv-line); font-size: .76rem; color: var(--rv-muted); flex-shrink: 0; }
+  .rv-pager-btns { display: flex; gap: 6px; }
+  .rv-pager-btns button { border: 1px solid var(--rv-line); background: #fff; border-radius: 9px; padding: 4px 11px; font-size: .74rem; font-weight: 600; cursor: pointer; transition: all .15s; }
+  .rv-pager-btns button:hover:not(:disabled) { border-color: var(--rv-brand); color: var(--rv-brand); }
+  .rv-pager-btns button:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* empty + skeleton */
+  .rv-empty { text-align: center; padding: 48px 20px; color: var(--rv-muted); }
+  .rv-empty-icon { width: 64px; height: 64px; margin: 0 auto 12px; border-radius: 20px; display: grid; place-items: center; font-size: 28px; background: var(--rv-green-soft); color: var(--rv-green); }
+  .rv-empty h6 { color: var(--rv-ink); font-weight: 700; }
+  .rv-empty p { font-size: .82rem; max-width: 340px; margin: 0 auto 12px; }
+  .rv-skeletons { display: flex; flex-direction: column; gap: 12px; }
+  .rv-skel { height: 140px; border-radius: 15px; background: linear-gradient(90deg, #eef0f6 25%, #f8f9fc 45%, #eef0f6 65%); background-size: 200% 100%; animation: rvShimmer 1.2s infinite; }
+
+  /* ---------- footer ---------- */
+  .rv-footer {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; flex-shrink: 0;
+    padding: 11px 18px; background: rgba(255, 255, 255, .92); backdrop-filter: blur(10px); border-top: 1px solid var(--rv-line);
+  }
+  .rv-footer-status { font-size: .78rem; color: var(--rv-muted); display: flex; align-items: center; gap: 8px; }
+  .rv-footer-status.dirty { color: var(--rv-green); font-weight: 600; }
+  .rv-footer-status .pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--rv-green); animation: rvPulseDot 1.4s infinite; }
+  .rv-btn { display: inline-flex; align-items: center; gap: 7px; border: 1px solid transparent; border-radius: 11px; padding: 8px 15px; font-size: .8rem; font-weight: 700; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease, background .15s ease; }
+  .rv-btn:hover:not(:disabled) { transform: translateY(-2px); }
+  .rv-btn:active:not(:disabled) { transform: translateY(0) scale(.98); }
+  .rv-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .rv-btn-primary { color: #fff; background: linear-gradient(135deg, var(--rv-brand), var(--rv-brand-2)); box-shadow: 0 8px 20px -6px rgba(79, 70, 229, .6); }
+  .rv-btn-primary:hover:not(:disabled) { box-shadow: 0 12px 26px -6px rgba(79, 70, 229, .7); }
+  .rv-btn-soft { color: var(--rv-brand); background: #eceafd; }
+  .rv-btn-soft:hover:not(:disabled) { background: #e0ddfb; }
+  .rv-btn-ghost { color: var(--rv-ink); background: #fff; border-color: #d6dbe8; }
+  .rv-btn-ghost:hover:not(:disabled) { border-color: var(--rv-brand); color: var(--rv-brand); }
+
+  /* ---------- animations ---------- */
+  @keyframes rvPop { from { opacity: 0; transform: translateY(6px) scale(.99); } to { opacity: 1; transform: none; } }
+  @keyframes rvShimmer { to { background-position: -200% 0; } }
+  @keyframes rvPulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  @keyframes rvPulseDot { 0% { box-shadow: 0 0 0 0 rgba(18, 160, 106, .55); } 70% { box-shadow: 0 0 0 8px rgba(18, 160, 106, 0); } 100% { box-shadow: 0 0 0 0 rgba(18, 160, 106, 0); } }
+  @media (prefers-reduced-motion: reduce) { .rv *, .rv { animation: none !important; transition: none !important; } }
+
+  /* ---------- responsive (container = the panel itself) ---------- */
+  @container (max-width: 860px) {
+    .rv-hero { grid-template-columns: auto 1fr; }
+    .rv-steps { grid-column: 1 / -1; justify-content: space-between; }
+    .rv-main { grid-template-columns: minmax(0, 1fr); overflow-y: auto; }
+    .rv-side { max-height: 260px; }
+    .rv-records { min-height: 420px; }
+  }
+  @container (max-width: 560px) {
+    .rv-steps .t small { display: none; }
+    .rv-header-sub { display: none; }
+  }
 </style>
 
 @if (isGlobalLoading) {
@@ -2290,228 +2558,390 @@
 </div>
 }
 
-<!-- ===================== MIGRATION RECOVERY PANEL (failed records, resume, start over) ===================== -->
+<!-- ===================== MIGRATION RECOVERY PANEL (understand → fix → retry) ===================== -->
 @if (showRecoveryPanel) {
-<div class="floating-review-panel recovery-panel animate__animated animate__fadeInUp" [class.minimized]="recoveryMinimized"
+<div class="floating-review-panel recovery-panel rv animate__animated animate__fadeInUp" [class.minimized]="recoveryMinimized"
   [class.expanded]="recoveryExpanded" [style.top.px]="recoveryTop" [style.left.px]="recoveryLeft">
 
-  <div class="bg-dark text-white p-2 px-3 d-flex justify-content-between align-items-center flex-shrink-0 panel-header"
-    style="border-radius: 8px 8px 0 0;" (mousedown)="startRecoveryPanelDrag($event)"
+  <!-- ============ Header (drag handle) ============ -->
+  <div class="rv-header panel-header" (mousedown)="startRecoveryPanelDrag($event)"
     (click)="recoveryMinimized ? recoveryMinimized = false : null" title="Drag to move">
-    <div class="d-flex align-items-center gap-2">
-      <i class="feather icon-alert-triangle text-warning fs-5"></i>
-      <h6 class="m-0 fw-bold">Migration Recovery</h6>
-      @if (activeRun) {
-      <span class="badge bg-danger ms-2">{{ activeRun.counts?.error || 0 }} failed</span>
-      }
+    <div class="d-flex align-items-center gap-3 min-w-0">
+      <span class="rv-header-icon"><i class="feather icon-life-buoy"></i></span>
+      <div class="min-w-0">
+        <div class="rv-header-title">Fix &amp; retry failed records
+          @if (activeRun && recoveryMinimized) { <span class="rv-mini-badge">{{ activeRun.counts?.error || 0 }} failed</span> }
+        </div>
+        @if (activeRun && !recoveryMinimized) {
+        <div class="rv-header-sub">Run <span class="font-monospace">{{ activeRun.runId }}</span> ·
+          started by {{ activeRun.isMine ? 'you' : (activeRun.startedBy?.name || activeRun.startedBy?.email || 'another user') }} ·
+          last activity {{ activeRun.updatedAt | date: 'MMM d, h:mm a' }}</div>
+        }
+      </div>
     </div>
-    <div class="d-flex gap-2">
+    <div class="d-flex align-items-center gap-2">
       @if (!recoveryMinimized) {
-      <button class="btn btn-sm btn-link text-white-50 p-0 btn-hover-lift" title="Toggle Fullscreen"
-        (click)="recoveryExpanded = !recoveryExpanded; $event.stopPropagation()">
-        <i class="feather fs-5" [ngClass]="recoveryExpanded ? 'icon-minimize' : 'icon-maximize'"></i>
+      <button class="rv-icon-btn" title="Toggle fullscreen" (click)="recoveryExpanded = !recoveryExpanded; $event.stopPropagation()">
+        <i class="feather" [ngClass]="recoveryExpanded ? 'icon-minimize-2' : 'icon-maximize-2'"></i>
       </button>
-      <button class="btn btn-sm btn-link text-white-50 p-0 btn-hover-lift" title="Minimize"
-        (click)="minimizeRecoveryPanel(); $event.stopPropagation()">
-        <i class="feather icon-minus fs-5"></i>
-      </button>
-      <button
-        class="btn btn-sm btn-link p-0 btn-hover-lift panel-close-btn rounded-circle d-flex align-items-center justify-content-center"
-        style="width: 22px; height: 22px;" (click)="cancelRecoveryPanel(); $event.stopPropagation()" title="Close">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+      <button class="rv-icon-btn" title="Minimize (Esc)" (click)="minimizeRecoveryPanel(); $event.stopPropagation()">
+        <i class="feather icon-minus"></i>
       </button>
       } @else {
-      <button class="btn btn-sm btn-link text-white-50 p-0 btn-hover-lift" title="Restore"
-        (click)="restoreRecoveryPanel(); $event.stopPropagation()">
-        <i class="feather icon-maximize-2 fs-5"></i>
-      </button>
-      <button
-        class="btn btn-sm btn-link p-0 btn-hover-lift panel-close-btn rounded-circle d-flex align-items-center justify-content-center"
-        style="width: 22px; height: 22px;" (click)="cancelRecoveryPanel(); $event.stopPropagation()" title="Close">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+      <button class="rv-icon-btn" title="Restore" (click)="restoreRecoveryPanel(); $event.stopPropagation()">
+        <i class="feather icon-maximize-2"></i>
       </button>
       }
+      <button class="rv-icon-btn rv-close" title="Close" (click)="cancelRecoveryPanel(); $event.stopPropagation()">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+      </button>
     </div>
   </div>
 
   @if (!recoveryMinimized && activeRun) {
-  <!-- Run summary -->
-  <div class="bg-white p-3 border-bottom flex-shrink-0">
-    @if (recoverableRuns.length > 1) {
-    <select class="form-select form-select-sm mb-2" (change)="openRunRecovery($any($event.target).value)">
-      @for (r of recoverableRuns; track r.runId) {
-      <option [value]="r.runId" [selected]="r.runId === activeRun.runId">
-        {{ r.runId }} · {{ r.status }} · {{ r.isMine ? 'you' : (r.startedBy?.name || 'another user') }}
-      </option>
+  <div class="rv-body">
+
+    <!-- ============ Hero: status + 3-step guide ============ -->
+    <section class="rv-hero">
+      <div class="rv-ring" [style.--pct]="successPct" [title]="successPct + '% of records succeeded'">
+        <div class="rv-ring-inner"><b>{{ successPct }}%</b><span>done</span></div>
+      </div>
+
+      <div class="rv-hero-main">
+        <div class="rv-hero-title">
+          @if ((activeRun.counts?.error || 0) > 0) {
+          {{ activeRun.counts?.error }} record{{ activeRun.counts?.error === 1 ? '' : 's' }} need your attention
+          } @else if (activeRun.status === 'running') {
+          This run is active in another session
+          } @else {
+          No failed records — you're ready to continue
+          }
+          <span class="rv-status" [attr.data-status]="activeRun.status">{{ activeRun.status | titlecase }}</span>
+        </div>
+
+        <div class="rv-bar" title="Succeeded / failed / skipped / waiting">
+          <span class="seg ok" [style.width.%]="pct(activeRun.counts?.success)"></span>
+          <span class="seg err" [style.width.%]="pct(activeRun.counts?.error)"></span>
+          <span class="seg skip" [style.width.%]="pct(activeRun.counts?.skipped)"></span>
+          <span class="seg wait" [style.width.%]="pct(activeRun.counts?.pending)"></span>
+        </div>
+        <div class="rv-legend">
+          <span><i class="dot ok"></i><b>{{ activeRun.counts?.success || 0 }}</b> succeeded</span>
+          <span><i class="dot err"></i><b>{{ activeRun.counts?.error || 0 }}</b> failed</span>
+          <span><i class="dot skip"></i><b>{{ activeRun.counts?.skipped || 0 }}</b> skipped</span>
+          <span><i class="dot wait"></i><b>{{ activeRun.counts?.pending || 0 }}</b> waiting</span>
+        </div>
+
+        @if (activeRun.position) {
+        <div class="rv-position">
+          <i class="feather icon-map-pin"></i>
+          {{ activeRun.status === 'running' ? 'Currently at' : 'Stopped at' }}
+          <b>{{ activeRun.position.targetObject }}</b>
+          @if (activeRun.position.passName) { · {{ activeRun.position.passName }} }
+          @if (activeRun.position.total) { — {{ activeRun.position.processed }} / {{ activeRun.position.total }} processed }
+          @else { — {{ activeRun.position.stage }} }
+        </div>
+        }
+      </div>
+
+      <ol class="rv-steps">
+        <li [class.active]="recoveryStep === 1" [class.done]="recoveryStep > 1">
+          <span class="n">@if (recoveryStep > 1) { <i class="feather icon-check"></i> } @else { 1 }</span>
+          <span class="t"><b>Understand</b><small>Why did they fail?</small></span>
+        </li>
+        <li [class.active]="recoveryStep === 2" [class.done]="recoveryStep > 2">
+          <span class="n">@if (recoveryStep > 2) { <i class="feather icon-check"></i> } @else { 2 }</span>
+          <span class="t"><b>Fix</b><small>Edit values</small></span>
+        </li>
+        <li [class.active]="recoveryStep === 3">
+          <span class="n">3</span>
+          <span class="t"><b>Retry</b><small>Send again</small></span>
+        </li>
+      </ol>
+    </section>
+
+    <!-- ============ Notices ============ -->
+    @if (activeRun.stopReason || (activeRun.insertAtRiskRows > 0 && activeRun.status !== 'running') || (!activeRun.isMine && activeRun.status !== 'running') || activeRun.status === 'running' || recoverableRuns.length > 1) {
+    <div class="rv-notices">
+      @if (recoverableRuns.length > 1) {
+      <div class="rv-notice info">
+        <i class="feather icon-layers"></i>
+        <div class="flex-grow-1">
+          <b>Other runs need attention too.</b>
+          <select class="form-select form-select-sm mt-1" (change)="openRunRecovery($any($event.target).value)">
+            @for (r of recoverableRuns; track r.runId) {
+            <option [value]="r.runId" [selected]="r.runId === activeRun.runId">
+              {{ r.runId }} · {{ r.status }} · {{ r.isMine ? 'you' : (r.startedBy?.name || 'another user') }}
+            </option>
+            }
+          </select>
+        </div>
+      </div>
       }
-    </select>
-    }
-
-    <div class="d-flex flex-wrap align-items-center gap-2 small">
-      <span class="badge" [ngClass]="activeRun.status === 'completed' ? 'bg-success' : activeRun.status === 'running' ? 'bg-primary' : 'bg-warning text-dark'">
-        {{ activeRun.status | titlecase }}
-      </span>
-      <span class="text-muted">Run <span class="font-monospace">{{ activeRun.runId }}</span></span>
-      <span class="text-muted">· Started by <b>{{ activeRun.isMine ? 'you' : (activeRun.startedBy?.name || activeRun.startedBy?.email || 'another user') }}</b></span>
-      <span class="text-muted">· Last activity {{ activeRun.updatedAt | date: 'medium' }}</span>
-    </div>
-
-    @if (activeRun.position) {
-    <div class="mt-2 small">
-      <i class="feather icon-map-pin text-primary"></i>
-      {{ activeRun.status === 'running' ? 'Currently at' : 'Stopped at' }}
-      <b>{{ activeRun.position.targetObject }}</b>
-      @if (activeRun.position.passName) { · {{ activeRun.position.passName }} }
-      @if (activeRun.position.total) { — {{ activeRun.position.processed }} / {{ activeRun.position.total }} records processed }
-      @else { — {{ activeRun.position.stage }} }
-    </div>
-    }
-    @if (activeRun.stopReason) {
-    <div class="mt-1 small text-muted">
-      <b>{{ stopReasonLabel(activeRun.stopReason.code) }}:</b> {{ activeRun.stopReason.message }}
-    </div>
-    }
-    @if (!activeRun.isMine && activeRun.status !== 'running') {
-    <div class="alert alert-info py-1 px-2 mt-2 mb-0 small">
-      This run was started by another user of this org. Resuming or retrying uses <b>your</b> connection to the org.
-    </div>
-    }
-    @if (activeRun.status === 'running') {
-    <div class="alert alert-warning py-1 px-2 mt-2 mb-0 small">
-      This run is active in another session, so editing and resuming are disabled for now.
-      @if (activeRun.lockRemainingSec > 0) {
-      If that session crashed, this frees itself in about <b>{{ activeRun.lockRemainingSec }}s</b> and Resume will appear.
+      @if (activeRun.stopReason) {
+      <div class="rv-notice warn">
+        <i class="feather icon-pause-circle"></i>
+        <div><b>{{ stopReasonLabel(activeRun.stopReason.code) }}.</b> {{ activeRun.stopReason.message }}</div>
+      </div>
+      }
+      @if (activeRun.status === 'running') {
+      <div class="rv-notice warn">
+        <i class="feather icon-lock"></i>
+        <div>This run is active in another session, so editing and resuming are paused.
+          @if (activeRun.lockRemainingSec > 0) { If that session crashed, this frees itself in about <b>{{ activeRun.lockRemainingSec }}s</b>. }
+        </div>
+      </div>
+      }
+      @if (!activeRun.isMine && activeRun.status !== 'running') {
+      <div class="rv-notice info">
+        <i class="feather icon-users"></i>
+        <div>Started by a colleague on the same org. Resuming or retrying uses <b>your</b> connection.</div>
+      </div>
+      }
+      @if (activeRun.insertAtRiskRows > 0 && activeRun.status !== 'running') {
+      <div class="rv-notice danger">
+        <i class="feather icon-alert-triangle"></i>
+        <div><b>{{ activeRun.insertAtRiskRows }}</b> insert row(s) were mid-send when the run stopped and can't be verified in the target.
+          Resuming sends them again and may create duplicates for those rows.</div>
+      </div>
       }
     </div>
     }
-    @if (activeRun.insertAtRiskRows > 0 && activeRun.status !== 'running') {
-    <div class="alert alert-danger py-1 px-2 mt-2 mb-0 small">
-      <b>{{ activeRun.insertAtRiskRows }}</b> insert row(s) were mid-send when the run stopped and can't be verified in the target.
-      Resuming sends them again and may create duplicates for those rows.
-    </div>
-    }
 
-    <div class="d-flex flex-wrap gap-2 mt-2">
-      <span class="badge bg-success-subtle text-success-emphasis">{{ activeRun.counts?.success || 0 }} succeeded</span>
-      <span class="badge bg-danger-subtle text-danger-emphasis">{{ activeRun.counts?.error || 0 }} failed</span>
-      <span class="badge bg-warning-subtle text-warning-emphasis">{{ activeRun.counts?.skipped || 0 }} skipped</span>
-      <span class="badge bg-secondary-subtle text-secondary-emphasis">{{ activeRun.counts?.pending || 0 }} waiting</span>
-    </div>
+    <!-- ============ Main: error reasons (left) + records (right) ============ -->
+    <div class="rv-main">
 
-    <div class="d-flex flex-wrap gap-2 mt-3">
+      <!-- ---- Left: why records failed ---- -->
+      <aside class="rv-side">
+        <div class="rv-side-head">
+          <span>Why records failed</span>
+          @if (failureSearch) { <button class="rv-link" (click)="clearFailureFilter()">Show all</button> }
+        </div>
+
+        @if (failureGroups.length === 0) {
+        <div class="rv-side-empty"><i class="feather icon-check-circle"></i> No error groups</div>
+        }
+        <div class="rv-groups">
+          @for (g of failureGroups; track $index) {
+          <button class="rv-group" [attr.data-tone]="g._info.tone" [class.active]="failureSearch.trim() === g.message"
+            (click)="selectGroup(g)" [title]="g.message">
+            <span class="rv-group-icon"><i class="feather" [ngClass]="g._info.icon"></i></span>
+            <span class="rv-group-text">
+              <span class="rv-group-title">{{ g._info.title }}</span>
+              <span class="rv-group-msg">{{ g.message }}</span>
+            </span>
+            <span class="rv-group-count">{{ g.count }}</span>
+          </button>
+          }
+        </div>
+
+        @if (activeGroup; as ag) {
+        <div class="rv-tip-card" [attr.data-tone]="ag._info.tone">
+          <div class="rv-tip-title"><i class="feather icon-zap"></i> How to fix this</div>
+          <p>{{ ag._info.fix }}</p>
+        </div>
+        }
+
+        <div class="rv-bulk">
+          <div class="rv-bulk-title"><i class="feather icon-edit-3"></i>
+            Fix {{ failureSearch.trim() ? 'all matching' : 'all' }} <b>{{ failureTotal }}</b> at once
+          </div>
+          <label class="rv-mini-label">Column</label>
+          <select class="form-select form-select-sm" [(ngModel)]="bulkField">
+            <option value="">Choose a column…</option>
+            @for (c of activeColumns; track c.sourceField) { <option [value]="c.sourceField">{{ c.sourceField }}</option> }
+          </select>
+          <label class="rv-mini-label mt-2">New value</label>
+          <input class="form-control form-control-sm" placeholder="Type the corrected value" [(ngModel)]="bulkValue"
+            (keydown.enter)="bulkField && applyRunMassUpdate(bulkField, bulkValue)">
+          <button class="rv-btn rv-btn-soft w-100 mt-2" [disabled]="!bulkField || !failureTotal || activeRun.status === 'running'"
+            (click)="applyRunMassUpdate(bulkField, bulkValue)">
+            <i class="feather icon-check-square"></i> Apply to {{ failureTotal }} record(s)
+          </button>
+          <small class="rv-bulk-note">Tip: pick an error above first to limit the change to that error only.</small>
+        </div>
+      </aside>
+
+      <!-- ---- Right: records ---- -->
+      <section class="rv-records">
+        <div class="rv-toolbar">
+          <div class="rv-search">
+            <i class="feather icon-search"></i>
+            <input placeholder="Search error text or value…" [value]="failureSearch"
+              (input)="onFailureSearchChange($any($event.target).value)">
+            @if (failureSearch) {
+            <button title="Clear" (click)="clearFailureFilter()"><i class="feather icon-x"></i></button>
+            }
+          </div>
+          @if (runJobs.length > 1) {
+          <select class="form-select form-select-sm w-auto" (change)="onFailureJobChange($any($event.target).value)">
+            @for (j of runJobs; track j.jobIdx) {
+            <option [value]="j.jobIdx" [selected]="j.jobIdx === failureJobIdx">{{ j.targetObject }}{{ j.isPass3Patch ? ' (reference patch)' : '' }}</option>
+            }
+          </select>
+          }
+          <span class="rv-total">{{ failureTotal }} record{{ failureTotal === 1 ? '' : 's' }}</span>
+          <div class="rv-seg ms-auto" role="group" aria-label="View mode">
+            <button [class.on]="recoveryView === 'cards'" (click)="recoveryView = 'cards'" title="Card view"><i class="feather icon-grid"></i> Cards</button>
+            <button [class.on]="recoveryView === 'table'" (click)="recoveryView = 'table'" title="Table view"><i class="feather icon-list"></i> Table</button>
+          </div>
+        </div>
+
+        <div class="rv-scroll">
+          @if (isLoadingFailures) {
+          <div class="rv-skeletons">
+            <div class="rv-skel"></div><div class="rv-skel"></div><div class="rv-skel"></div>
+          </div>
+          } @else if (failureRows.length === 0) {
+          <div class="rv-empty">
+            <div class="rv-empty-icon"><i class="feather" [ngClass]="failureSearch ? 'icon-search' : 'icon-check-circle'"></i></div>
+            @if (failureSearch) {
+            <h6>No failed records match this filter</h6>
+            <p>Try a different search, or show every failed record.</p>
+            <button class="rv-btn rv-btn-soft" (click)="clearFailureFilter()">Clear filter</button>
+            } @else {
+            <h6>No failed records here</h6>
+            <p>Everything in this view is fixed or succeeded. Use the button below to continue the migration.</p>
+            }
+          </div>
+          } @else if (recoveryView === 'cards') {
+
+          <!-- ======== CARD VIEW ======== -->
+          <div class="rv-cards">
+            @for (row of failureRows; track row.jobIdx + '-' + row.passNo + '-' + row.rowIdx) {
+            <article class="rv-card" [class.fixed]="row._dirty" [attr.data-tone]="row._info.tone">
+              <header class="rv-card-head">
+                <span class="rv-rownum">Row {{ row.rowIdx + 1 }}</span>
+                <span class="rv-pill" [attr.data-tone]="row._info.tone"><i class="feather" [ngClass]="row._info.icon"></i> {{ row._info.title }}</span>
+                @if (row._dirty) { <span class="rv-edited"><i class="feather icon-edit-2"></i> Edited — not saved yet</span> }
+                <button class="rv-copy" title="Copy error message" (click)="copyError(row.error)"><i class="feather icon-copy"></i></button>
+              </header>
+
+              <div class="rv-raw"><span class="lbl">CRM said</span>{{ row.error }}</div>
+              <div class="rv-fix"><i class="feather icon-zap"></i><span>{{ row._info.fix }}</span></div>
+
+              <div class="rv-fields-head">
+                <span><i class="feather icon-layers"></i> All {{ activeColumns.length }} fields</span>
+                @if (flaggedCount(row) > 0) { <span class="rv-fields-flag"><i class="feather icon-alert-circle"></i> {{ flaggedCount(row) }} to check (shown first)</span> }
+              </div>
+              <div class="rv-fields">
+                @for (c of orderedColumns(row); track c.sourceField) {
+                <label class="rv-field" [class.flag]="hasRunCellError(row, c) && !row._edited[c.sourceField]" [class.edited]="row._edited[c.sourceField]">
+                  <span class="rv-field-label">
+                    {{ c.sourceField }} <small>→ {{ c.targetField }}</small>
+                    @if (hasRunCellError(row, c) && !row._edited[c.sourceField]) { <em class="rv-flag">check this</em> }
+                  </span>
+                  <span class="rv-input-wrap">
+                    <input class="form-control form-control-sm" [disabled]="activeRun.status === 'running'"
+                      [value]="formatCellValue(row.record[c.sourceField])"
+                      (input)="onRunCellEdit(row, c.sourceField, $any($event.target).value)">
+                    @if (row._edited[c.sourceField]) {
+                    <button type="button" class="rv-undo" title="Undo this change" (click)="revertCell(row, c.sourceField)"><i class="feather icon-rotate-ccw"></i></button>
+                    }
+                  </span>
+                </label>
+                }
+              </div>
+            </article>
+            }
+          </div>
+
+          } @else {
+
+          <!-- ======== TABLE VIEW ======== -->
+          <table class="table table-sm mb-0 align-middle rv-table">
+            <thead>
+              <tr>
+                <th style="width: 50px">#</th>
+                <th style="min-width: 300px">Error from CRM</th>
+                @for (c of activeColumns; track c.sourceField) {
+                <th style="min-width: 150px">{{ c.sourceField }}<small class="d-block fw-normal">&rarr; {{ c.targetField }}</small></th>
+                }
+              </tr>
+            </thead>
+            <tbody>
+              @for (row of failureRows; track row.jobIdx + '-' + row.passNo + '-' + row.rowIdx) {
+              <tr [class.row-fixed]="row._dirty">
+                <td class="text-muted">{{ row.rowIdx + 1 }}</td>
+                <td>
+                  <span class="rv-pill sm" [attr.data-tone]="row._info.tone">{{ row._info.title }}</span>
+                  <div class="rv-table-err">{{ row.error }}</div>
+                </td>
+                @for (c of activeColumns; track c.sourceField) {
+                <td>
+                  <input class="form-control form-control-sm"
+                    [class.is-invalid]="hasRunCellError(row, c) && !row._edited[c.sourceField]"
+                    [class.bg-success-subtle]="row._edited[c.sourceField]" [class.border-success]="row._edited[c.sourceField]"
+                    [disabled]="activeRun.status === 'running'" [value]="formatCellValue(row.record[c.sourceField])"
+                    (input)="onRunCellEdit(row, c.sourceField, $any($event.target).value)">
+                </td>
+                }
+              </tr>
+              }
+            </tbody>
+          </table>
+          }
+        </div>
+
+        <div class="rv-pager">
+          <span>
+            @if (failureTotal > 0) { Showing <b>{{ failureRangeStart }}–{{ failureRangeEnd }}</b> of <b>{{ failureTotal }}</b> failed records }
+            @else { No records }
+            · Page <b>{{ failurePage + 1 }}</b> / {{ failurePageCount }}
+          </span>
+          <div class="rv-pager-btns">
+            <label class="rv-size">Per page
+              <select (change)="setFailurePageSize($any($event.target).value)">
+                @for (n of failurePageSizes; track n) { <option [value]="n" [selected]="n === failurePageSize">{{ n }}</option> }
+              </select>
+            </label>
+            <button [disabled]="failurePage === 0" (click)="changeFailurePage(-1)"><i class="feather icon-chevron-left"></i> Prev</button>
+            <button [disabled]="failurePage + 1 >= failurePageCount" (click)="changeFailurePage(1)">Next <i class="feather icon-chevron-right"></i></button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ============ Sticky action bar ============ -->
+  <footer class="rv-footer">
+    <div class="rv-footer-status" [class.dirty]="dirtyRowCount > 0">
+      @if (dirtyRowCount > 0) {
+      <span class="pulse"></span> <b>{{ dirtyRowCount }}</b> edited record{{ dirtyRowCount === 1 ? '' : 's' }} not saved yet
+      } @else {
+      <i class="feather icon-info"></i> Edit the highlighted fields, then retry. Your changes are saved automatically when you retry.
+      }
+    </div>
+    <div class="d-flex flex-wrap gap-2 align-items-center">
+      @if (dirtyRowCount > 0) {
+      <button class="rv-btn rv-btn-ghost" (click)="saveRunEdits()" [disabled]="isSavingEdits || activeRun.status === 'running'">
+        @if (isSavingEdits) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="feather icon-save"></i> } Save only
+      </button>
+      }
       @if (activeRun.resumable) {
-      <button class="btn btn-sm btn-primary fw-bold" (click)="resumeFromPanel(false)" [disabled]="isGlobalLoading || isSavingEdits">
-        <i class="feather icon-play"></i> Resume from where it stopped
+      <button class="rv-btn" [ngClass]="activeRun.counts?.error ? 'rv-btn-soft' : 'rv-btn-primary'"
+        (click)="resumeFromPanel(false)" [disabled]="isGlobalLoading || isSavingEdits"
+        title="Continue the interrupted migration from its last checkpoint">
+        <i class="feather icon-play"></i> Resume
       </button>
       @if ((activeRun.counts?.error || 0) > 0) {
-      <button class="btn btn-sm btn-primary fw-bold" (click)="resumeFromPanel(true)" [disabled]="isGlobalLoading || isSavingEdits">
-        <i class="feather icon-refresh-cw"></i> Resume + retry {{ activeRun.counts?.error }} failed
+      <button class="rv-btn rv-btn-primary" (click)="resumeFromPanel(true)" [disabled]="isGlobalLoading || isSavingEdits">
+        <i class="feather icon-refresh-cw"></i> {{ dirtyRowCount ? 'Save, resume' : 'Resume' }} + retry {{ activeRun.counts?.error }} failed
       </button>
       }
       }
-      @if (activeRun.retryable) {
-      <button class="btn btn-sm btn-primary fw-bold" (click)="retryFromPanel()" [disabled]="isGlobalLoading || isSavingEdits">
-        <i class="feather icon-refresh-cw"></i> Retry failed records
+      @if (activeRun.retryable && !activeRun.resumable) {
+      <button class="rv-btn rv-btn-primary" (click)="retryFromPanel()" [disabled]="isGlobalLoading || isSavingEdits">
+        <i class="feather icon-refresh-cw"></i> {{ dirtyRowCount ? 'Save & retry' : 'Retry' }} {{ activeRun.counts?.error }} failed record{{ activeRun.counts?.error === 1 ? '' : 's' }}
       </button>
       }
-      <!-- @if (activeRun.status !== 'running' && activeRun.status !== 'superseded') {
-      <button class="btn btn-sm btn-outline-danger" (click)="restartFromPanel()" [disabled]="isGlobalLoading">
-        <i class="feather icon-rotate-ccw"></i> Start over
-      </button>
-      } -->
-      <button class="btn btn-sm btn-success fw-bold ms-auto" (click)="saveRunEdits()"
-        [disabled]="dirtyRowCount === 0 || isSavingEdits || activeRun.status === 'running'">
-        <i class="feather icon-save"></i> Save {{ dirtyRowCount }} edited record(s)
-      </button>
-    </div>
-  </div>
-
-  <!-- Filters, error groups, mass update -->
-  <div class="bg-light p-2 px-3 border-bottom flex-shrink-0">
-    <div class="d-flex flex-wrap gap-2 align-items-center">
-      @if (runJobs.length > 1) {
-      <select class="form-select form-select-sm w-auto" (change)="onFailureJobChange($any($event.target).value)">
-        @for (j of runJobs; track j.jobIdx) {
-        <option [value]="j.jobIdx" [selected]="j.jobIdx === failureJobIdx">{{ j.targetObject }}{{ j.isPass3Patch ? ' (reference patch)' : '' }}</option>
-        }
-      </select>
-      }
-      <input class="form-control form-control-sm w-auto" style="min-width: 240px" placeholder="Filter by error text or value..."
-        [value]="failureSearch" (input)="onFailureSearchChange($any($event.target).value)">
-      <span class="small text-muted">{{ failureTotal }} failed record(s)</span>
-
-      <div class="d-flex gap-1 align-items-center ms-auto">
-        <span class="small fw-bold">Fix all matching:</span>
-        <select #massCol class="form-select form-select-sm w-auto">
-          @for (c of activeColumns; track c.sourceField) { <option [value]="c.sourceField">{{ c.sourceField }}</option> }
-        </select>
-        <input #massVal class="form-control form-control-sm w-auto" style="max-width: 160px" placeholder="New value">
-        <button class="btn btn-sm btn-outline-success" [disabled]="!failureTotal || activeRun.status === 'running'"
-          (click)="applyRunMassUpdate(massCol.value, massVal.value)">Apply</button>
-      </div>
-    </div>
-
-    @if (failureGroups.length) {
-    <div class="d-flex flex-wrap gap-1 mt-2">
-      @for (g of failureGroups; track $index) {
-      <button class="btn btn-xs btn-outline-danger text-start" style="font-size: 0.72rem; max-width: 420px"
-        (click)="filterByGroup(g)" [title]="g.message">
-        <span class="badge bg-danger me-1">{{ g.count }}</span>{{ g.message.length > 80 ? (g.message | slice: 0 : 80) + '…' : g.message }}
+      @if (activeRun.retryable && activeRun.resumable) {
+      <button class="rv-btn rv-btn-ghost" (click)="retryFromPanel()" [disabled]="isGlobalLoading || isSavingEdits">
+        <i class="feather icon-refresh-cw"></i> Retry failed only
       </button>
       }
     </div>
-    }
-  </div>
-
-  <!-- Failed records grid (editable, like the validation grid) -->
-  <div class="panel-body flex-grow-1 overflow-auto bg-white">
-    @if (isLoadingFailures) {
-    <div class="text-center text-muted p-4">Loading failed records...</div>
-    } @else if (failureRows.length === 0) {
-    <div class="text-center text-muted p-4">
-      @if (failureSearch) { No failed records match this filter. } @else { No failed records. }
-    </div>
-    } @else {
-    <table class="table table-sm table-bordered mb-0 align-middle" style="font-size: 0.78rem">
-      <thead class="table-light" style="position: sticky; top: 0; z-index: 2">
-        <tr>
-          <th style="width: 50px">#</th>
-          <th style="min-width: 280px">Error from CRM</th>
-          @for (c of activeColumns; track c.sourceField) {
-          <th style="min-width: 150px">{{ c.sourceField }}<small class="text-muted d-block fw-normal">&rarr; {{ c.targetField }}</small></th>
-          }
-        </tr>
-      </thead>
-      <tbody>
-        @for (row of failureRows; track row.jobIdx + '-' + row.passNo + '-' + row.rowIdx) {
-        <tr [class.table-success]="row._dirty">
-          <td class="text-muted">{{ row.rowIdx + 1 }}</td>
-          <td class="text-danger">{{ row.error }}</td>
-          @for (c of activeColumns; track c.sourceField) {
-          <td>
-            <input class="form-control form-control-sm"
-              [class.is-invalid]="hasRunCellError(row, c) && !row._edited[c.sourceField]"
-              [class.bg-success-subtle]="row._edited[c.sourceField]" [class.border-success]="row._edited[c.sourceField]"
-              [disabled]="activeRun.status === 'running'" [value]="formatCellValue(row.record[c.sourceField])"
-              (input)="onRunCellEdit(row, c.sourceField, $any($event.target).value)">
-          </td>
-          }
-        </tr>
-        }
-      </tbody>
-    </table>
-    }
-  </div>
-
-  <div class="bg-light border-top p-2 px-3 d-flex justify-content-between align-items-center flex-shrink-0 small">
-    <span>Page {{ failurePage + 1 }} of {{ failurePageCount }}</span>
-    <div class="d-flex align-items-center gap-2">
-      <div class="btn-group btn-group-sm">
-        <button class="btn btn-outline-secondary" [disabled]="failurePage === 0" (click)="changeFailurePage(-1)">Previous</button>
-        <button class="btn btn-outline-secondary" [disabled]="failurePage + 1 >= failurePageCount" (click)="changeFailurePage(1)">Next</button>
-      </div>
-    </div>
-  </div>
+  </footer>
   }
 </div>
 }
@@ -2520,7 +2950,7 @@
 @if (canReopenRecovery) {
 <button class="btn btn-danger shadow recovery-reopen-chip d-flex align-items-center gap-2" (click)="reopenRecoveryPanel()"
   title="Reopen the Migration Recovery panel">
-  <i class="feather icon-alert-triangle"></i> Recovery
+  <i class="feather icon-life-buoy"></i> Fix &amp; retry
   @if (retryCount > 0) { <span class="badge bg-light text-danger">{{ retryCount }}</span> }
 </button>
 }

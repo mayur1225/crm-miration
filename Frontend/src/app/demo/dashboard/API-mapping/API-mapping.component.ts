@@ -2655,6 +2655,7 @@ onReviewPanelDragEnd(): void {
 
         this.isGlobalLoading = false;
         this.cdr.detectChanges();
+        this.openPendingRecovery();
       },
       error: (err) => {
         if (isAuthExpiredError(err)) { this.handleSessionExpired(getExpiredSidesFromError(err)); return; }
@@ -2663,6 +2664,7 @@ onReviewPanelDragEnd(): void {
         this.isLoading = false;
         this.isGlobalLoading = false;
         this.cdr.detectChanges();
+        this.openPendingRecovery();
       }
     });
   }
@@ -3518,7 +3520,8 @@ onReviewPanelDragEnd(): void {
   failureGroups: any[] = [];
   failureTotal = 0;
   failurePage = 0;
-  readonly failurePageSize = 25;
+  failurePageSize = 50;
+  readonly failurePageSizes = [25, 50, 100, 200];
   failureSearch = '';
   failureJobIdx: number | null = null;
   isLoadingFailures = false;
@@ -3532,6 +3535,150 @@ onReviewPanelDragEnd(): void {
 
   get dirtyRowCount(): number {
     return this.failureRows.filter((r) => r._dirty).length;
+  }
+
+  // ---------- Recovery panel UX helpers (friendly errors, card view, bulk fix) ----------
+  recoveryView: 'cards' | 'table' = 'cards';
+  bulkField = '';
+  bulkValue = '';
+
+  /** % of all rows in the run that already succeeded (drives the progress ring). */
+  get successPct(): number {
+    const c = this.activeRun?.counts || {};
+    const total = (c.success || 0) + (c.error || 0) + (c.skipped || 0) + (c.pending || 0);
+    return total ? Math.round(((c.success || 0) / total) * 100) : 0;
+  }
+
+  pct(n: number | undefined): number {
+    const c = this.activeRun?.counts || {};
+    const total = (c.success || 0) + (c.error || 0) + (c.skipped || 0) + (c.pending || 0);
+    return total ? ((n || 0) / total) * 100 : 0;
+  }
+
+  /** 1 = understand the errors, 2 = you have unsaved edits, 3 = nothing left to fix, ready to retry / resume. */
+  get recoveryStep(): number {
+    if (this.dirtyRowCount > 0) return 2;
+    if ((this.activeRun?.counts?.error || 0) > 0) return 1;
+    return 3;
+  }
+
+  /** The error group currently used as the filter (if any). */
+  get activeGroup(): any | null {
+    const s = this.failureSearch.trim();
+    return s ? this.failureGroups.find((g) => g.message === s) || null : null;
+  }
+
+  /** Turns raw CRM error text into a short title, a colour, an icon and a plain-English "what to do". */
+  explainError(message: string): { title: string; tone: string; icon: string; fix: string } {
+    const m = String(message || '').toLowerCase();
+    const rules: Array<{ re: RegExp; title: string; tone: string; icon: string; fix: string }> = [
+      { re: /duplicate|already exists|duplicate_value|not unique|unique/, title: 'Duplicate record', tone: 'warn', icon: 'icon-copy',
+        fix: 'A record with the same unique value already exists in the target. Change the value, or leave these rows out of the retry.' },
+      { re: /required|missing|cannot be blank|must not be empty|may not be null|mandatory/, title: 'Required value missing', tone: 'danger', icon: 'icon-alert-circle',
+        fix: 'A mandatory field is empty. Fill it in for these rows (use “Fix all at once” if the same value works for all of them).' },
+      { re: /picklist|restricted|bad value|invalid_option|not a valid option|invalid value for/, title: 'Value not allowed in dropdown', tone: 'warn', icon: 'icon-list',
+        fix: 'The target field only accepts specific dropdown values. Type one of the allowed values — “Fix all at once” changes every matching row in one click.' },
+      { re: /invalid_cross_reference|cross reference|lookup|reference|malformed id|invalid id|entity is deleted|parent|not found/, title: 'Linked record not found', tone: 'link', icon: 'icon-link',
+        fix: 'The record this row points to does not exist in the target. Retry the parent object first, or correct the linked ID / value.' },
+      { re: /too long|max.*length|string_too_long|exceeds|too large|value too large/, title: 'Text too long', tone: 'warn', icon: 'icon-type',
+        fix: 'The text is longer than the target field allows. Shorten it in the highlighted field.' },
+      { re: /validation|custom_validation|validation rule/, title: 'Blocked by a validation rule', tone: 'danger', icon: 'icon-shield',
+        fix: 'The target org has a rule that rejected this record. Adjust the highlighted value, or ask an admin to relax the rule during migration.' },
+      { re: /insufficient_access|permission|not authorized|forbidden|field.?level|read.?only|not writeable|not updateable|cannot be updated/, title: 'No permission to write', tone: 'danger', icon: 'icon-lock',
+        fix: 'The connected user cannot write this field or object. Check field-level security / permissions, or remove the mapping.' },
+      { re: /date|datetime|invalid_type|invalid format|format|cannot deserialize|not a valid|invalid number|invalid email|invalid phone/, title: 'Wrong format', tone: 'info', icon: 'icon-calendar',
+        fix: 'A value is not in the format the target expects (dates like 2025-01-31, numbers without text, valid email / phone). Correct the highlighted field.' },
+      { re: /quota|rate limit|too many requests|429|api limit|request_limit/, title: 'API limit reached', tone: 'info', icon: 'icon-clock',
+        fix: 'The CRM is throttling requests. No data fix needed — wait a few minutes and retry.' },
+      { re: /timeout|timed out|unavailable|50[023]|unable_to_lock_row|lock/, title: 'Temporary CRM problem', tone: 'info', icon: 'icon-clock',
+        fix: 'This is usually temporary. Retry without changing anything.' }
+    ];
+    const hit = rules.find((r) => r.re.test(m));
+    return hit
+      ? { title: hit.title, tone: hit.tone, icon: hit.icon, fix: hit.fix }
+      : { title: 'Rejected by the CRM', tone: 'danger', icon: 'icon-help-circle',
+          fix: 'Read the CRM message, correct the highlighted values, then retry. Copy the message if you need to share it with an admin.' };
+  }
+
+  private columnsForJob(jobIdx: any): any[] {
+    const job = this.runJobs.find((j) => j.jobIdx === jobIdx) || this.runJobs.find((j) => j.jobIdx === this.failureJobIdx) || this.runJobs[0];
+    return job?.columns || [];
+  }
+
+  /** Column whose name appears in the error text, so "Fix all at once" can be pre-selected. */
+  private guessGroupField(g: any): string {
+    const text = String(g?.message || '').toLowerCase();
+    const hit = this.columnsForJob(g?.jobIdx).find(
+      (c: any) =>
+        (c.targetField && text.includes(String(c.targetField).toLowerCase())) ||
+        (c.sourceField && text.includes(String(c.sourceField).toLowerCase()))
+    );
+    return hit?.sourceField || '';
+  }
+
+  selectGroup(g: any): void {
+    if (this.failureSearch.trim() === g.message) {
+      this.clearFailureFilter();
+      return;
+    }
+    this.bulkField = g._field || this.bulkField;
+    this.filterByGroup(g);
+  }
+
+  clearFailureFilter(): void {
+    this.failureSearch = '';
+    this.failurePage = 0;
+    void this.loadFailures();
+  }
+
+  // --- card view: EVERY mapped field is listed; the ones named in the error come first (stable order while typing) ---
+  orderedColumns(row: any): any[] {
+    if (!row._cols) {
+      const cols = this.activeColumns;
+      const flagged = cols.filter((c) => this.hasRunCellError(row, c));
+      row._cols = [...flagged, ...cols.filter((c) => !flagged.includes(c))];
+      row._flagged = flagged.length;
+    }
+    return row._cols;
+  }
+
+  flaggedCount(row: any): number {
+    this.orderedColumns(row);
+    return row._flagged || 0;
+  }
+
+  get failureRangeStart(): number {
+    return this.failureTotal ? this.failurePage * this.failurePageSize + 1 : 0;
+  }
+
+  get failureRangeEnd(): number {
+    return Math.min(this.failureTotal, this.failurePage * this.failurePageSize + this.failureRows.length);
+  }
+
+  async setFailurePageSize(value: string): Promise<void> {
+    const size = Number(value);
+    if (!this.failurePageSizes.includes(size) || size === this.failurePageSize) return;
+    if (this.dirtyRowCount) await this.saveRunEdits(true);
+    this.failurePageSize = size;
+    this.failurePage = 0;
+    await this.loadFailures();
+  }
+
+  revertCell(row: any, field: string): void {
+    if (!row._orig || !(field in row._orig)) return;
+    row.record[field] = row._orig[field];
+    delete row._edited[field];
+    delete row._orig[field];
+    row._dirty = Object.keys(row._edited).length > 0;
+  }
+
+  async copyError(text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(String(text || ''));
+      this.toastr.info('Error message copied.', 'Copied');
+    } catch {
+      this.toastr.warning('Could not copy automatically.', 'Copy');
+    }
   }
 
   get failurePageCount(): number {
@@ -3564,25 +3711,50 @@ onReviewPanelDragEnd(): void {
    * Called on page load (and therefore after every login redirect). The SERVER decides which unfinished
    * runs belong to the org pair this user is connected to now: their own, or a colleague's on the same org.
    */
+  private pendingRecovery: any = null;
+
   private async restoreLastRun(): Promise<void> {
     try {
       const { runs } = await this.runApi('/api/runs/recoverable');
       this.recoverableRuns = runs || [];
-      const candidate = this.recoverableRuns.find((r) => r.resumable || r.retryable);
-      if (!candidate || this.isGlobalLoading) return;
-      await this.openRunRecovery(candidate.runId);
-      const who = candidate.isMine ? 'You' : candidate.startedBy?.name || 'Another user';
-      this.logMessages = [
-        ...this.logMessages,
-        `${who} started a migration on this org (${candidate.runId}) that ${
-          candidate.resumable ? 'stopped before finishing' : 'finished with failed rows'
-        }. Review it in the Recovery panel.`
-      ];
+      // The server already returns only runs that still need attention, newest first (resumable, retryable,
+      // or still holding a lock for a few seconds after a refresh / crash).
+      const candidate = this.recoverableRuns[0];
+      if (!candidate) return;
+
+      // Restore the state behind the "Fix & retry" chip FIRST. After a refresh / re-login it starts empty, and the
+      // chip is only shown when currentRunId + canResume/canRetryFailed are set.
+      this.currentRunId = candidate.runId;
+      this.rememberRun(candidate.runId);
+      this.canResume = !!candidate.resumable;
+      this.canRetryFailed = !!candidate.retryable;
+      this.retryCount = candidate.counts?.error || 0;
+
+      this.pendingRecovery = candidate;
+      this.openPendingRecovery();
     } catch {
       // offline / server restarting: the next visit asks again
     } finally {
       this.cdr.detectChanges();
     }
+  }
+
+  /**
+   * Opens the recovery panel for the run found on page load, but only when nothing else owns the screen.
+   * The schema loader sets isGlobalLoading while the page boots, so this is called again when it finishes.
+   */
+  private openPendingRecovery(): void {
+    const candidate = this.pendingRecovery;
+    if (!candidate || this.isGlobalLoading || this.migrationSocket) return;
+    this.pendingRecovery = null;
+    void this.openRunRecovery(candidate.runId);
+    const who = candidate.isMine ? 'You' : candidate.startedBy?.name || 'Another user';
+    this.logMessages = [
+      ...this.logMessages,
+      `${who} started a migration on this org (${candidate.runId}) that ${
+        candidate.resumable ? 'stopped before finishing' : candidate.retryable ? 'finished with failed rows' : 'is still being wrapped up'
+      }. Review it in the Fix & retry panel.`
+    ];
   }
 
   async openRunRecovery(runId: string): Promise<void> {
@@ -3599,6 +3771,8 @@ onReviewPanelDragEnd(): void {
       this.failureJobIdx = withErrors?.jobIdx ?? this.runJobs[0]?.jobIdx ?? null;
       this.failurePage = 0;
       this.failureSearch = '';
+      this.bulkField = '';
+      this.bulkValue = '';
       if (!this.showRecoveryPanel) this.positionRecoveryPanel();
       this.showRecoveryPanel = true;
       this.recoveryMinimized = false;
@@ -3643,9 +3817,9 @@ onReviewPanelDragEnd(): void {
       if (this.failureJobIdx !== null) q.set('jobIdx', String(this.failureJobIdx));
       if (this.failureSearch.trim()) q.set('search', this.failureSearch.trim());
       const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/failures?${q}`);
-      this.failureRows = (res.rows || []).map((r: any) => ({ ...r, _edited: {}, _dirty: false }));
+      this.failureRows = (res.rows || []).map((r: any) => ({ ...r, _edited: {}, _orig: {}, _dirty: false, _info: this.explainError(r.error) }));
       this.failureTotal = res.total || 0;
-      this.failureGroups = res.groups || [];
+      this.failureGroups = (res.groups || []).map((g: any) => ({ ...g, _info: this.explainError(g.message), _field: this.guessGroupField(g) }));
     } catch (e: any) {
       this.toastr.error(e?.message || 'Could not load failed records.', 'Recovery');
     } finally {
@@ -3706,6 +3880,8 @@ onReviewPanelDragEnd(): void {
 
   onRunCellEdit(row: any, field: string, value: string): void {
     if (String(row.record[field] ?? '') === value) return;
+    row._orig = row._orig || {};
+    if (!(field in row._orig)) row._orig[field] = row.record[field];
     row.record[field] = value;
     row._edited[field] = true;
     row._dirty = true;

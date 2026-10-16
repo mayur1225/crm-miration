@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 
 from app.services.crm_service import CrmService
 from app.services.org_identity import org_key
-from app.services.store import RunForbidden, RunNotFound, RunStore
+from app.services.store import BASE_RUNS_DIR, RunForbidden, RunNotFound, RunStore
 
 logger = logging.getLogger(__name__)
 
@@ -61,31 +61,47 @@ class RunAccess:
         """Runs on this user's connected org pair that still need attention (own runs and colleagues')."""
         orgs = cls.user_orgs(user_id)
         if not orgs.get("target"):
+            logger.info("[RECOVERY] user %s has no saved target connection, so no runs can be matched yet.", user_id)
             return []
-        out: List[Dict[str, Any]] = []
+        logger.info("[RECOVERY] user %s connected to target=%s source=%s; scanning %s",
+                    user_id, (orgs.get("target") or {}).get("key"), (orgs.get("source") or {}).get("key"), BASE_RUNS_DIR)
+
+        candidates: List[Dict[str, Any]] = []
+        replaced: set = set()  # runs that already have a retry / restart child: the child is the one to show
         for path in RunStore.recent_run_paths(max_age_days):
             run_id = os.path.basename(path)[:-3]
             try:
                 store = RunStore.open_shared(run_id, user_id)
             except Exception:
+                logger.warning("[RECOVERY] cannot open %s", path, exc_info=True)
                 continue
             try:
                 meta = store.run_meta()
                 mine = store.user_id == str(user_id)
                 if meta.get("targetOrg"):
                     if not cls._matches(meta, orgs):
+                        logger.info("[RECOVERY] skip %s: started on %s / %s, you are connected to %s / %s",
+                                    run_id, meta.get("sourceOrg"), meta.get("targetOrg"),
+                                    (orgs.get("source") or {}).get("key"), (orgs.get("target") or {}).get("key"))
                         continue
                 elif not mine:
-                    continue  # legacy run without org identity: owner only
+                    logger.info("[RECOVERY] skip %s: no org identity stored and it belongs to another user.", run_id)
+                    continue  # legacy run / CRM without a stable org id: owner only
                 summary = store.summary()
+                if summary.get("parentRunId"):
+                    replaced.add(summary["parentRunId"])
                 actionable = summary["resumable"] or summary["retryable"] or summary["status"] == "running"
                 if not actionable or not (summary["counts"] or summary["status"] == "running"):
+                    logger.debug("[RECOVERY] skip %s: status=%s nothing to resume or retry.", run_id, summary["status"])
                     continue
                 summary["isMine"] = mine
-                out.append(summary)
+                candidates.append(summary)
             except Exception:
                 logger.exception("Skipping unreadable run %s", run_id)
             finally:
                 store.close()
+
+        out = [r for r in candidates if r["runId"] not in replaced]
         out.sort(key=lambda r: r["updatedAt"] or "", reverse=True)
+        logger.info("[RECOVERY] user %s: %d recoverable run(s).", user_id, len(out))
         return out[:limit]
