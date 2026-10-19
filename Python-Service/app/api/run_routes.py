@@ -53,7 +53,6 @@ def list_runs(current_user=Depends(get_current_user)) -> Dict[str, Any]:
     """The caller's own runs."""
     runs = [
         r for r in RunStore.list_runs(current_user.id)
-        # a run that never processed a row (e.g. login expired on start) is noise, not something to resume
         if r["counts"] or r["status"] in ("completed", "running")
     ]
     return {"success": True, "runs": runs}
@@ -92,6 +91,20 @@ def get_failures(
     try:
         total, rows = store.failed_rows(jobIdx, state, search.strip(), offset, limit)
         return {"success": True, "total": total, "rows": rows, "groups": store.failure_groups(jobIdx)}
+    finally:
+        store.close()
+
+
+@router.get("/api/runs/{run_id}/queued")
+def get_queued(
+    run_id: str, jobIdx: Optional[int] = None, search: str = "", editedOnly: bool = False,
+    offset: int = 0, limit: int = 25, current_user=Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Rows queued for the next Retry / Resume (corrected rows first) with their before/after changes."""
+    offset, limit = max(0, offset), min(max(1, limit), 200)
+    store = _open_run(current_user.id, run_id)
+    try:
+        return {"success": True, **store.queued_rows(jobIdx, search.strip(), editedOnly, offset, limit)}
     finally:
         store.close()
 

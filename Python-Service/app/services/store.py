@@ -672,6 +672,66 @@ class RunStore:
                         "error": r["error"] or r["skip_reason"], "attempts": r["attempts"], "record": rec})
         return total, out
 
+    def queued_rows(self, job_idx: Optional[int], search: str, edited_only: bool, offset: int, limit: int) -> Dict[str, Any]:
+        """
+        Rows the next Retry / Resume will send ('pending'): rows corrected by a user first, then the rest.
+        Each row carries what was changed (first old value -> current value), so the UI can show a before/after.
+        """
+        edited_sql = ("EXISTS (SELECT 1 FROM row_edit x WHERE x.job_idx=r.job_idx AND x.row_idx=r.row_idx "
+                      "AND COALESCE(x.old_value,'') != COALESCE(x.new_value,''))")
+        conds = ["r.state='pending'"]
+        params: List[Any] = []
+        if job_idx is not None:
+            conds.append("r.job_idx=?")
+            params.append(job_idx)
+        if search:
+            conds.append("e.source_json LIKE ?")
+            params.append(f"%{search}%")
+        base = ("FROM row_state r JOIN extracted e ON e.job_idx=r.job_idx AND e.row_idx=r.row_idx WHERE "
+                + " AND ".join(conds))
+
+        def count(where: str) -> int:
+            return self._conn.execute(
+                f"SELECT COUNT(*) AS n FROM (SELECT r.job_idx, r.row_idx {base}{where} GROUP BY r.job_idx, r.row_idx)", params
+            ).fetchone()["n"]
+
+        waiting_total = count("")
+        edited_total = count(f" AND {edited_sql}")
+        where = f" AND {edited_sql}" if edited_only else ""
+        total = edited_total if edited_only else waiting_total
+
+        rows = self._conn.execute(
+            "SELECT r.job_idx, r.row_idx, MIN(r.pass_no) AS pass_no, MAX(r.attempts) AS attempts, "
+            f"e.source_json, {edited_sql} AS has_edit {base}{where} "
+            "GROUP BY r.job_idx, r.row_idx ORDER BY has_edit DESC, r.job_idx, r.row_idx LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+
+        edits_by_row: Dict[Tuple[int, int], Dict[str, Dict[str, Any]]] = {}
+        by_job: Dict[int, List[int]] = {}
+        for r in rows:
+            if r["has_edit"]:
+                by_job.setdefault(r["job_idx"], []).append(r["row_idx"])
+        for j, idxs in by_job.items():
+            marks = ",".join("?" * len(idxs))
+            for e in self._conn.execute(
+                f"SELECT row_idx, field, old_value, new_value FROM row_edit WHERE job_idx=? AND row_idx IN ({marks}) ORDER BY id",
+                [j, *idxs],
+            ).fetchall():
+                per_field = edits_by_row.setdefault((j, e["row_idx"]), {})
+                entry = per_field.setdefault(e["field"], {"field": e["field"], "from": e["old_value"], "to": e["new_value"]})
+                entry["to"] = e["new_value"]
+
+        out = []
+        for r in rows:
+            rec = json.loads(r["source_json"])
+            for k in TARGET_RESULT_KEYS:
+                rec.pop(k, None)
+            changes = [c for c in edits_by_row.get((r["job_idx"], r["row_idx"]), {}).values() if (c["from"] or "") != (c["to"] or "")]
+            out.append({"jobIdx": r["job_idx"], "passNo": r["pass_no"], "rowIdx": r["row_idx"],
+                        "attempts": r["attempts"], "edits": changes, "record": rec})
+        return {"total": total, "waitingTotal": waiting_total, "editedTotal": edited_total, "rows": out}
+
     def failure_groups(self, job_idx: Optional[int]) -> List[Dict[str, Any]]:
         sql = "SELECT job_idx, substr(error, 1, 240) AS message, COUNT(*) AS n FROM row_state WHERE state='error'"
         params: List[Any] = []
@@ -733,7 +793,6 @@ class RunStore:
                     keys_by_job.setdefault(job_idx, set()).add(k["source_key"])
                 touched_jobs.add(job_idx)
 
-            # a later pass (e.g. self-reference Pass 2) that was blocked only because this record failed
             for job_idx, keys in keys_by_job.items():
                 keys = list(keys)
                 for start in range(0, len(keys), 500):

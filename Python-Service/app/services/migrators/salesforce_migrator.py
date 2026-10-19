@@ -29,7 +29,6 @@ class SalesforceMigrator:
         
         clean_query = (query or "").strip()
 
-        # APPLY DYNAMIC TIME FILTER LOGIC (date-range only; see time_filter_service.py)
         try:
             time_clause = build_salesforce_time_clause(time_filter)
         except TimeFilterError as e:
@@ -45,12 +44,7 @@ class SalesforceMigrator:
             if " * " in soql.lower() or soql.lower().startswith("select *"):
                 soql = re.sub(r'(?i)select\s+\*\s+from', f'SELECT {fields_str} FROM', soql)
             else:
-                # A hand-written/auto-generated SELECT list is a floor, not
-                # a ceiling -- every field mapped in the UI must actually be
-                # queried, or it comes back silently empty in the extracted
-                # records even though the mapping table says it's mapped.
-                # headers_list already guarantees "Id" is included, so this
-                # single union replaces the old id-only injection below it.
+
                 soql = ensure_fields_selected(soql, headers_list)
         else:
             where_parts = []
@@ -131,16 +125,12 @@ class SalesforceMigrator:
 
         chunks = list(chunk_dataset(payload, batch_size))
 
-        # RESUME: a previous run already opened a Bulk job for exactly this segment (one job == one batch).
-        # Ingest its results instead of submitting the rows again.
         job_id, batch_ids = None, []
         resume_job_id = options.get("resumeBulkJobId")
         if resume_job_id and len(chunks) == 1:
             list_res = await client.get(f"{bulk_base_url}/job/{resume_job_id}/batch", headers=sf_headers)
             existing = [b.get("id") for b in list_res.json().get("batchInfo", [])] if list_res.status_code == 200 else []
             if list_res.status_code != 200 and op_mode == "insert":
-                # Bulk jobs are visible only to the Salesforce user who created them (and expire). If we cannot read it we
-                # cannot tell which rows it created; re-sending an INSERT would duplicate them.
                 raise Exception(
                     f"Cannot read the interrupted Salesforce Bulk job {resume_job_id} (HTTP {list_res.status_code}; it was created by "
                     f"another Salesforce user or has expired). Its rows may already exist in Salesforce, so they were NOT re-sent. "
@@ -245,10 +235,10 @@ class SalesforceMigrator:
             )
             on_revert_pending = options.get("onRevertPending")
             if on_revert_pending:
-                on_revert_pending(ids_to_revert)  # persisted BEFORE the delete job so a crash can finish the revert
+                on_revert_pending(ids_to_revert)
             failed = set(await self._delete_records(client, sf_instance, sf_headers, bulk_base_url, target_object, ids_to_revert, send_log))
             on_revert_done = options.get("onRevertDone")
-            if on_revert_done:  # only confirmed deletes leave the pending-revert queue
+            if on_revert_done:
                 on_revert_done([i for i in ids_to_revert if i and i not in failed])
             if failed:
                 await send_log(

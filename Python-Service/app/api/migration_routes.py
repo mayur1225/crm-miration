@@ -537,7 +537,6 @@ async def websocket_migration(ws: WebSocket):
         target_instance = target_creds.get("instance_url") or target_creds.get("api_domain") or target_creds.get("subdomain")
 
         # ---------------- never continue a run against a DIFFERENT org ----------------
-        # (log out, log in to another org, press Resume on the old run id -> without this it would send there)
         run_meta = store.run_meta()
         if mode in ("resume", "retry_failed", "restart"):
             mismatch = run_recovery.org_mismatch(run_meta, source_crm, source_creds, target_crm, target_creds)
@@ -571,8 +570,6 @@ async def websocket_migration(ws: WebSocket):
         store.add_participant(user_id, user_name or user_email, mode)
 
         if store.user_id != str(user_id) and mode in ("resume", "retry_failed"):
-            # A colleague is continuing someone else's run. Reference remapping reads the ACTING user's id map,
-            # so copy over the source->target ids this run already created.
             for j, q in enumerate(execution_queue):
                 pairs = [
                     ((r.get("Id") or r.get("id")), r.get("Target_Id"))
@@ -939,8 +936,6 @@ async def websocket_migration(ws: WebSocket):
         if store is not None:
             try:
                 if lock_held:
-                    # Each step is guarded on its own: when the disk is full, a failing set_status must not
-                    # prevent release_lock (the lock would otherwise block resume until the TTL runs out).
                     try:
                         if final_status == "interrupted" and store.get_kv("cancel") == "1":
                             final_status = "cancelled"
@@ -1039,7 +1034,6 @@ async def websocket_validate_stream(websocket: WebSocket):
 
             validation_stats = {"total": total_count, "valid": valid_count, "invalid": invalid_count, "duplicates": chunk_result["stats"].get("duplicates", 0)}
 
-            # The 500-row query above is only the UI preview; the helper reads the full set for the report.
             parsed_source_crm, parsed_object = _parse_session_id(session_id)
             _persist_validation_history(
                 user_id=user_id, session_id=session_id,

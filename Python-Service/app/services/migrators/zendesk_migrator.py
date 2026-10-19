@@ -185,9 +185,6 @@ class ZendeskMigrator:
                         break
 
         except Exception as e:
-            # Never return a partial list: the migration FREEZES whatever extract() returns as this run's source
-            # snapshot, so a swallowed error would turn a half-read object into the permanent dataset (and an expired
-            # session would never ask the user to log in again).
             await send_log(f" Zendesk Extraction Error: {str(e)}")
             raise
 

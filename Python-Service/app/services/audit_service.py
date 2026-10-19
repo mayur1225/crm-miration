@@ -50,11 +50,9 @@ class SureShiftPDF(FPDF):
     def header(self):
         s = AuditService._sanitize_pdf_text
 
-        # --- Banner background (navy, so the logo drops in seamlessly) ---
         self.set_fill_color(*self.NAVY)
         self.rect(0, 0, self.w, 26, style="F")
 
-        # --- Logo (falls back to a text wordmark if no file is present) ---
         logo_path = _resolve_logo_path()
         logo_drawn = False
         logo_w = 0
@@ -70,7 +68,6 @@ class SureShiftPDF(FPDF):
 
         title_x = 8 + logo_w + 6 if logo_drawn else 10
 
-        # --- Report title (logo already carries the SureShift wordmark) ---
         self.set_text_color(255, 255, 255)
         if not logo_drawn:
             self.set_xy(title_x, 5)

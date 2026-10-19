@@ -67,7 +67,7 @@ class RunAccess:
                     user_id, (orgs.get("target") or {}).get("key"), (orgs.get("source") or {}).get("key"), BASE_RUNS_DIR)
 
         candidates: List[Dict[str, Any]] = []
-        replaced: set = set()  # runs that already have a retry / restart child: the child is the one to show
+        replaced: set = set()  
         for path in RunStore.recent_run_paths(max_age_days):
             run_id = os.path.basename(path)[:-3]
             try:

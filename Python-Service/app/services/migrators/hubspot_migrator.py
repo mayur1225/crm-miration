@@ -18,8 +18,6 @@ MAX_PROBES = 5
 BATCH_CONCURRENCY = 3
 SINGLE_CONCURRENCY = 5
 FIND_CHUNK = 100                  # the Search API's IN operator accepts up to 100 values
-# Search is eventually consistent: a record created seconds ago may not be searchable yet. find_existing waits
-# this long first so an interrupted INSERT is not re-sent for a record that is merely not indexed yet.
 SEARCH_SETTLE_SECONDS = float(os.environ.get("HUBSPOT_SEARCH_SETTLE_SECONDS", "8"))
 
 _SINGULAR_TO_OBJECT = {"contact": "contacts", "company": "companies", "deal": "deals", "ticket": "tickets"}
@@ -126,8 +124,6 @@ class HubspotMigrator:
                 headers["Authorization"] = f"Bearer {token}"
                 refreshed = True
                 continue
-            # A non-idempotent write (plain INSERT) is replayed only when the server certainly did NOT process it
-            # (429 / 503). After a 500 / 502 / 504 the record may exist, so the caller decides (OUTCOME_UNKNOWN).
             if res.status_code in (429, 503) or (res.status_code >= 500 and idempotent):
                 if res.status_code == 429 and _is_daily_limit(res):
                     return res
@@ -270,7 +266,7 @@ class HubspotMigrator:
         errs: List[dict] = []
         skips: List[dict] = []
 
-        decided: set = set()   # rows that already have a definitive answer from HubSpot
+        decided: set = set()   
 
         def ok(it, hs_id):
             rec = source_records[it["idx"]]
@@ -356,8 +352,6 @@ class HubspotMigrator:
             items.append({"idx": entry["originalIndex"], "trace": str(entry["originalIndex"]),
                           "props": props, "ext_val": None if ext_val in (None, "") else str(ext_val)})
 
-        # Reference-only "patch" passes (HubSpot associations aren't written by this migrator) leave
-        # a row with no writable properties; sending it would create a blank record.
         if op_mode != "delete":
             writable = []
             for it in items:
@@ -392,7 +386,6 @@ class HubspotMigrator:
                     (ok(c, c["ext_val"]) if res.status_code in (200, 202, 204) else fail(c, self._fmt_http(res)))
             return result()
 
-        # ---- wire helpers
         def wire_input(mode, it):
             inp: Dict[str, Any] = {"properties": it["props"], "objectWriteTraceId": it["trace"]}
             if mode in ("update", "upsert"):
@@ -448,15 +441,14 @@ class HubspotMigrator:
                 errors = body.get("errors") or []
                 settle_missing(mode, it, self._fmt_error(errors[0] if errors else None))
 
-        trace_ok: Optional[bool] = None   # does this portal echo objectWriteTraceId on batch results?
+        trace_ok: Optional[bool] = None
 
         async def run_group(mode, group):
             nonlocal trace_ok
             remaining = list(group)
             single_sem = asyncio.Semaphore(SINGLE_CONCURRENCY)
 
-            # Probe with single-record batches: attribution is trivially correct, and the first
-            # clean success tells us whether trace ids are echoed (needed to attribute big batches).
+            
             probes = 0
             while trace_ok is None and remaining and probes < MAX_PROBES:
                 it = remaining.pop(0)

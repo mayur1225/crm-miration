@@ -640,7 +640,6 @@ private showSchemaLoader(): void {
     return parts;
   }
 
-  /** Index of the top-level FROM keyword (ignores FROM inside sub-selects / string literals), or -1. */
   private findTopLevelFrom(sql: string, searchFrom: number): number {
     let depth = 0;
     let inString = false;
@@ -684,13 +683,10 @@ private showSchemaLoader(): void {
       const item = rawItem.trim();
       if (!item) continue;
 
-      // SELECT * / FIELDS(ALL|STANDARD|CUSTOM) => every field, so no narrowing.
       if (item === '*' || /^fields\s*\(/i.test(item)) return null;
 
-      // Child-relationship sub-select, e.g. (SELECT Id FROM Contacts) -- not a field of this object.
       if (item.startsWith('(')) continue;
 
-      // Unwrap single-argument functions: toLabel(Status), FORMAT(Amount), convertCurrency(Amount)
       const fnMatch = /^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*([A-Za-z0-9_.]+)\s*\)/.exec(item);
       const expression = fnMatch ? fnMatch[1] : item.split(/\s+/)[0];
 
@@ -2530,8 +2526,6 @@ onReviewPanelDragEnd(): void {
       }
 
       if (conditionPart.trim() !== '') {
-        // SOQL: = != < > <= >= LIKE IN NOT IN INCLUDES EXCLUDES, IS [NOT] NULL
-        // COQL: all of the above plus BETWEEN, STARTS WITH, ENDS WITH, CONTAINS (and their NOT forms)
         const hasOperator =
           /(=|<|>)/.test(conditionPart) ||
           /\b(like|in|includes|excludes|between|starts\s+with|ends\s+with|contains)\b/.test(conditionPart) ||
@@ -3537,10 +3531,146 @@ onReviewPanelDragEnd(): void {
     return this.failureRows.filter((r) => r._dirty).length;
   }
 
-  // ---------- Recovery panel UX helpers (friendly errors, card view, bulk fix) ----------
   recoveryView: 'cards' | 'table' = 'cards';
   bulkField = '';
   bulkValue = '';
+
+  recoveryTab: 'failed' | 'queued' = 'failed';
+  queuedRows: any[] = [];
+  queuedTotal = 0;
+  queuedWaiting = 0;
+  queuedEditedTotal = 0;
+  queuedPage = 0;
+  queuedFilter: 'all' | 'edited' = 'all';
+  isLoadingQueued = false;
+  massPreview: { field: string; value: string; count: number; filter: string } | null = null;
+  isApplyingMass = false;
+  changeBanner: { title: string; rows: number; unblocked: number; field?: string; value?: string } | null = null;
+
+  get queuedCount(): number {
+    return this.activeRun?.counts?.pending || 0;
+  }
+
+  get currentJobLabel(): string {
+    const job = this.runJobs.find((j) => j.jobIdx === this.failureJobIdx) || this.runJobs[0];
+    return job?.targetObject || 'this object';
+  }
+
+  get queuedPageCount(): number {
+    return Math.max(1, Math.ceil(this.queuedTotal / this.failurePageSize));
+  }
+
+  get queuedRangeStart(): number {
+    return this.queuedTotal ? this.queuedPage * this.failurePageSize + 1 : 0;
+  }
+
+  get queuedRangeEnd(): number {
+    return Math.min(this.queuedTotal, this.queuedPage * this.failurePageSize + this.queuedRows.length);
+  }
+
+  toggleRecoveryExpanded(): void {
+    if (this.recoveryMinimized) return;
+    this.recoveryExpanded = !this.recoveryExpanded;
+  }
+
+  async setRecoveryTab(tab: 'failed' | 'queued'): Promise<void> {
+    if (tab === this.recoveryTab) return;
+    if (tab === 'queued' && this.dirtyRowCount) await this.saveRunEdits(true);
+    this.recoveryTab = tab;
+    this.massPreview = null;
+    if (tab === 'queued') {
+      this.queuedPage = 0;
+      await this.loadQueued();
+    } else {
+      await this.loadFailures();
+    }
+    this.cdr.detectChanges();
+  }
+
+  showQueued(): void {
+    void this.setRecoveryTab('queued');
+  }
+
+  async setQueuedFilter(filter: 'all' | 'edited'): Promise<void> {
+    if (filter === this.queuedFilter) return;
+    this.queuedFilter = filter;
+    this.queuedPage = 0;
+    await this.loadQueued();
+  }
+
+  async changeQueuedPage(delta: number): Promise<void> {
+    const next = this.queuedPage + delta;
+    if (next < 0 || next >= this.queuedPageCount) return;
+    this.queuedPage = next;
+    await this.loadQueued();
+  }
+
+  async loadQueued(): Promise<void> {
+    if (!this.activeRun) return;
+    this.isLoadingQueued = true;
+    this.cdr.detectChanges();
+    try {
+      const q = new URLSearchParams({
+        offset: String(this.queuedPage * this.failurePageSize),
+        limit: String(this.failurePageSize)
+      });
+      if (this.failureJobIdx !== null) q.set('jobIdx', String(this.failureJobIdx));
+      const search = this.activeGroup ? '' : this.failureSearch.trim();
+      if (search) q.set('search', search);
+      if (this.queuedFilter === 'edited') q.set('editedOnly', 'true');
+      const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/queued?${q}`);
+      this.queuedRows = res.rows || [];
+      this.queuedTotal = res.total || 0;
+      this.queuedWaiting = res.waitingTotal || 0;
+      this.queuedEditedTotal = res.editedTotal || 0;
+    } catch (e: any) {
+      this.toastr.error(e?.message || 'Could not load the queued records.', 'Recovery');
+    } finally {
+      this.isLoadingQueued = false;
+      this.cdr.detectChanges();
+    }
+  }
+
+  queuedPreview(row: any): Array<{ label: string; value: string }> {
+    return this.columnsForJob(row.jobIdx)
+      .slice(0, 4)
+      .map((c: any) => ({ label: c.sourceField, value: this.formatCellValue(row.record?.[c.sourceField]) }));
+  }
+
+  requestMassUpdate(field: string, value: string): void {
+    if (!field || !this.activeRun || this.failureJobIdx === null || !this.failureTotal) return;
+    this.massPreview = { field, value: value ?? '', count: this.failureTotal, filter: this.failureSearch.trim() };
+  }
+
+  cancelMassUpdate(): void {
+    this.massPreview = null;
+  }
+
+  async confirmMassUpdate(): Promise<void> {
+    const p = this.massPreview;
+    if (!p || !this.activeRun || this.failureJobIdx === null || this.isApplyingMass) return;
+    this.isApplyingMass = true;
+    this.cdr.detectChanges();
+    try {
+      const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/records/mass-update`, {
+        method: 'POST',
+        body: JSON.stringify({ jobIdx: this.failureJobIdx, field: p.field, value: p.value, errorContains: p.filter })
+      });
+      this.massPreview = null;
+      this.bulkValue = '';
+      this.changeBanner = { title: 'Mass update applied', rows: res.rowsRequeued || 0, unblocked: res.rowsUnblocked || 0, field: p.field, value: p.value };
+      this.failurePage = 0;
+      this.queuedPage = 0;
+      this.recoveryTab = 'queued';
+      await this.refreshActiveRun();
+      await this.loadFailures(); // also reloads the queued list while the Ready tab is open
+    } catch (e: any) {
+      this.toastr.error(e?.message || 'Mass update failed.', 'Recovery');
+    } finally {
+      this.isApplyingMass = false;
+      this.cdr.detectChanges();
+    }
+  }
 
   /** % of all rows in the run that already succeeded (drives the progress ring). */
   get successPct(): number {
@@ -3555,20 +3685,17 @@ onReviewPanelDragEnd(): void {
     return total ? ((n || 0) / total) * 100 : 0;
   }
 
-  /** 1 = understand the errors, 2 = you have unsaved edits, 3 = nothing left to fix, ready to retry / resume. */
   get recoveryStep(): number {
     if (this.dirtyRowCount > 0) return 2;
     if ((this.activeRun?.counts?.error || 0) > 0) return 1;
     return 3;
   }
 
-  /** The error group currently used as the filter (if any). */
   get activeGroup(): any | null {
     const s = this.failureSearch.trim();
     return s ? this.failureGroups.find((g) => g.message === s) || null : null;
   }
 
-  /** Turns raw CRM error text into a short title, a colour, an icon and a plain-English "what to do". */
   explainError(message: string): { title: string; tone: string; icon: string; fix: string } {
     const m = String(message || '').toLowerCase();
     const rules: Array<{ re: RegExp; title: string; tone: string; icon: string; fix: string }> = [
@@ -3605,7 +3732,6 @@ onReviewPanelDragEnd(): void {
     return job?.columns || [];
   }
 
-  /** Column whose name appears in the error text, so "Fix all at once" can be pre-selected. */
   private guessGroupField(g: any): string {
     const text = String(g?.message || '').toLowerCase();
     const hit = this.columnsForJob(g?.jobIdx).find(
@@ -3617,6 +3743,7 @@ onReviewPanelDragEnd(): void {
   }
 
   selectGroup(g: any): void {
+    this.massPreview = null;
     if (this.failureSearch.trim() === g.message) {
       this.clearFailureFilter();
       return;
@@ -3626,12 +3753,13 @@ onReviewPanelDragEnd(): void {
   }
 
   clearFailureFilter(): void {
+    this.massPreview = null;
+    this.queuedPage = 0;
     this.failureSearch = '';
     this.failurePage = 0;
     void this.loadFailures();
   }
 
-  // --- card view: EVERY mapped field is listed; the ones named in the error come first (stable order while typing) ---
   orderedColumns(row: any): any[] {
     if (!row._cols) {
       const cols = this.activeColumns;
@@ -3707,23 +3835,15 @@ onReviewPanelDragEnd(): void {
     return body as T;
   }
 
-  /**
-   * Called on page load (and therefore after every login redirect). The SERVER decides which unfinished
-   * runs belong to the org pair this user is connected to now: their own, or a colleague's on the same org.
-   */
   private pendingRecovery: any = null;
 
   private async restoreLastRun(): Promise<void> {
     try {
       const { runs } = await this.runApi('/api/runs/recoverable');
       this.recoverableRuns = runs || [];
-      // The server already returns only runs that still need attention, newest first (resumable, retryable,
-      // or still holding a lock for a few seconds after a refresh / crash).
       const candidate = this.recoverableRuns[0];
       if (!candidate) return;
 
-      // Restore the state behind the "Fix & retry" chip FIRST. After a refresh / re-login it starts empty, and the
-      // chip is only shown when currentRunId + canResume/canRetryFailed are set.
       this.currentRunId = candidate.runId;
       this.rememberRun(candidate.runId);
       this.canResume = !!candidate.resumable;
@@ -3739,10 +3859,6 @@ onReviewPanelDragEnd(): void {
     }
   }
 
-  /**
-   * Opens the recovery panel for the run found on page load, but only when nothing else owns the screen.
-   * The schema loader sets isGlobalLoading while the page boots, so this is called again when it finishes.
-   */
   private openPendingRecovery(): void {
     const candidate = this.pendingRecovery;
     if (!candidate || this.isGlobalLoading || this.migrationSocket) return;
@@ -3773,10 +3889,19 @@ onReviewPanelDragEnd(): void {
       this.failureSearch = '';
       this.bulkField = '';
       this.bulkValue = '';
+      this.recoveryTab = 'failed';
+      this.queuedPage = 0;
+      this.queuedFilter = 'all';
+      this.massPreview = null;
+      this.changeBanner = null;
       if (!this.showRecoveryPanel) this.positionRecoveryPanel();
       this.showRecoveryPanel = true;
       this.recoveryMinimized = false;
       await this.loadFailures();
+      if (this.failureTotal === 0 && (detail.counts?.pending || 0) > 0) {
+        this.recoveryTab = 'queued';
+        await this.loadQueued();
+      }
     } catch (e: any) {
       if (e?.status === 404) {
         this.handleStaleRun(runId);
@@ -3820,6 +3945,7 @@ onReviewPanelDragEnd(): void {
       this.failureRows = (res.rows || []).map((r: any) => ({ ...r, _edited: {}, _orig: {}, _dirty: false, _info: this.explainError(r.error) }));
       this.failureTotal = res.total || 0;
       this.failureGroups = (res.groups || []).map((g: any) => ({ ...g, _info: this.explainError(g.message), _field: this.guessGroupField(g) }));
+      if (this.recoveryTab === 'queued') void this.loadQueued();
     } catch (e: any) {
       this.toastr.error(e?.message || 'Could not load failed records.', 'Recovery');
     } finally {
@@ -3842,6 +3968,8 @@ onReviewPanelDragEnd(): void {
     this.failureSearch = value;
     clearTimeout(this.failureSearchTimer);
     this.failureSearchTimer = setTimeout(() => {
+      this.massPreview = null;
+      this.queuedPage = 0;
       this.failurePage = 0;
       void this.loadFailures();
     }, 350);
@@ -3849,11 +3977,15 @@ onReviewPanelDragEnd(): void {
 
   async onFailureJobChange(value: string): Promise<void> {
     this.failureJobIdx = value === '' ? null : Number(value);
+    this.massPreview = null;
+    this.queuedPage = 0;
     this.failurePage = 0;
     await this.loadFailures();
   }
 
   filterByGroup(group: any): void {
+    this.massPreview = null;
+    this.queuedPage = 0;
     this.failureJobIdx = group.jobIdx;
     this.failureSearch = group.message;
     this.failurePage = 0;
@@ -3902,47 +4034,18 @@ onReviewPanelDragEnd(): void {
         method: 'PATCH',
         body: JSON.stringify({ edits })
       });
-      if (!silent) {
-        this.toastr.success(
-          `${res.rowsRequeued} record(s) corrected and queued. Use ${this.activeRun.resumable ? 'Resume' : 'Retry failed'} to send them.`,
-          'Saved'
-        );
-      }
       await this.refreshActiveRun();
-      if (!silent) await this.loadFailures();
+      if (!silent) {
+        this.changeBanner = { title: 'Changes saved', rows: res.rowsRequeued || 0, unblocked: res.rowsUnblocked || 0 };
+        this.queuedPage = 0;
+        this.recoveryTab = 'queued';
+        await this.loadFailures(); // also reloads the queued list while the Ready tab is open
+      }
     } catch (e: any) {
       this.toastr.error(e?.message || 'Could not save your edits.', 'Recovery');
     } finally {
       this.isSavingEdits = false;
       this.cdr.detectChanges();
-    }
-  }
-
-  /** Same value into one column for EVERY failed row (server-side, not just this page) matching the current error filter. */
-  async applyRunMassUpdate(field: string, value: string): Promise<void> {
-    if (!field || !this.activeRun || this.failureJobIdx === null) return;
-    const confirm = await Swal.fire({
-      title: 'Apply to all matching failed rows?',
-      html: `Set <b>${field}</b> to <b>${value || '(empty)'}</b> on <b>${this.failureTotal}</b> failed record(s)${
-        this.failureSearch.trim() ? ' matching the current filter' : ''
-      }.`,
-      icon: 'question',
-      showCancelButton: true,
-      confirmButtonText: 'Apply',
-      customClass: { popup: 'rounded-4 shadow-lg border-0' }
-    });
-    if (!confirm.isConfirmed) return;
-    try {
-      const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/records/mass-update`, {
-        method: 'POST',
-        body: JSON.stringify({ jobIdx: this.failureJobIdx, field, value, errorContains: this.failureSearch.trim() })
-      });
-      this.toastr.success(`${res.rowsRequeued} record(s) corrected and queued.`, 'Mass update applied');
-      this.failurePage = 0;
-      await this.refreshActiveRun();
-      await this.loadFailures();
-    } catch (e: any) {
-      this.toastr.error(e?.message || 'Mass update failed.', 'Recovery');
     }
   }
 

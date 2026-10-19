@@ -877,6 +877,100 @@
   .rv-btn-ghost { color: var(--rv-ink); background: #fff; border-color: #d6dbe8; }
   .rv-btn-ghost:hover:not(:disabled) { border-color: var(--rv-brand); color: var(--rv-brand); }
 
+  /* ---------- retry logo, header buttons, minimized pill ---------- */
+  .rv .rv-header-icon {
+    position: relative; width: 40px; height: 40px; border-radius: 50%;
+    background: radial-gradient(circle at 30% 25%, #8b8cf8 0%, #4f46e5 55%, #7c3aed 100%);
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, .2), 0 8px 20px rgba(124, 58, 237, .55);
+    color: #fff;
+  }
+  .rv .rv-header-icon::after {
+    content: ''; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid rgba(165, 180, 252, .55);
+    animation: rvRing 2.4s ease-out infinite; pointer-events: none;
+  }
+  .rv-logo { width: 22px; height: 22px; display: block; filter: drop-shadow(0 1px 2px rgba(0, 0, 0, .35)); }
+  .rv-logo-arrows { transform-origin: 12px 12px; }
+  .rv-header-icon:hover .rv-logo-arrows { animation: rvSpin .9s ease-in-out; }
+  .rv-icon-btn svg { width: 14px; height: 14px; display: block; }
+  .rv-icon-btn { flex-shrink: 0; }
+  .rv.minimized { width: 340px; min-width: 340px; }
+  .rv.minimized .rv-header { padding: 0 10px; height: 100%; }
+  .rv.minimized .rv-header-icon { width: 30px; height: 30px; }
+  .rv.minimized .rv-header-icon::after { display: none; }
+  .rv.minimized .rv-logo { width: 17px; height: 17px; }
+  .rv.minimized .rv-header-title { font-size: .9rem; }
+  .recovery-reopen-chip .rv-logo { width: 18px; height: 18px; }
+
+  /* ---------- tabs: failed / ready to retry ---------- */
+  .rv-tabs { display: flex; gap: 6px; padding: 8px 12px 0; border-bottom: 1px solid var(--rv-line); flex-shrink: 0; }
+  .rv-tab {
+    border: 0; background: none; padding: 8px 12px; font-size: .78rem; font-weight: 700; color: var(--rv-muted);
+    border-bottom: 2px solid transparent; margin-bottom: -1px; display: inline-flex; align-items: center; gap: 7px;
+    cursor: pointer; transition: color .15s, border-color .15s;
+  }
+  .rv-tab:hover { color: var(--rv-ink); }
+  .rv-tab.on { color: var(--rv-red); border-bottom-color: var(--rv-red); }
+  .rv-tab.ready.on { color: var(--rv-green); border-bottom-color: var(--rv-green); }
+  .rv-tab .cnt { font-size: .66rem; padding: 1px 8px; border-radius: 999px; background: #e9ecf4; color: #4b5368; }
+  .rv-tab.on .cnt { background: var(--rv-red); color: #fff; }
+  .rv-tab.ready.on .cnt { background: var(--rv-green); }
+
+  /* ---------- inline "change applied" banner (replaces the popup / toast) ---------- */
+  .rv-banner {
+    margin: 10px 18px 0; display: flex; gap: 12px; align-items: center; padding: 10px 14px; border-radius: 14px; flex-shrink: 0;
+    background: linear-gradient(135deg, #e8f8f1, #f4fcf8); border: 1px solid #a9e2c9; color: #0c6b47; font-size: .8rem;
+    animation: rvPop .25s ease;
+  }
+  .rv-banner-ico { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: var(--rv-green); color: #fff; flex-shrink: 0; }
+  .rv-banner-ico svg { width: 15px; height: 15px; }
+  .rv-banner-body { flex: 1 1 auto; min-width: 0; }
+  .rv-banner-actions { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  .rv-banner-x { border: 0; background: none; color: #0c6b47; opacity: .6; width: 22px; height: 22px; border-radius: 50%; cursor: pointer; font-size: 14px; }
+  .rv-banner-x:hover { opacity: 1; background: rgba(12, 107, 71, .1); }
+
+  /* ---------- inline confirm card (replaces the popup) ---------- */
+  .rv-confirm {
+    margin-top: 10px; border-radius: 12px; padding: 10px; background: #fff; border: 1.5px solid var(--rv-brand);
+    box-shadow: 0 10px 24px -12px rgba(79, 70, 229, .6); animation: rvPop .2s ease;
+  }
+  .rv-confirm-title { font-weight: 700; font-size: .78rem; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .rv-confirm-title i { color: var(--rv-brand); }
+  .rv-confirm p { font-size: .74rem; color: #3a4256; line-height: 1.4; margin: 8px 0 10px; }
+  .rv-confirm-actions { display: flex; gap: 6px; }
+  .rv-confirm-actions .rv-btn { flex: 1; justify-content: center; padding: 7px 8px; font-size: .76rem; }
+
+  .rv-diff { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; font-size: .72rem; min-width: 0; }
+  .rv-diff .k { font-weight: 700; background: var(--rv-soft); padding: 2px 8px; border-radius: 7px; }
+  .rv-diff .old { background: var(--rv-red-soft); color: #a52529; text-decoration: line-through; padding: 2px 8px; border-radius: 7px; overflow-wrap: anywhere; }
+  .rv-diff .new { background: var(--rv-green-soft); color: #0c6b47; font-weight: 600; padding: 2px 8px; border-radius: 7px; overflow-wrap: anywhere; }
+  .rv-diff .arr { color: var(--rv-muted); }
+
+  /* ---------- ready-to-retry list ---------- */
+  .rv-legend .rv-legend-link { cursor: pointer; border-radius: 6px; padding: 0 3px; margin: 0 -3px; }
+  .rv-legend .rv-legend-link:hover { background: var(--rv-blue-soft); color: var(--rv-blue); }
+  .rv-ready {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 12px; margin-bottom: 12px;
+    border-radius: 12px; background: var(--rv-green-soft); border: 1px solid #a9e2c9; color: #0c6b47; font-size: .8rem;
+  }
+  .rv-ready .rv-seg { margin-left: auto; background: #fff; }
+  .rv-pill.ok { background: var(--rv-green-soft); color: var(--rv-green); }
+  .rv-pill.wait { background: var(--rv-blue-soft); color: var(--rv-blue); }
+  .rv-qrow {
+    display: grid; grid-template-columns: 64px 110px minmax(0, 1.3fr) minmax(0, 1fr); gap: 10px; align-items: start;
+    padding: 10px 12px; background: #fff; border: 1px solid var(--rv-line); border-radius: 13px; animation: rvPop .25s ease both;
+  }
+  .rv-qrow.edited { border-color: #a9e2c9; background: linear-gradient(180deg, #f6fdf9, #fff 70%); }
+  .rv-qchips { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .rv-qpreview { display: flex; flex-direction: column; gap: 2px; font-size: .7rem; color: var(--rv-muted); min-width: 0; }
+  .rv-qpreview span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rv-qpreview b { color: var(--rv-ink); font-weight: 600; }
+  @container (max-width: 760px) {
+    .rv-qrow { grid-template-columns: 64px minmax(0, 1fr); }
+    .rv-qrow > :nth-child(n+3) { grid-column: 1 / -1; }
+  }
+  @keyframes rvSpin { to { transform: rotate(360deg); } }
+  @keyframes rvRing { 0% { transform: scale(.9); opacity: .9; } 100% { transform: scale(1.35); opacity: 0; } }
+
   /* ---------- animations ---------- */
   @keyframes rvPop { from { opacity: 0; transform: translateY(6px) scale(.99); } to { opacity: 1; transform: none; } }
   @keyframes rvShimmer { to { background-position: -200% 0; } }
@@ -2565,11 +2659,12 @@
 
   <!-- ============ Header (drag handle) ============ -->
   <div class="rv-header panel-header" (mousedown)="startRecoveryPanelDrag($event)"
-    (click)="recoveryMinimized ? recoveryMinimized = false : null" title="Drag to move">
+    (click)="recoveryMinimized ? recoveryMinimized = false : null" (dblclick)="toggleRecoveryExpanded()" title="Drag to move · double-click to toggle full screen">
     <div class="d-flex align-items-center gap-3 min-w-0">
-      <span class="rv-header-icon"><i class="feather icon-life-buoy"></i></span>
+      <span class="rv-header-icon"><svg class="rv-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g class="rv-logo-arrows"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></g><circle cx="12" cy="12" r="2.7" fill="#fde68a" stroke="none"/></svg></span>
       <div class="min-w-0">
-        <div class="rv-header-title">Fix &amp; retry failed records
+        <div class="rv-header-title">
+          @if (recoveryMinimized) { Fix &amp; retry } @else { Fix &amp; retry failed records }
           @if (activeRun && recoveryMinimized) { <span class="rv-mini-badge">{{ activeRun.counts?.error || 0 }} failed</span> }
         </div>
         @if (activeRun && !recoveryMinimized) {
@@ -2581,15 +2676,19 @@
     </div>
     <div class="d-flex align-items-center gap-2">
       @if (!recoveryMinimized) {
-      <button class="rv-icon-btn" title="Toggle fullscreen" (click)="recoveryExpanded = !recoveryExpanded; $event.stopPropagation()">
-        <i class="feather" [ngClass]="recoveryExpanded ? 'icon-minimize-2' : 'icon-maximize-2'"></i>
+      <button class="rv-icon-btn" [title]="recoveryExpanded ? 'Exit full screen' : 'Full screen'" (click)="toggleRecoveryExpanded(); $event.stopPropagation()">
+        @if (recoveryExpanded) {
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"></polyline><polyline points="20 10 14 10 14 4"></polyline><line x1="14" y1="10" x2="21" y2="3"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>
+        } @else {
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"></polyline><polyline points="9 21 3 21 3 15"></polyline><line x1="21" y1="3" x2="14" y2="10"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>
+        }
       </button>
       <button class="rv-icon-btn" title="Minimize (Esc)" (click)="minimizeRecoveryPanel(); $event.stopPropagation()">
-        <i class="feather icon-minus"></i>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="19" x2="19" y2="19"></line></svg>
       </button>
       } @else {
       <button class="rv-icon-btn" title="Restore" (click)="restoreRecoveryPanel(); $event.stopPropagation()">
-        <i class="feather icon-maximize-2"></i>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"></polyline><polyline points="9 21 3 21 3 15"></polyline><line x1="21" y1="3" x2="14" y2="10"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>
       </button>
       }
       <button class="rv-icon-btn rv-close" title="Close" (click)="cancelRecoveryPanel(); $event.stopPropagation()">
@@ -2629,7 +2728,7 @@
           <span><i class="dot ok"></i><b>{{ activeRun.counts?.success || 0 }}</b> succeeded</span>
           <span><i class="dot err"></i><b>{{ activeRun.counts?.error || 0 }}</b> failed</span>
           <span><i class="dot skip"></i><b>{{ activeRun.counts?.skipped || 0 }}</b> skipped</span>
-          <span><i class="dot wait"></i><b>{{ activeRun.counts?.pending || 0 }}</b> waiting</span>
+          <span class="rv-legend-link" (click)="showQueued()" title="See the records waiting to be sent"><i class="dot wait"></i><b>{{ activeRun.counts?.pending || 0 }}</b> waiting</span>
         </div>
 
         @if (activeRun.position) {
@@ -2708,6 +2807,25 @@
     </div>
     }
 
+    <!-- ============ Inline result of a mass update / save (no popup) ============ -->
+    @if (changeBanner) {
+    <div class="rv-banner">
+      <span class="rv-banner-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg></span>
+      <div class="rv-banner-body">
+        <b>{{ changeBanner.title }}.</b>
+        {{ changeBanner.rows }} record{{ changeBanner.rows === 1 ? '' : 's' }} corrected and queued for {{ activeRun.resumable ? 'Resume' : 'Retry' }}@if (changeBanner.unblocked > 0) { (+{{ changeBanner.unblocked }} blocked child record{{ changeBanner.unblocked === 1 ? '' : 's' }} released) }.
+        @if (changeBanner.field) {
+        <span class="rv-diff d-inline-flex ms-1"><span class="k">{{ changeBanner.field }}</span><span class="arr">→</span><span class="new">{{ changeBanner.value || '(empty)' }}</span></span>
+        }
+      </div>
+      <div class="rv-banner-actions">
+        @if (recoveryTab !== 'queued') { <button class="rv-link" (click)="showQueued()">Review queued records</button> }
+        @else if ((activeRun.counts?.error || 0) > 0) { <button class="rv-link" (click)="setRecoveryTab('failed')">{{ activeRun.counts?.error }} still failed</button> }
+        <button class="rv-banner-x" title="Dismiss" (click)="changeBanner = null">&times;</button>
+      </div>
+    </div>
+    }
+
     <!-- ============ Main: error reasons (left) + records (right) ============ -->
     <div class="rv-main">
 
@@ -2747,23 +2865,45 @@
             Fix {{ failureSearch.trim() ? 'all matching' : 'all' }} <b>{{ failureTotal }}</b> at once
           </div>
           <label class="rv-mini-label">Column</label>
-          <select class="form-select form-select-sm" [(ngModel)]="bulkField">
+          <select class="form-select form-select-sm" [ngModel]="bulkField" (ngModelChange)="bulkField = $event; massPreview = null">
             <option value="">Choose a column…</option>
             @for (c of activeColumns; track c.sourceField) { <option [value]="c.sourceField">{{ c.sourceField }}</option> }
           </select>
           <label class="rv-mini-label mt-2">New value</label>
-          <input class="form-control form-control-sm" placeholder="Type the corrected value" [(ngModel)]="bulkValue"
-            (keydown.enter)="bulkField && applyRunMassUpdate(bulkField, bulkValue)">
+          <input class="form-control form-control-sm" placeholder="Type the corrected value" [ngModel]="bulkValue" (ngModelChange)="bulkValue = $event; massPreview = null"
+            (keydown.enter)="requestMassUpdate(bulkField, bulkValue)">
           <button class="rv-btn rv-btn-soft w-100 mt-2" [disabled]="!bulkField || !failureTotal || activeRun.status === 'running'"
-            (click)="applyRunMassUpdate(bulkField, bulkValue)">
-            <i class="feather icon-check-square"></i> Apply to {{ failureTotal }} record(s)
+            (click)="requestMassUpdate(bulkField, bulkValue)">
+            <i class="feather icon-check-square"></i> Review &amp; apply to {{ failureTotal }} record(s)
           </button>
+          @if (massPreview; as mp) {
+          <div class="rv-confirm">
+            <div class="rv-confirm-title"><i class="feather icon-eye"></i> Check before applying</div>
+            <div class="rv-diff"><span class="k">{{ mp.field }}</span><span class="arr">→</span><span class="new">{{ mp.value || '(empty)' }}</span></div>
+            <p>Updates <b>{{ mp.count }}</b> failed record{{ mp.count === 1 ? '' : 's' }}@if (mp.filter) { with the selected error }.
+              They then move to <b>Ready to {{ activeRun.resumable ? 'resume' : 'retry' }}</b>, where you can review every change.</p>
+            <div class="rv-confirm-actions">
+              <button class="rv-btn rv-btn-ghost" (click)="cancelMassUpdate()" [disabled]="isApplyingMass">Cancel</button>
+              <button class="rv-btn rv-btn-primary" (click)="confirmMassUpdate()" [disabled]="isApplyingMass">
+                @if (isApplyingMass) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="feather icon-check"></i> } Apply
+              </button>
+            </div>
+          </div>
+          }
           <small class="rv-bulk-note">Tip: pick an error above first to limit the change to that error only.</small>
         </div>
       </aside>
 
       <!-- ---- Right: records ---- -->
       <section class="rv-records">
+        <div class="rv-tabs" role="tablist">
+          <button class="rv-tab" role="tab" [class.on]="recoveryTab === 'failed'" (click)="setRecoveryTab('failed')">
+            <i class="feather icon-alert-circle"></i> Failed <span class="cnt">{{ activeRun.counts?.error || 0 }}</span>
+          </button>
+          <button class="rv-tab ready" role="tab" [class.on]="recoveryTab === 'queued'" (click)="setRecoveryTab('queued')">
+            <i class="feather icon-send"></i> Ready to {{ activeRun.resumable ? 'resume' : 'retry' }} <span class="cnt">{{ queuedCount }}</span>
+          </button>
+        </div>
         <div class="rv-toolbar">
           <div class="rv-search">
             <i class="feather icon-search"></i>
@@ -2780,12 +2920,78 @@
             }
           </select>
           }
-          <span class="rv-total">{{ failureTotal }} record{{ failureTotal === 1 ? '' : 's' }}</span>
+          <span class="rv-total">{{ recoveryTab === 'queued' ? queuedTotal : failureTotal }} record{{ (recoveryTab === 'queued' ? queuedTotal : failureTotal) === 1 ? '' : 's' }}</span>
+          @if (recoveryTab === 'failed') {
           <div class="rv-seg ms-auto" role="group" aria-label="View mode">
             <button [class.on]="recoveryView === 'cards'" (click)="recoveryView = 'cards'" title="Card view"><i class="feather icon-grid"></i> Cards</button>
             <button [class.on]="recoveryView === 'table'" (click)="recoveryView = 'table'" title="Table view"><i class="feather icon-list"></i> Table</button>
           </div>
+          }
         </div>
+
+        @if (recoveryTab === 'queued') {
+
+        <!-- ======== READY TO RETRY / RESUME ======== -->
+        <div class="rv-scroll">
+          <div class="rv-ready">
+            <i class="feather icon-send"></i>
+            <span>
+              <b>{{ queuedWaiting }}</b> record{{ queuedWaiting === 1 ? '' : 's' }}@if (runJobs.length > 1) { in <b>{{ currentJobLabel }}</b> } will be sent when you {{ activeRun.resumable ? 'Resume' : 'Retry' }}.
+              @if (queuedEditedTotal > 0) { <b>{{ queuedEditedTotal }}</b> corrected by you (shown first). }
+            </span>
+            <div class="rv-seg" role="group" aria-label="Filter">
+              <button [class.on]="queuedFilter === 'all'" (click)="setQueuedFilter('all')">All waiting</button>
+              <button [class.on]="queuedFilter === 'edited'" (click)="setQueuedFilter('edited')">Corrected only</button>
+            </div>
+          </div>
+
+          @if (isLoadingQueued) {
+          <div class="rv-skeletons"><div class="rv-skel"></div><div class="rv-skel"></div></div>
+          } @else if (queuedRows.length === 0) {
+          <div class="rv-empty">
+            <div class="rv-empty-icon"><i class="feather icon-inbox"></i></div>
+            <h6>{{ queuedFilter === 'edited' ? 'No corrected records here' : 'Nothing is waiting to be sent' }}</h6>
+            <p>{{ queuedFilter === 'edited' ? 'Fix failed records (one by one or all at once) and they appear here.' : 'Fix failed records and they appear here, ready for the next ' + (activeRun.resumable ? 'Resume' : 'Retry') + '.' }}</p>
+            @if ((activeRun.counts?.error || 0) > 0) { <button class="rv-btn rv-btn-soft" (click)="setRecoveryTab('failed')">Go to failed records</button> }
+          </div>
+          } @else {
+          <div class="rv-cards">
+            @for (row of queuedRows; track row.jobIdx + '-' + row.rowIdx) {
+            <div class="rv-qrow" [class.edited]="row.edits?.length">
+              <span class="rv-rownum">Row {{ row.rowIdx + 1 }}</span>
+              <span class="rv-pill" [ngClass]="row.edits?.length ? 'ok' : 'wait'">
+                <i class="feather" [ngClass]="row.edits?.length ? 'icon-check' : 'icon-clock'"></i> {{ row.edits?.length ? 'Corrected' : 'Waiting' }}
+              </span>
+              <div class="rv-qchips">
+                @if (row.edits?.length) {
+                @for (e of row.edits; track e.field) {
+                <div class="rv-diff"><span class="k">{{ e.field }}</span><span class="old">{{ e.from || '(empty)' }}</span><span class="arr">→</span><span class="new">{{ e.to || '(empty)' }}</span></div>
+                }
+                } @else {
+                <span class="small text-muted">Unchanged — will be sent as is.</span>
+                }
+              </div>
+              <div class="rv-qpreview">
+                @for (p of queuedPreview(row); track p.label) { <span [title]="p.value"><b>{{ p.label }}:</b> {{ p.value }}</span> }
+              </div>
+            </div>
+            }
+          </div>
+          }
+        </div>
+
+        <div class="rv-pager">
+          <span>
+            @if (queuedTotal > 0) { Showing <b>{{ queuedRangeStart }}–{{ queuedRangeEnd }}</b> of <b>{{ queuedTotal }}</b> } @else { No records }
+            · Page <b>{{ queuedPage + 1 }}</b> / {{ queuedPageCount }}
+          </span>
+          <div class="rv-pager-btns">
+            <button [disabled]="queuedPage === 0" (click)="changeQueuedPage(-1)"><i class="feather icon-chevron-left"></i> Prev</button>
+            <button [disabled]="queuedPage + 1 >= queuedPageCount" (click)="changeQueuedPage(1)">Next <i class="feather icon-chevron-right"></i></button>
+          </div>
+        </div>
+
+        } @else {
 
         <div class="rv-scroll">
           @if (isLoadingFailures) {
@@ -2899,6 +3105,7 @@
             <button [disabled]="failurePage + 1 >= failurePageCount" (click)="changeFailurePage(1)">Next <i class="feather icon-chevron-right"></i></button>
           </div>
         </div>
+        }
       </section>
     </div>
   </div>
@@ -2908,6 +3115,9 @@
     <div class="rv-footer-status" [class.dirty]="dirtyRowCount > 0">
       @if (dirtyRowCount > 0) {
       <span class="pulse"></span> <b>{{ dirtyRowCount }}</b> edited record{{ dirtyRowCount === 1 ? '' : 's' }} not saved yet
+      } @else if (queuedCount > 0) {
+      <i class="feather icon-send"></i> <b>{{ queuedCount }}</b> record{{ queuedCount === 1 ? '' : 's' }} ready to send on {{ activeRun.resumable ? 'Resume' : 'Retry' }}
+      <button class="rv-link" (click)="showQueued()">Review</button>
       } @else {
       <i class="feather icon-info"></i> Edit the highlighted fields, then retry. Your changes are saved automatically when you retry.
       }
@@ -2950,7 +3160,7 @@
 @if (canReopenRecovery) {
 <button class="btn btn-danger shadow recovery-reopen-chip d-flex align-items-center gap-2" (click)="reopenRecoveryPanel()"
   title="Reopen the Migration Recovery panel">
-  <i class="feather icon-life-buoy"></i> Fix &amp; retry
+  <svg class="rv-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g class="rv-logo-arrows"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></g><circle cx="12" cy="12" r="2.7" fill="#fde68a" stroke="none"/></svg> Fix &amp; retry
   @if (retryCount > 0) { <span class="badge bg-light text-danger">{{ retryCount }}</span> }
 </button>
 }

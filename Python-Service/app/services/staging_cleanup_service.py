@@ -6,7 +6,7 @@ import time
 logger = logging.getLogger(__name__)
 
 BASE_STAGING_DIR = os.path.join(os.getcwd(), "SureShift_staging_databases")
-DEFAULT_MAX_AGE_HOURS = 24
+DEFAULT_MAX_AGE_HOURS = 24 * 7
 DEFAULT_SWEEP_INTERVAL_SECONDS = 3600  # sweep hourly; deletions still respect max_age_hours
 
 

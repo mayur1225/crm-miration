@@ -104,7 +104,7 @@ class ResumableRunner:
             try:
                 self.store.save_results(spec.job_idx, spec.pass_no, results, clear_bulk=clear_bulk)
                 return
-            except sqlite3.OperationalError as exc:  # "database or disk is full", "database is locked", ...
+            except sqlite3.OperationalError as exc: 
                 last = exc
                 logger.error("[RUNNER] checkpoint write failed (attempt %d/%d): %s", attempt, self.CHECKPOINT_RETRIES, exc)
                 if attempt < self.CHECKPOINT_RETRIES:
@@ -112,7 +112,7 @@ class ResumableRunner:
                     delay = min(delay * 2, 15.0)
 
         created = [(r.row_idx, r.target_id) for r in results if r.state == "success" and r.target_id]
-        try:  # the database is unusable, so the websocket log is the only place left to record what was created
+        try:  
             sample = ", ".join(f"row {i} -> {tid}" for i, tid in created[:200])
             await self.send_log(
                 f"[{spec.target_object}] {spec.pass_name}: CRITICAL could not save {len(results)} result(s) ({last}). "
