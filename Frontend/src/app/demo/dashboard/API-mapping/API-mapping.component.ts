@@ -1,9 +1,10 @@
 import { CommonModule } from '@angular/common';
-import { Component, OnInit, inject, ChangeDetectorRef, NgZone, HostListener, OnDestroy } from '@angular/core';
+import { Component, OnInit, inject, ChangeDetectorRef, NgZone, HostListener, OnDestroy, DestroyRef } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { forkJoin, of, Subject } from 'rxjs';
-import { takeUntil, catchError } from 'rxjs/operators';
+import { takeUntil, catchError, take } from 'rxjs/operators';
 import { MappingApiService } from 'src/app/services/mapping-api.service';
 import { ToastrService } from 'ngx-toastr';
 import Swal from 'sweetalert2';
@@ -12,6 +13,7 @@ import { environment } from 'src/environments/environment';
 import { HttpClient } from '@angular/common/http';
 import { AuthService } from 'src/app/demo/Services/auth.service';
 import { CrmAuthService } from 'src/app/services/CrmAuthService.service';
+import { ConnectivityService } from 'src/app/services/connectivity.service';
 import {
   CrmSide,
   getExpiredSidesFromError,
@@ -123,6 +125,8 @@ export class ApiMappingComponent implements OnInit, OnDestroy {
   retryCount = 0;
   private static readonly LAST_RUN_KEY = 'last_migration_run_id';
   private http = inject(HttpClient);
+  private connectivity = inject(ConnectivityService);
+  private destroyRef = inject(DestroyRef);
 
   private mappingCancel$ = new Subject<void>();
 
@@ -367,6 +371,10 @@ get fileMigrationNotes(): string[] {
   isSessionsLoading = false;
 
   ngOnInit(): void {
+  this.connectivity.reconnected$
+    .pipe(takeUntilDestroyed(this.destroyRef))
+    .subscribe(() => this.onConnectionRestored());
+
   this.getUserData();
   void this.restoreLastRun();
 
@@ -497,7 +505,7 @@ private showSchemaLoader(): void {
   async fetchRecoverableSessions(): Promise<void> {
   this.isSessionsLoading = true;
   try {
-    const response = await fetch(`${environment.apiUrl}/api/validation/sessions`, {
+    const response = await this.connectivity.guardedFetch(`${environment.apiUrl}/api/validation/sessions`, {
       headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` }
     });
 
@@ -2267,7 +2275,7 @@ onReviewPanelDragEnd(): void {
     };
 
     try {
-      const response = await fetch(`${environment.apiUrl}/api/metadata/preview-filter`, {
+      const response = await this.connectivity.guardedFetch(`${environment.apiUrl}/api/metadata/preview-filter`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2322,7 +2330,7 @@ onReviewPanelDragEnd(): void {
         params.set('timeFilter', JSON.stringify(timeFilter));
       }
 
-      const response = await fetch(
+      const response = await this.connectivity.guardedFetch(
         `${environment.apiUrl}/api/metadata/${this.sourceCrmId}/count/${encodeURIComponent(objectName)}?${params.toString()}`,
         { headers: { Authorization: `Bearer ${localStorage.getItem('supabase_token') || ''}` } }
       );
@@ -3329,18 +3337,13 @@ onReviewPanelDragEnd(): void {
         this.logError(' WebSocket Error: Validation stream disconnected.');
         this.jobStatus = 'Validation Failed';
         this.isValidating = false;
-        Swal.fire({
-          title: 'Connection Lost',
-          text: 'The server disconnected unexpectedly while streaming data. Please check your network or server logs and try again.',
-          icon: 'error',
-          confirmButtonColor: '#0d6efd',
-          customClass: { popup: 'rounded-4 shadow-lg border-0' }
-        });
+        void this.notifySocketFailure('Validation stream');
         this.cdr.detectChanges();
       });
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
+      if (!event.wasClean) void this.connectivity.reportFailure();
       this.zone.run(() => {
         if (this.validationSocket === ws) this.validationSocket = null;
         if (this.jobStatus !== 'Validation Passed' && this.jobStatus !== 'Validation Warning' && this.jobStatus !== 'Validation Failed') {
@@ -3814,7 +3817,7 @@ onReviewPanelDragEnd(): void {
   }
 
   private async runApi<T = any>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${environment.apiUrl}${path}`, {
+    const response = await this.connectivity.guardedFetch(`${environment.apiUrl}${path}`, {
       ...init,
       headers: {
         'Content-Type': 'application/json',
@@ -4724,6 +4727,24 @@ onReviewPanelDragEnd(): void {
     this.openMigrationSocket({ queue: [job] });
   }
 
+  private onConnectionRestored(): void {
+    if (!this.canResume || !this.currentRunId) return;
+    this.toastr
+      .info('Click to resume the interrupted migration.', 'Migration can be resumed', {
+        disableTimeOut: true,
+        closeButton: true
+      })
+      .onTap.pipe(take(1))
+      .subscribe(() => this.resumeMigration());
+  }
+
+  /** Confirmed outages are surfaced by the global toast/overlay; only request-specific failures are reported here. */
+  private async notifySocketFailure(context: string): Promise<void> {
+    const outage = await this.connectivity.reportFailure();
+    if (outage) return;
+    this.toastr.error(`${context} failed unexpectedly. Check the server logs and try again.`, 'Engine Error');
+  }
+
   private openMigrationSocket(payload: any): void {
     this.canResume = false;
     this.canRetryFailed = false;
@@ -4893,19 +4914,13 @@ onReviewPanelDragEnd(): void {
         this.logMessages.push('FATAL: Connection to migration engine lost or refused.');
         this.jobStatus = 'Failed';
         this.canResume = !!this.currentRunId;
-        this.toastr.error('WebSocket connection failed.', 'Engine Error');
-        Swal.fire({
-          title: 'Connection Lost',
-          text: 'The server disconnected unexpectedly while streaming data. Please check your network or server logs and try again.',
-          icon: 'error',
-          confirmButtonColor: '#0d6efd',
-          customClass: { popup: 'rounded-4 shadow-lg border-0' }
-        });
+        void this.notifySocketFailure('Migration stream');
         this.cdr.detectChanges();
       });
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
+      if (!event.wasClean) void this.connectivity.reportFailure();
       this.zone.run(() => {
         if (this.migrationSocket === ws) this.migrationSocket = null;
         this.isGlobalLoading = false;
