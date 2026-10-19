@@ -102,7 +102,7 @@ class RunStore:
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(SCHEMA)
 
     # ------------------------------------------------------------------ lifecycle
@@ -220,14 +220,18 @@ class RunStore:
         with self._tx() as c:
             c.execute("UPDATE run SET status=?, updated_at=?", (status, _now_iso()))
 
-    def acquire_lock(self, owner: str, ttl: float = 30.0) -> bool:
+    def acquire_lock(self, owner: str, ttl: float = 30.0, set_running: bool = True) -> bool:
+        """set_running=False takes the lock WITHOUT touching the run status (short edits of a finished run)."""
         now = time.time()
         with self._tx() as c:
             row = c.execute("SELECT lock_owner, lock_expires_at FROM run").fetchone()
             if row["lock_owner"] and row["lock_owner"] != owner and (row["lock_expires_at"] or 0) > now:
                 return False
-            c.execute("UPDATE run SET lock_owner=?, lock_expires_at=?, status='running', updated_at=?",
-                      (owner, now + ttl, _now_iso()))
+            if set_running:
+                c.execute("UPDATE run SET lock_owner=?, lock_expires_at=?, status='running', updated_at=?",
+                          (owner, now + ttl, _now_iso()))
+            else:
+                c.execute("UPDATE run SET lock_owner=?, lock_expires_at=?", (owner, now + ttl))
         return True
 
     def heartbeat(self, owner: str, ttl: float = 30.0) -> None:
@@ -473,6 +477,29 @@ class RunStore:
     def clear_pending_reverts(self, job_idx: int, pass_no: int) -> None:
         self._conn.execute("DELETE FROM pending_revert WHERE job_idx=? AND pass_no=?", (job_idx, pass_no))
 
+    def remove_pending_reverts(self, job_idx: int, pass_no: int, target_ids: Sequence[str]) -> None:
+        """Forget ONLY the reverts the target confirmed. Anything not confirmed stays queued for the next resume."""
+        ids = [str(t) for t in target_ids if t]
+        if not ids:
+            return
+        with self._tx() as c:
+            c.executemany(
+                "DELETE FROM pending_revert WHERE job_idx=? AND pass_no=? AND target_id=?",
+                [(job_idx, pass_no, t) for t in ids],
+            )
+
+    def fail_pending_rows(self, job_idx: int, pass_no: int, failures: Sequence[Tuple[int, str]]) -> None:
+        """Mark still-pending rows as failed with a reason (rows rejected before they were ever sent)."""
+        if not failures:
+            return
+        now = time.time()
+        with self._tx() as c:
+            c.executemany(
+                "UPDATE row_state SET state='error', error=?, attempts=attempts+1, updated_at=? "
+                "WHERE job_idx=? AND pass_no=? AND row_idx=? AND state='pending'",
+                [(msg, now, job_idx, pass_no, idx) for idx, msg in failures],
+            )
+
     # ------------------------------------------------------------------ results
     def _result_records(self, where: str = "", params: Sequence[Any] = ()) -> List[Tuple[RowResult, Dict[str, Any], int, int]]:
         rows = self._conn.execute(
@@ -545,7 +572,8 @@ class RunStore:
                 (now,),
             )
             c.execute("UPDATE job SET bulk_job_id=NULL, bulk_rows=NULL")
-            c.execute("DELETE FROM pending_revert")
+            for r in c.execute("SELECT DISTINCT job_idx FROM pending_revert").fetchall():
+                c.execute("DELETE FROM kv WHERE key=?", (f"done:{r['job_idx']}",))
             c.execute("DELETE FROM kv WHERE key IN ('cancel','stop_reason')")
             for r in c.execute("SELECT DISTINCT job_idx FROM row_state WHERE state='pending'").fetchall():
                 c.execute("DELETE FROM kv WHERE key IN (?, ?)", (f"done:{r['job_idx']}", f"files_done:{r['job_idx']}"))

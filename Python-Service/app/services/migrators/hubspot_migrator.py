@@ -1,9 +1,12 @@
 import asyncio
 import json
+import logging
+import os
 import re
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from app.services.crm_service import CrmService
+from app.services.resilience.retry import ApiQuotaExhausted, CircuitOpen, OUTCOME_UNKNOWN
 from app.services.time_filter_service import build_hubspot_time_filters, TimeFilterError
 
 DEFAULT_DOMAIN = "https://api.hubapi.com"
@@ -14,10 +17,17 @@ MAX_RETRIES = 6
 MAX_PROBES = 5
 BATCH_CONCURRENCY = 3
 SINGLE_CONCURRENCY = 5
+FIND_CHUNK = 100                  # the Search API's IN operator accepts up to 100 values
+# Search is eventually consistent: a record created seconds ago may not be searchable yet. find_existing waits
+# this long first so an interrupted INSERT is not re-sent for a record that is merely not indexed yet.
+SEARCH_SETTLE_SECONDS = float(os.environ.get("HUBSPOT_SEARCH_SETTLE_SECONDS", "8"))
 
 _SINGULAR_TO_OBJECT = {"contact": "contacts", "company": "companies", "deal": "deals", "ticket": "tickets"}
 _ID_FIELDS = {"id", "hs_object_id"}
 _READ_ONLY_PROPS = _ID_FIELDS
+_PROPAGATE = (ApiQuotaExhausted, CircuitOpen, asyncio.CancelledError)   # stop the run, never swallow
+
+logger = logging.getLogger(__name__)
 
 
 def chunk_dataset(data: list, chunk_size: int = 100):
@@ -101,7 +111,8 @@ async def hubspot_search_all(
 class HubspotMigrator:
 
     # ------------------------------------------------------------------ http
-    async def _request(self, client, method: str, url: str, headers: dict, user_id, role: str, send_log, **kwargs):
+    async def _request(self, client, method: str, url: str, headers: dict, user_id, role: str, send_log,
+                       idempotent: bool = True, **kwargs):
         """One silent token refresh, Retry-After backoff on 429 / 5xx. `headers`
         is mutated on refresh so later calls in the same run reuse the new token.
         Returns the last response; callers decide what a non-2xx means."""
@@ -115,7 +126,9 @@ class HubspotMigrator:
                 headers["Authorization"] = f"Bearer {token}"
                 refreshed = True
                 continue
-            if res.status_code == 429 or res.status_code >= 500:
+            # A non-idempotent write (plain INSERT) is replayed only when the server certainly did NOT process it
+            # (429 / 503). After a 500 / 502 / 504 the record may exist, so the caller decides (OUTCOME_UNKNOWN).
+            if res.status_code in (429, 503) or (res.status_code >= 500 and idempotent):
                 if res.status_code == 429 and _is_daily_limit(res):
                     return res
                 try:
@@ -257,20 +270,66 @@ class HubspotMigrator:
         errs: List[dict] = []
         skips: List[dict] = []
 
+        decided: set = set()   # rows that already have a definitive answer from HubSpot
+
         def ok(it, hs_id):
             rec = source_records[it["idx"]]
             rec["Target_Id"] = str(hs_id)
+            decided.add(it["idx"])
             succ.append(rec)
 
         def fail(it, msg):
             rec = source_records[it["idx"]]
             rec["Target_Error"] = f"HubSpot Error: {msg}"
+            decided.add(it["idx"])
             errs.append(rec)
 
         def skip(it, msg):
             rec = source_records[it["idx"]]
             rec["Target_SkipReason"] = msg
+            decided.add(it["idx"])
             skips.append(rec)
+
+        def unknown(it, msg):
+            """INSERT whose outcome is ambiguous: the record may exist. The runner looks it up (or keeps it as an
+            unconfirmed failure) instead of re-sending blindly."""
+            rec = source_records[it["idx"]]
+            rec["Target_Error"] = f"{OUTCOME_UNKNOWN}HubSpot did not confirm this write ({msg}); the record may already exist."
+            decided.add(it["idx"])
+            errs.append(rec)
+
+        def fail_http(mode, it, res):
+            msg = self._fmt_http(res)
+            if mode == "insert" and res.status_code >= 500 and res.status_code != 503:
+                unknown(it, msg)
+            else:
+                fail(it, msg)
+
+        def settle_exception(mode, chunk, exc):
+            """A network error mid-request. Rows that already have an answer keep it; the rest are 'unknown' for an
+            INSERT, and plainly retryable for the replay-safe modes."""
+            detail = f"{type(exc).__name__}: {exc}"[:200]
+            for c in chunk:
+                if c["idx"] in decided:
+                    continue
+                if mode == "insert":
+                    unknown(c, detail)
+                else:
+                    fail(c, f"Temporary network failure, safe to retry ({detail})")
+
+        async def guarded(mode, chunk, coro):
+            try:
+                await coro
+            except _PROPAGATE:
+                raise
+            except Exception as exc:
+                settle_exception(mode, chunk, exc)
+
+        async def gather_all(coros):
+            """Let every sibling finish (no orphaned tasks writing after we return); then re-raise a stop signal."""
+            for r in await asyncio.gather(*coros, return_exceptions=True):
+                if isinstance(r, BaseException):
+                    raise r
 
         def result():
             return len(succ), len(errs), len(skips), succ, errs, skips
@@ -309,8 +368,8 @@ class HubspotMigrator:
                              "HubSpot associations are not migrated).")
             items = writable
 
-        async def req(method, url, **kw):
-            return await self._request(client, method, url, headers, user_id, "target", send_log, **kw)
+        async def req(method, url, idempotent=True, **kw):
+            return await self._request(client, method, url, headers, user_id, "target", send_log, idempotent=idempotent, **kw)
 
         # ---- delete
         if op_mode == "delete":
@@ -321,8 +380,14 @@ class HubspotMigrator:
                         fail(c, "No record id to delete.")
                 if not targets:
                     continue
-                res = await req("POST", f"{objects_url}/batch/archive",
-                                json={"inputs": [{"id": c["ext_val"]} for c in targets]})
+                try:
+                    res = await req("POST", f"{objects_url}/batch/archive",
+                                    json={"inputs": [{"id": c["ext_val"]} for c in targets]})
+                except _PROPAGATE:
+                    raise
+                except Exception as exc:
+                    settle_exception("delete", targets, exc)
+                    continue
                 for c in targets:
                     (ok(c, c["ext_val"]) if res.status_code in (200, 202, 204) else fail(c, self._fmt_http(res)))
             return result()
@@ -356,7 +421,7 @@ class HubspotMigrator:
 
         async def send_batch(mode, chunk):
             endpoint = {"insert": "create", "update": "update", "upsert": "upsert"}[mode]
-            return await req("POST", f"{objects_url}/batch/{endpoint}",
+            return await req("POST", f"{objects_url}/batch/{endpoint}", idempotent=(mode != "insert"),
                              json={"inputs": [wire_input(mode, c) for c in chunk]})
 
         def settle_missing(mode, it, msg):
@@ -371,12 +436,12 @@ class HubspotMigrator:
             safe path when the API doesn't echo objectWriteTraceId."""
             async with sem:
                 if mode == "insert":
-                    res = await req("POST", objects_url, json={"properties": it["props"]})
-                    (ok(it, res.json().get("id")) if res.status_code in (200, 201) else fail(it, self._fmt_http(res)))
+                    res = await req("POST", objects_url, idempotent=False, json={"properties": it["props"]})
+                    (ok(it, res.json().get("id")) if res.status_code in (200, 201) else fail_http(mode, it, res))
                     return
                 res = await send_batch(mode, [it])
                 if res.status_code not in (200, 201, 207):
-                    return fail(it, self._fmt_http(res))
+                    return fail_http(mode, it, res)
                 body = res.json()
                 if body.get("results"):
                     return ok(it, body["results"][0].get("id"))
@@ -396,9 +461,15 @@ class HubspotMigrator:
             while trace_ok is None and remaining and probes < MAX_PROBES:
                 it = remaining.pop(0)
                 probes += 1
-                res = await send_batch(mode, [it])
+                try:
+                    res = await send_batch(mode, [it])
+                except _PROPAGATE:
+                    raise
+                except Exception as exc:
+                    settle_exception(mode, [it], exc)
+                    continue
                 if res.status_code not in (200, 201, 207):
-                    fail(it, self._fmt_http(res))
+                    fail_http(mode, it, res)
                     continue
                 body = res.json()
                 results = body.get("results") or []
@@ -416,7 +487,7 @@ class HubspotMigrator:
             if not trace_ok:   # can't attribute batch results safely -> one request per record
                 await send_log(f"[{obj}] {pass_name}: batch results can't be matched to records; "
                                f"writing {len(remaining)} record(s) individually.")
-                await asyncio.gather(*[write_single(mode, it, single_sem) for it in remaining])
+                await gather_all([guarded(mode, [it], write_single(mode, it, single_sem)) for it in remaining])
                 return
 
             batch_sem = asyncio.Semaphore(BATCH_CONCURRENCY)
@@ -433,13 +504,14 @@ class HubspotMigrator:
                                 settle_missing(mode, c, bad[c["trace"]])
                     elif len(chunk) > 1 and res.status_code < 500 and res.status_code != 429:
                         # whole batch rejected (nothing committed): isolate the offending rows
-                        await asyncio.gather(*[write_single(mode, c, single_sem) for c in chunk])
+                        await gather_all([guarded(mode, [c], write_single(mode, c, single_sem)) for c in chunk])
                     else:
                         msg = self._fmt_http(res)
+                        ambiguous = mode == "insert" and res.status_code >= 500 and res.status_code != 503
                         for c in chunk:
-                            fail(c, msg)
+                            (unknown if ambiguous else fail)(c, msg)
 
-            await asyncio.gather(*[do_chunk(c) for c in chunk_dataset(remaining, BATCH_SIZE)])
+            await gather_all([guarded(mode, c, do_chunk(c)) for c in chunk_dataset(remaining, BATCH_SIZE)])
 
         # ---- group rows by wire mode
         groups: Dict[str, List[dict]] = {"insert": [], "update": [], "upsert": []}
@@ -458,3 +530,55 @@ class HubspotMigrator:
             await run_group(mode, groups[mode])
 
         return result()
+
+    # ==========================================
+    # RECONCILE (used by an interrupted INSERT on resume)
+    # ==========================================
+    async def find_existing(self, client, options, key_field, values):
+        """
+        {correlation value: HubSpot id} for records that already carry one of `values` in the custom property
+        `key_field` (the property the runner stamps with the source key on every INSERT). This is what lets Resume /
+        Retry tell "created but not recorded" from "never created", so an interrupted INSERT creates no duplicates.
+
+        Needs that custom property to exist on the HubSpot object. The oldest record wins when a key matches several.
+        """
+        obj = normalize_hubspot_object(options["targetObject"])
+        base = (options.get("instance_url") or DEFAULT_DOMAIN).rstrip("/")
+        if not base.startswith("http"):
+            base = f"https://{base}"
+        headers = {"Authorization": f"Bearer {options['token']}", "Content-Type": "application/json"}
+        url = f"{base}/crm/v3/objects/{obj}/search"
+
+        async def log(msg):
+            logger.info("[HubSpot find_existing] %s", msg)
+
+        wanted = {str(v).lower(): str(v) for v in dict.fromkeys(values) if v not in (None, "")}
+        found: Dict[str, str] = {}
+        if not wanted:
+            return found
+        if SEARCH_SETTLE_SECONDS > 0:
+            await asyncio.sleep(SEARCH_SETTLE_SECONDS)
+
+        for chunk in chunk_dataset(list(wanted), FIND_CHUNK):   # lower-cased: Search compares text case-insensitively
+            payload: Dict[str, Any] = {
+                "filterGroups": [{"filters": [{"propertyName": key_field, "operator": "IN", "values": chunk}]}],
+                "properties": [key_field],
+                "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
+                "limit": SEARCH_PAGE_SIZE,
+            }
+            after = None
+            while True:
+                body_payload = dict(payload, after=after) if after else payload
+                res = await self._request(client, "POST", url, headers, options.get("userId"), "target", log, json=body_payload)
+                if res.status_code != 200:
+                    raise RuntimeError(f"HubSpot lookup failed ({res.status_code}): {res.text[:300]}")
+                body = res.json()
+                for rec in body.get("results") or []:
+                    key = (rec.get("properties") or {}).get(key_field)
+                    original = wanted.get(str(key).lower()) if key not in (None, "") else None
+                    if original is not None:
+                        found.setdefault(original, str(rec["id"]))   # ascending ids: the first one is the oldest
+                after = ((body.get("paging") or {}).get("next") or {}).get("after")
+                if not after:
+                    break
+        return found

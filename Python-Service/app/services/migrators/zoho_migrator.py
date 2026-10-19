@@ -241,7 +241,15 @@ class ZohoMigrator:
                 f"[{normalized_obj}] {pass_name}: Update mode found {len(ids_to_revert)} record(s) with no "
                 f"match — reverting the records Zoho auto-created for them..."
             )
-            await self._delete_records(client, domain, headers, normalized_obj, ids_to_revert, user_id, send_log)
+            failed = set(await self._delete_records(client, domain, headers, normalized_obj, ids_to_revert, user_id, send_log))
+            on_revert_done = options.get("onRevertDone")
+            if on_revert_done:  # only confirmed deletes leave the pending-revert queue
+                on_revert_done([i for i in ids_to_revert if i and i not in failed])
+            if failed:
+                await send_log(
+                    f"[{normalized_obj}] {pass_name}: WARNING {len(failed)} auto-created record(s) could not be deleted "
+                    f"and stay queued; they are retried on the next resume."
+                )
 
         return total_success, total_error, total_skipped, all_success_data, all_error_data, all_skipped_data
 
@@ -261,7 +269,7 @@ class ZohoMigrator:
     async def revert_created(self, client, options, record_ids, send_log):
         """Public entry used by the resume path to finish a revert that was interrupted."""
         headers = {"Authorization": f"Zoho-oauthtoken {options['token']}", "Content-Type": "application/json"}
-        await self._delete_records(
+        return await self._delete_records(
             client, self._domain(options), headers, self._normalize_object(options["targetObject"]),
             record_ids, options.get("userId"), send_log,
         )
@@ -285,8 +293,14 @@ class ZohoMigrator:
 
     async def _delete_records(self, client, domain, headers, normalized_obj, record_ids, user_id, send_log):
         """Deletes records Zoho auto-created that 'update' mode should never
-        have created in the first place (Zoho's bulk delete takes <=100 ids/call)."""
-        for chunk in chunk_dataset(record_ids, 100):
+        have created in the first place (Zoho's bulk delete takes <=100 ids/call).
+
+        Returns the ids that could NOT be confirmed deleted ([] = everything reverted). Zoho answers per id, so
+        each entry of the response is checked; an id that is already gone counts as done (safe to replay).
+        """
+        failed = []
+        ids = [str(r) for r in dict.fromkeys(record_ids) if r]
+        for chunk in chunk_dataset(ids, 100):
             try:
                 ids_param = ",".join(chunk)
                 res = await client.delete(f"{domain}/crm/v6/{normalized_obj}?ids={ids_param}", headers=headers)
@@ -298,5 +312,22 @@ class ZohoMigrator:
 
                 if res.status_code not in [200, 202]:
                     await send_log(f"[{normalized_obj}] Revert batch failed: {res.text}")
+                    failed.extend(chunk)
+                    continue
+
+                try:
+                    items = res.json().get("data") or []
+                except ValueError:
+                    items = []
+                confirmed = set()
+                for item in items:
+                    rid = str((item.get("details") or {}).get("id") or "")
+                    message = str(item.get("message") or "").lower()
+                    gone = any(w in message for w in ("not exist", "not found", "already", "deleted", "invalid"))
+                    if item.get("status") == "success" or gone:
+                        confirmed.add(rid)
+                failed.extend(i for i in chunk if i not in confirmed)
             except Exception as e:
                 await send_log(f"[{normalized_obj}] Revert Failed: {str(e)}")
+                failed.extend(chunk)
+        return failed

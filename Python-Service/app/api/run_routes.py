@@ -1,4 +1,6 @@
 import logging
+import uuid
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,9 +32,20 @@ def _editor(user) -> str:
     return getattr(user, "email", None) or str(user.id)
 
 
-def _require_idle(store: RunStore) -> None:
-    if store.effective_status() == "running":
+@contextmanager
+def _edit_lock(store: RunStore):
+    """
+    Hold the run lock for the duration of an edit. The old "check status, then write" left a window in which a
+    Resume could start between the check and the write. Taking the lock closes it atomically (BEGIN IMMEDIATE),
+    and set_running=False keeps the run's status (e.g. 'completed') untouched.
+    """
+    owner = f"edit-{uuid.uuid4().hex}"
+    if not store.acquire_lock(owner, ttl=60.0, set_running=False):
         raise HTTPException(status_code=409, detail="This run is active in another session. Wait for it to stop, then edit.")
+    try:
+        yield
+    finally:
+        store.release_lock(owner)
 
 
 @router.get("/api/runs")
@@ -105,8 +118,8 @@ def edit_records(run_id: str, payload: EditPayload, current_user=Depends(get_cur
     """Save corrected source values and re-queue those rows; the next Resume / Retry sends them."""
     store = _open_run(current_user.id, run_id)
     try:
-        _require_idle(store)
-        result = store.apply_edits([e.model_dump() for e in payload.edits], _editor(current_user))
+        with _edit_lock(store):
+            result = store.apply_edits([e.model_dump() for e in payload.edits], _editor(current_user))
         return {"success": True, **result}
     finally:
         store.close()
@@ -117,8 +130,8 @@ def mass_update_records(run_id: str, payload: MassUpdatePayload, current_user=De
     """Set one field on EVERY failed row of a job whose error contains `errorContains` (e.g. a restricted picklist value)."""
     store = _open_run(current_user.id, run_id)
     try:
-        _require_idle(store)
-        result = store.mass_update(payload.jobIdx, payload.field, payload.value, payload.errorContains.strip(), _editor(current_user))
+        with _edit_lock(store):
+            result = store.mass_update(payload.jobIdx, payload.field, payload.value, payload.errorContains.strip(), _editor(current_user))
         return {"success": True, **result}
     finally:
         store.close()

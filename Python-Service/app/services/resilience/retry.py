@@ -13,6 +13,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN: "
+
 
 class ApiQuotaExhausted(Exception):
     """Daily/hard API quota reached. Retrying now is pointless; the run must be checkpointed and resumed later."""

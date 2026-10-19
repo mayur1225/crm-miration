@@ -2,7 +2,7 @@ import urllib.parse
 import re
 import asyncio
 import json
-from app.services.crm_service import CrmService
+from app.services.crm_service import CrmService, crm_session_expired
 from app.services.time_filter_service import (
     build_zendesk_time_clause,
     build_zendesk_custom_object_time_filter,
@@ -71,13 +71,17 @@ class ZendeskMigrator:
 
                 url = f"https://{subdomain}.zendesk.com/api/v2/search/export.json?filter[type]={safe_obj_singular}&query={safe_query}&page[size]=1000"
 
+                token_refreshed = False
                 while url:
                     while True:
                         res = await client.get(url, headers=headers)
                         if res.status_code == 401:
+                            if token_refreshed:  # a freshly refreshed token was refused too: do not loop forever
+                                raise crm_session_expired("zendesk", "source")
                             await send_log(" Zendesk token expired. Silently refreshing...")
                             token = await CrmService.refresh_crm_token(user_id, "zendesk", "source")
                             headers["Authorization"] = f"Bearer {token}"
+                            token_refreshed = True
                             continue
                         if res.status_code == 429:
                             await send_log(" ⏳ Zendesk Rate Limit hit. Pausing 30s...")
@@ -86,6 +90,7 @@ class ZendeskMigrator:
                         break
 
                     res.raise_for_status()
+                    token_refreshed = False
                     data = res.json()
 
                     results = data.get("results", [])
@@ -132,6 +137,7 @@ class ZendeskMigrator:
                 else:
                     url = f"https://{subdomain}.zendesk.com/api/v2/custom_objects/{safe_obj}/records?page[size]=100"
 
+                token_refreshed = False
                 while url:
                     while True:
                         if is_search:
@@ -140,9 +146,12 @@ class ZendeskMigrator:
                             res = await client.get(url, headers=headers)
 
                         if res.status_code == 401:
+                            if token_refreshed:  # a freshly refreshed token was refused too: do not loop forever
+                                raise crm_session_expired("zendesk", "source")
                             await send_log(" Zendesk token expired. Silently refreshing...")
                             token = await CrmService.refresh_crm_token(user_id, "zendesk", "source")
                             headers["Authorization"] = f"Bearer {token}"
+                            token_refreshed = True
                             continue
                         if res.status_code == 429:
                             await send_log("Zendesk Rate Limit hit. Pausing 30s...")
@@ -151,6 +160,7 @@ class ZendeskMigrator:
                         break
 
                     res.raise_for_status()
+                    token_refreshed = False
                     data = res.json()
 
                     results = data.get("custom_object_records", [])
@@ -175,7 +185,11 @@ class ZendeskMigrator:
                         break
 
         except Exception as e:
+            # Never return a partial list: the migration FREEZES whatever extract() returns as this run's source
+            # snapshot, so a swallowed error would turn a half-read object into the permanent dataset (and an expired
+            # session would never ask the user to log in again).
             await send_log(f" Zendesk Extraction Error: {str(e)}")
+            raise
 
         await send_log(f"[{safe_obj}] Extraction Complete! Total: {len(source_records)}")
         return source_records

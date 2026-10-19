@@ -32,7 +32,9 @@ from app.services.store import RunStore, RunNotFound, RunForbidden
 from app.services.run_access import RunAccess
 from app.services.org_identity import org_key
 from app.services import run_recovery
-from app.services.resumable_runner import ResumableRunner, PassSpec, RunInterrupted
+from app.services.resumable_runner import (
+    ResumableRunner, PassSpec, RunInterrupted, DiskSpaceLow, CheckpointWriteFailed,
+)
 
 import uuid
 import sqlite3
@@ -471,10 +473,6 @@ async def websocket_migration(ws: WebSocket):
                     parent.close()
                     await websocket.close()
                     return
-                parent.delete_kv("cancel")        # a cancelled run may be resumed from its checkpoint
-                parent.clear_stop_reason()
-                if payload.get("includeFailed"):
-                    parent.requeue_failed()       # resume AND re-send the rows that failed
                 store = parent
             elif mode == "restart":
                 try:
@@ -552,6 +550,11 @@ async def websocket_migration(ws: WebSocket):
                 await websocket.send_json({"log": f"FATAL: {mismatch}", "status": "Failed", "errorCode": "ORG_MISMATCH"})
                 await websocket.close()
                 return
+        if mode == "resume":
+            store.delete_kv("cancel")         # a cancelled run may be resumed from its checkpoint
+            store.clear_stop_reason()
+            if payload.get("includeFailed"):
+                store.requeue_failed()        # resume AND re-send the rows that failed
         if mode == "restart":
             _supersede_parent(user_id, store)
 
@@ -738,7 +741,11 @@ async def websocket_migration(ws: WebSocket):
                 segment_size = max(1, segment_size)
 
                 for pass_no, pass_name, pass_op, builder_opts in plan:
-                    payload_data = PayloadBuilderService.build_payload(source_records, mappings, builder_opts, target_crm)
+                    coerce_errors: list = []  # rows rejected by the payload builder (bad type / missing match key)
+                    payload_data = PayloadBuilderService.build_payload(
+                        source_records, mappings, {**builder_opts, "nullStrings": job.get("nullStrings")}, target_crm,
+                        errors=coerce_errors,
+                    )
                     dedupe_key = ""
                     if pass_op in ("update", "upsert") and ext_id_field:
                         dedupe_key = "external_id" if target_crm == "zendesk" else ext_id_field
@@ -750,6 +757,7 @@ async def websocket_migration(ws: WebSocket):
                         options_base=options_base, dedupe_key_field=dedupe_key,
                         correlation_field=(job.get("correlationField") or "") if pass_op == "insert" else "",
                         parent_job_idx=(job_index if pass_no == 2 else parent_job_idx if pass_no == 3 else None),
+                        precheck_errors=coerce_errors,
                     ))
 
                 # ---------------- id mapping ----------------
@@ -877,6 +885,20 @@ async def websocket_migration(ws: WebSocket):
             })
         await websocket.close()
 
+    except DiskSpaceLow as e:
+        _note_stop(store, "disk_full", str(e))
+        await websocket.send_json({
+            "log": f"Run paused: {e} Everything finished so far is saved.",
+            "status": "Interrupted", "runId": store.run_id if store else None, "resumable": True,
+        })
+        await websocket.close()
+    except CheckpointWriteFailed as e:
+        _note_stop(store, "checkpoint_failed", str(e))
+        await websocket.send_json({
+            "log": f"SYSTEM STOP: {e}",
+            "status": "Interrupted", "runId": store.run_id if store else None, "resumable": True,
+        })
+        await websocket.close()
     except (WebSocketDisconnect, RunInterrupted):
         logger.info("Run %s interrupted (client left or cancelled); checkpoint is intact.", getattr(store, "run_id", None))
         if store is not None and store.get_kv("cancel") != "1":
@@ -917,10 +939,18 @@ async def websocket_migration(ws: WebSocket):
         if store is not None:
             try:
                 if lock_held:
-                    if final_status == "interrupted" and store.get_kv("cancel") == "1":
-                        final_status = "cancelled"
-                    store.set_status(final_status)
-                    store.release_lock(lock_owner)
+                    # Each step is guarded on its own: when the disk is full, a failing set_status must not
+                    # prevent release_lock (the lock would otherwise block resume until the TTL runs out).
+                    try:
+                        if final_status == "interrupted" and store.get_kv("cancel") == "1":
+                            final_status = "cancelled"
+                        store.set_status(final_status)
+                    except Exception:
+                        logger.exception("Could not record final status %r for run %s", final_status, store.run_id)
+                    try:
+                        store.release_lock(lock_owner)
+                    except Exception:
+                        logger.exception("Could not release the lock of run %s (it expires on its own)", store.run_id)
             finally:
                 store.close()
 

@@ -246,7 +246,15 @@ class SalesforceMigrator:
             on_revert_pending = options.get("onRevertPending")
             if on_revert_pending:
                 on_revert_pending(ids_to_revert)  # persisted BEFORE the delete job so a crash can finish the revert
-            await self._delete_records(client, sf_instance, sf_headers, bulk_base_url, target_object, ids_to_revert, send_log)
+            failed = set(await self._delete_records(client, sf_instance, sf_headers, bulk_base_url, target_object, ids_to_revert, send_log))
+            on_revert_done = options.get("onRevertDone")
+            if on_revert_done:  # only confirmed deletes leave the pending-revert queue
+                on_revert_done([i for i in ids_to_revert if i and i not in failed])
+            if failed:
+                await send_log(
+                    f"[{target_object}] {pass_name}: WARNING {len(failed)} auto-created record(s) could not be deleted "
+                    f"and stay queued; they are retried on the next resume."
+                )
 
         return total_success, total_error, total_skipped, all_success_data, all_error_data, all_skipped_data
 
@@ -255,7 +263,7 @@ class SalesforceMigrator:
         sf_instance = options["instance_url"]
         sf_headers = {"X-SFDC-Session": options["token"], "Content-Type": "application/json; charset=UTF-8", "Accept": "application/json"}
         bulk_base_url = f"{sf_instance.rstrip('/')}/services/async/60.0"
-        await self._delete_records(client, sf_instance, sf_headers, bulk_base_url, options["targetObject"], record_ids, send_log)
+        return await self._delete_records(client, sf_instance, sf_headers, bulk_base_url, options["targetObject"], record_ids, send_log)
 
     async def find_existing(self, client, options, key_field, values):
         """{key_value: Salesforce Id} for rows that already exist -- makes insert resume duplicate-free."""
@@ -279,7 +287,16 @@ class SalesforceMigrator:
 
     async def _delete_records(self, client, sf_instance, sf_headers, bulk_base_url, target_object, record_ids, send_log):
         """Runs a small Bulk API delete job to undo records that 'update' mode
-        should never have created in the first place."""
+        should never have created in the first place.
+
+        Returns the ids that could NOT be confirmed deleted ([] = everything reverted). A 201 on batch submit only
+        means "queued", so the batch result is read back. Retrying an id that is already gone is harmless:
+        ENTITY_IS_DELETED counts as done.
+        """
+        ids = [r for r in dict.fromkeys(record_ids) if r]
+        if not ids:
+            return []
+        failed = []
         try:
             job_res = await client.post(
                 f"{bulk_base_url}/job",
@@ -288,16 +305,48 @@ class SalesforceMigrator:
             )
             if job_res.status_code != 201:
                 await send_log(f"[{target_object}] Revert Failed: could not open delete job: {job_res.text}")
-                return
+                return list(ids)
 
             job_id = job_res.json().get("id")
-            delete_rows = [{"Id": rid} for rid in record_ids if rid]
-
-            for chunk in chunk_dataset(delete_rows, 5000):
-                b_res = await client.post(f"{bulk_base_url}/job/{job_id}/batch", json=chunk, headers=sf_headers)
+            batches = []  # (batch_id, [ids in that batch])
+            for chunk_ids in chunk_dataset(ids, 5000):
+                b_res = await client.post(
+                    f"{bulk_base_url}/job/{job_id}/batch", json=[{"Id": rid} for rid in chunk_ids], headers=sf_headers
+                )
                 if b_res.status_code != 201:
                     await send_log(f"[{target_object}] Revert batch failed: {b_res.text}")
+                    failed.extend(chunk_ids)
+                    continue
+                batches.append((b_res.json().get("id"), chunk_ids))
 
             await client.post(f"{bulk_base_url}/job/{job_id}", json={"state": "Closed"}, headers=sf_headers)
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 120.0
+            for batch_id, chunk_ids in batches:
+                delay, state = 1.0, None
+                while True:
+                    st = await client.get(f"{bulk_base_url}/job/{job_id}/batch/{batch_id}", headers=sf_headers)
+                    state = st.json().get("state") if st.status_code == 200 else None
+                    if state in ("Completed", "Failed", "NotProcessed") or loop.time() > deadline:
+                        break
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.5, 5.0)
+                if state != "Completed":
+                    failed.extend(chunk_ids)
+                    continue
+                res = await client.get(f"{bulk_base_url}/job/{job_id}/batch/{batch_id}/result", headers=sf_headers)
+                results = res.json() if res.status_code == 200 else []
+                if len(results) != len(chunk_ids):
+                    failed.extend(chunk_ids)
+                    continue
+                for rid, r in zip(chunk_ids, results):
+                    if r.get("success") or "ENTITY_IS_DELETED" in str(r.get("errors")):
+                        continue
+                    failed.append(rid)
+            if failed:
+                await send_log(f"[{target_object}] Revert incomplete: {len(failed)} of {len(ids)} record(s) not deleted.")
         except Exception as e:
             await send_log(f"[{target_object}] Revert Failed: {str(e)}")
+            return list(ids)  # unknown how far it got; ids that are already deleted are accepted on the retry
+        return failed

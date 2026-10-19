@@ -3,9 +3,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Types whose values legitimately arrive as "123.0" (float-ified by pandas/Excel) and must be "123".
+# Plain text/picklist columns are NOT in this set: "3.0" in a version field must stay "3.0".
+_DOT_ZERO_TYPES = {"phone", "reference", "number", "integer", "double", "currency", "percent", "float"}
+# Only pandas/NumPy artifacts count as "no value". Real words such as "Nan", "Null" or "None" (they are
+# surnames and product names) are kept. A job can add its own list with options["nullStrings"].
+_DEFAULT_NULL_STRINGS = ("", "nan", "NaN", "NaT", "<NA>")
+_TRUE_VALUES = {"true", "1", "1.0", "yes", "y", "t", "on"}
+_FALSE_VALUES = {"false", "0", "0.0", "no", "n", "f", "off"}
+
 class PayloadBuilderService:
     @staticmethod
-    def build_payload(raw_records, mappings, options, target_crm="salesforce"):
+    def build_payload(raw_records, mappings, options, target_crm="salesforce", errors=None):
+        """
+        Returns [{originalIndex, targetRecord}].
+
+        errors: optional list. When given, rows that cannot be built safely (a value that does not convert to the
+        mapped type, or a patch-pass row with no external-id value to match on) are NOT sent; one
+        {"originalIndex", "message"} entry per row is appended so the caller can record them as failed rows
+        instead of silently dropping data. When omitted (legacy callers) a bad value is omitted from the record
+        and a warning is logged.
+        """
         mappings = PayloadBuilderService._dedupe_target_fields(mappings)
 
         skip_self_ref = options.get("skipSelfReferencing", False)
@@ -15,6 +33,7 @@ class PayloadBuilderService:
         target_object = options.get("targetObject", "")
         target_ext_id_field = options.get("targetExtIdField", "")
         op_mode = options.get("operationMode", "insert")
+        null_strings = set(options.get("nullStrings") or _DEFAULT_NULL_STRINGS)
 
         payload = []
         is_patch_mode = only_self_ref or len(only_refs) > 0
@@ -22,6 +41,8 @@ class PayloadBuilderService:
         for idx, raw_row in enumerate(raw_records):
             target_record = {}
             has_patch_data = False
+            row_errors = []
+            skip_row = False
 
             for mapping in mappings:
                 # ---  Support BOTH API Mapping and CSV Mapping formats ---
@@ -37,48 +58,55 @@ class PayloadBuilderService:
                 if csv_val is None and target_field in raw_row:
                     csv_val = raw_row.get(target_field)
 
-                # --- ULTIMATE TYPE ENFORCEMENT & SANITIZER ---
+                expected_type = (mapping.get("type") or "string").lower()
+                original_val = csv_val
+                coerce_failed = False
+
+                # --- SANITIZER (only real "no value" markers are nulled) ---
                 if csv_val is not None:
-                    # Catch Math NaNs
                     if isinstance(csv_val, float) and math.isnan(csv_val):
                         csv_val = None
-                    
-                    # Catch String "nulls" and trailing ".0"
-                    if isinstance(csv_val, str):
+                    elif isinstance(csv_val, str):
                         csv_val = csv_val.strip()
-                        if csv_val.lower() in ["nan", "null", "none", "nat", "<na>", "undefined", ""]:
+                        if csv_val in null_strings:
                             csv_val = None
-                        elif csv_val.endswith(".0") and csv_val[:-2].isdigit():
+                        elif expected_type in _DOT_ZERO_TYPES and csv_val.endswith(".0") and csv_val[:-2].isdigit():
                             csv_val = csv_val[:-2]
 
-                # 3. Force exact JSON Types required by the CRM API
+                # --- TYPE ENFORCEMENT: exact JSON types required by the CRM API ---
                 if csv_val is not None:
-                    expected_type = mapping.get("type", "string").lower()
-                    
                     # Force strings for Phone, Email, Picklists, etc.
                     if expected_type in ["string", "phone", "email", "text", "picklist", "textarea", "reference"]:
                         if isinstance(csv_val, float) and csv_val.is_integer():
                             csv_val = str(int(csv_val))
                         else:
                             csv_val = str(csv_val)
-                            
-                    # Force numbers (Handle Integer vs Float for Zoho strictness)
+
+                    # Force numbers (integer vs float matters for Zoho)
                     elif expected_type in ["number", "integer", "double", "currency", "percent", "float"]:
                         try:
                             num_val = float(csv_val)
-                            # If it's a perfect whole number (like 400.0) or explicitly an integer, cast to int!
+                            if not math.isfinite(num_val):
+                                raise ValueError("not finite")
                             if num_val.is_integer() or expected_type == "integer":
                                 csv_val = int(num_val)
                             else:
                                 csv_val = num_val
-                        except (ValueError, TypeError):
+                        except (ValueError, TypeError, OverflowError):
                             csv_val = None
-                            
-                    # Force true booleans for Checkboxes
+                            coerce_failed = True
+
+                    # Force true booleans for Checkboxes. Unknown words are an error, never "True".
                     elif expected_type == "boolean":
-                        if str(csv_val).lower() in ["true", "1", "yes", "y"]: csv_val = True
-                        elif str(csv_val).lower() in ["false", "0", "no", "n"]: csv_val = False
-                        else: csv_val = bool(csv_val)
+                        if not isinstance(csv_val, bool):
+                            flag = str(csv_val).strip().lower()
+                            if flag in _TRUE_VALUES:
+                                csv_val = True
+                            elif flag in _FALSE_VALUES:
+                                csv_val = False
+                            else:
+                                csv_val = None
+                                coerce_failed = True
 
                     elif expected_type in ["date", "datetime"]:
                         try:
@@ -91,6 +119,10 @@ class PayloadBuilderService:
                                     csv_val = parsed_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')
                         except Exception:
                             pass
+
+                if coerce_failed:
+                    row_errors.append(f"[{target_field}] Cannot convert {str(original_val)[:80]!r} to {expected_type}.")
+                    continue
 
                 if is_patch_mode and target_field in ['CreatedDate', 'CreatedById', 'LastModifiedDate', 'LastModifiedById', 'created_at', 'updated_at']:
                     continue
@@ -105,10 +137,11 @@ class PayloadBuilderService:
                 is_excluded_cross = any(obj in refs_other for obj in exclude_refs)
                 is_only_target_cross = len(only_refs) > 0 and any(obj in refs_other for obj in only_refs)
 
+                is_ext_id_mapping = bool(target_ext_id_field) and target_field == target_ext_id_field
                 if skip_self_ref and is_self_ref: continue
-                if only_self_ref and not is_self_ref: continue
+                if only_self_ref and not is_self_ref and not is_ext_id_mapping: continue
                 if is_excluded_cross: continue
-                if len(only_refs) > 0 and not is_only_target_cross: continue
+                if len(only_refs) > 0 and not is_only_target_cross and not is_ext_id_mapping: continue
 
                 # ==========================================
                 # CRM-SPECIFIC PAYLOAD FORMATTING
@@ -130,6 +163,7 @@ class PayloadBuilderService:
                         if is_patch_mode: has_patch_data = True
                     else:
                         target_record[target_field] = csv_val
+                        if is_patch_mode and mapping.get("type") == "reference": has_patch_data = True
                 
                 elif target_crm == "zoho":
                     rel_ext_id = mapping.get("relationalExtIdField")
@@ -155,7 +189,6 @@ class PayloadBuilderService:
 
                     if target_ext_id_field and target_field == target_ext_id_field:
                         target_record["external_id"] = csv_val
-                        if is_patch_mode: has_patch_data = True
                     elif target_field.startswith("custom_field_"):
                         if "custom_fields" not in target_record:
                             target_record["custom_fields"] = []
@@ -179,6 +212,22 @@ class PayloadBuilderService:
                     
                     if is_patch_mode and mapping.get("type") == "reference": 
                         has_patch_data = True
+
+            if is_patch_mode and has_patch_data and target_ext_id_field:
+                key_name = "external_id" if target_crm == "zendesk" else target_ext_id_field
+                if target_record.get(key_name) in (None, ""):
+                    row_errors.append(
+                        f"[{target_ext_id_field}] Missing value: a patch pass cannot match the record created by the first pass."
+                    )
+                    skip_row = True
+
+            if row_errors:
+                if errors is not None:
+                    errors.append({"originalIndex": idx, "message": "; ".join(row_errors)})
+                    continue
+                logger.warning("[PAYLOAD BUILDER] row %d: %s", idx, "; ".join(row_errors))
+                if skip_row:
+                    continue
 
             # Ensure External ID is present for Upserts
             if target_ext_id_field and target_ext_id_field not in target_record:

@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import os
 import random
 import re
-from dataclasses import dataclass
+import shutil
+import sqlite3
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from fastapi import HTTPException
@@ -10,7 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.services.crm_service import is_crm_session_expired
 from app.services.payload_builder import PayloadBuilderService
-from app.services.resilience.retry import ApiQuotaExhausted, CircuitOpen, idempotent_posts
+from app.services.resilience.retry import ApiQuotaExhausted, CircuitOpen, OUTCOME_UNKNOWN, idempotent_posts
 from app.services.store import RowResult, RunStore, TARGET_RESULT_KEYS
 
 logger = logging.getLogger(__name__)
@@ -24,11 +27,24 @@ TRANSIENT_ROW_RE = re.compile(
 )
 # DELETE is replayed after a crash: a row the interrupted attempt already deleted is done, not an error.
 ALREADY_GONE_RE = re.compile(r"ENTITY_IS_DELETED|entity is deleted|already (been )?deleted|NOT_FOUND|record not found|no record found", re.I)
-_PROPAGATE = (ApiQuotaExhausted, CircuitOpen, WebSocketDisconnect, asyncio.CancelledError)
 
 
 class RunInterrupted(Exception):
     """Raised at a segment boundary when the client went away; everything finished so far is checkpointed."""
+
+
+class DiskSpaceLow(RunInterrupted):
+    """Raised BEFORE a segment is sent when the runs folder is nearly full; the run stays resumable."""
+
+
+class CheckpointWriteFailed(Exception):
+    """A segment WAS sent but its result could not be written to the run database (disk full / locked)."""
+
+
+# Minimum free space on the runs volume before another segment may be sent.
+MIN_FREE_BYTES = int(os.environ.get("SURESHIFT_MIN_FREE_MB", "200")) * 1024 * 1024
+
+_PROPAGATE = (ApiQuotaExhausted, CircuitOpen, WebSocketDisconnect, asyncio.CancelledError, CheckpointWriteFailed, DiskSpaceLow)
 
 
 @dataclass
@@ -47,6 +63,7 @@ class PassSpec:
     dedupe_key_field: str = ""        # set to dedupe update/upsert batches by unique key
     correlation_field: str = ""       # insert mode: target field stamped with the source key for reconcile
     parent_job_idx: Optional[int] = None  # job whose failed rows block this pass (Pass 2 -> own job, Pass 3 -> original job)
+    precheck_errors: List[Dict[str, Any]] = field(default_factory=list)  # rows PayloadBuilder rejected: [{originalIndex, message}]
 
 
 def source_key(rec: Dict[str, Any]) -> str:
@@ -55,12 +72,60 @@ def source_key(rec: Dict[str, Any]) -> str:
 
 class ResumableRunner:
     MAX_ROW_RETRY_ROUNDS = 2
+    CHECKPOINT_RETRIES = 5
 
     def __init__(self, store: RunStore, client: Any, send_log: SendLog, should_stop: Callable[[], bool]):
         self.store = store
         self.client = client
         self.send_log = send_log
         self.should_stop = should_stop
+
+    # ------------------------------------------------------------------ durability helpers
+    def _check_disk(self) -> None:
+        """Refuse to send another segment when there is no room to checkpoint its result."""
+        try:
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(self.store.path))).free
+        except OSError:
+            return
+        if free < MIN_FREE_BYTES:
+            raise DiskSpaceLow(
+                f"Only {free // (1024 * 1024)} MB free on the runs disk (need {MIN_FREE_BYTES // (1024 * 1024)} MB). "
+                f"Free up disk space, then resume."
+            )
+
+    async def _save(self, spec: "PassSpec", results: List[RowResult], clear_bulk: bool = True) -> None:
+        """
+        The checkpoint write. Never swallowed: retried a few times (disk briefly full / database locked), then
+        CheckpointWriteFailed. The rows stay 'in_flight', so a resume reconciles them instead of re-sending blindly.
+        """
+        delay = 1.0
+        last: Optional[Exception] = None
+        for attempt in range(1, self.CHECKPOINT_RETRIES + 1):
+            try:
+                self.store.save_results(spec.job_idx, spec.pass_no, results, clear_bulk=clear_bulk)
+                return
+            except sqlite3.OperationalError as exc:  # "database or disk is full", "database is locked", ...
+                last = exc
+                logger.error("[RUNNER] checkpoint write failed (attempt %d/%d): %s", attempt, self.CHECKPOINT_RETRIES, exc)
+                if attempt < self.CHECKPOINT_RETRIES:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 15.0)
+
+        created = [(r.row_idx, r.target_id) for r in results if r.state == "success" and r.target_id]
+        try:  # the database is unusable, so the websocket log is the only place left to record what was created
+            sample = ", ".join(f"row {i} -> {tid}" for i, tid in created[:200])
+            await self.send_log(
+                f"[{spec.target_object}] {spec.pass_name}: CRITICAL could not save {len(results)} result(s) ({last}). "
+                f"{len(created)} record(s) WERE created in the target"
+                + (f" (first {min(len(created), 200)}: {sample})." if created else ".")
+                + " Free disk space and resume; check the target for these records before re-sending."
+            )
+        except Exception:
+            pass
+        raise CheckpointWriteFailed(
+            f"Could not save the results of {len(results)} row(s) to the run database ({last}). "
+            f"The run was stopped before sending anything else. Free disk space and resume."
+        )
 
     # ------------------------------------------------------------------ public
     async def run_pass(self, spec: PassSpec) -> None:
@@ -90,7 +155,13 @@ class ResumableRunner:
                     f"'{spec.ext_id_field}' value within this batch -- keeping the last one, skipping the rest."
                 )
         seed_rows += [(i["originalIndex"], source_key(spec.source_records[i["originalIndex"]]), "pending", None) for i in active]
+        precheck = list(spec.precheck_errors or [])
+        seed_rows += [
+            (e["originalIndex"], source_key(spec.source_records[e["originalIndex"]]), "pending", None) for e in precheck
+        ]
         store.seed(spec.job_idx, spec.pass_no, seed_rows)
+        if precheck:  # rejected before sending (bad value type, missing match key): visible, editable, retryable
+            store.fail_pending_rows(spec.job_idx, spec.pass_no, [(e["originalIndex"], e["message"]) for e in precheck])
 
         by_idx = {i["originalIndex"]: i for i in active}
         await self._reconcile(spec, by_idx)
@@ -103,6 +174,7 @@ class ResumableRunner:
         while True:
             if self.should_stop():
                 raise RunInterrupted()
+            self._check_disk()
 
             rows = store.next_pending(spec.job_idx, spec.pass_no, spec.segment_size)
             if not rows:
@@ -112,7 +184,7 @@ class ResumableRunner:
                 keys = store.source_keys(spec.job_idx, spec.pass_no, rows)
                 blocked = [i for i in rows if keys.get(i) in blocking]
                 if blocked:
-                    store.save_results(spec.job_idx, spec.pass_no, [
+                    await self._save(spec, [
                         RowResult(i, "skipped", skip_reason="parent_failed: the record this one depends on failed to migrate.")
                         for i in blocked
                     ], clear_bulk=False)
@@ -122,7 +194,7 @@ class ResumableRunner:
 
             missing = [i for i in rows if i not in by_idx]
             if missing:
-                store.save_results(spec.job_idx, spec.pass_no, [
+                await self._save(spec, [
                     RowResult(i, "error", error="Row could not be rebuilt into a payload on resume.") for i in missing
                 ], clear_bulk=False)
                 rows = [i for i in rows if i in by_idx]
@@ -147,8 +219,19 @@ class ResumableRunner:
             await self.send_log(
                 f"[{spec.target_object}] {spec.pass_name}: finishing {len(reverts)} pending revert(s) from the interrupted run..."
             )
-            await reverter(self.client, self._options(spec), reverts, self.send_log)
-        store.clear_pending_reverts(spec.job_idx, spec.pass_no)
+            failed = set(await reverter(self.client, self._options(spec), reverts, self.send_log) or [])
+            # forget only what the target confirmed; the rest is retried on the next resume
+            store.remove_pending_reverts(spec.job_idx, spec.pass_no, [t for t in reverts if t not in failed])
+            if failed:
+                await self.send_log(
+                    f"[{spec.target_object}] {spec.pass_name}: WARNING {len(failed)} auto-created record(s) could not be "
+                    f"deleted yet and stay queued for the next resume: {', '.join(sorted(failed)[:20])}"
+                )
+        elif reverts:
+            await self.send_log(
+                f"[{spec.target_object}] {spec.pass_name}: WARNING {len(reverts)} pending revert(s) kept; "
+                f"this CRM adapter cannot revert them automatically."
+            )
 
         stuck = store.in_flight_rows(spec.job_idx, spec.pass_no)
         if not stuck:
@@ -163,8 +246,7 @@ class ResumableRunner:
 
         resolved = await self._lookup_created(spec, stuck)
         if resolved:
-            store.save_results(spec.job_idx, spec.pass_no,
-                               [RowResult(i, "success", target_id=tid) for i, tid in resolved.items()], clear_bulk=False)
+            await self._save(spec, [RowResult(i, "success", target_id=tid) for i, tid in resolved.items()], clear_bulk=False)
             await self.send_log(f"[{spec.target_object}] {spec.pass_name}: {len(resolved)} row(s) already existed in the target; not re-sent.")
         remaining = [i for i in stuck if i not in resolved]
         if remaining and not self._can_lookup(spec):
@@ -207,8 +289,10 @@ class ResumableRunner:
         except Exception as exc:
             await self._on_segment_failure(spec, items, idxs, exc)
             return
-        self.store.save_results(spec.job_idx, spec.pass_no, results)
-        self.store.clear_pending_reverts(spec.job_idx, spec.pass_no)
+        await self._save(spec, results)
+        if not getattr(spec.migrator, "revert_created", None):
+            # adapters without revert support never confirm reverts, so do not let them pile up
+            self.store.clear_pending_reverts(spec.job_idx, spec.pass_no)
 
     async def _on_segment_failure(self, spec: PassSpec, items: List[Dict[str, Any]], idxs: List[int], exc: Exception) -> None:
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
@@ -220,11 +304,10 @@ class ResumableRunner:
             # The failed attempt may have created some rows; resolve those before resending anything.
             resolved = await self._lookup_created(spec, idxs)
             if resolved:
-                self.store.save_results(spec.job_idx, spec.pass_no,
-                                        [RowResult(i, "success", target_id=tid) for i, tid in resolved.items()], clear_bulk=False)
+                await self._save(spec, [RowResult(i, "success", target_id=tid) for i, tid in resolved.items()], clear_bulk=False)
                 remaining_items = [i for i in items if i["originalIndex"] not in resolved]
             if remaining_items and not self._can_lookup(spec):
-                self.store.save_results(spec.job_idx, spec.pass_no, [
+                await self._save(spec, [
                     RowResult(i["originalIndex"], "error",
                               error=f"Segment failed mid-flight and was not retried to avoid duplicates ({message}). Use Retry failed.")
                     for i in remaining_items
@@ -232,10 +315,10 @@ class ResumableRunner:
                 return
 
         if not remaining_items:
-            self.store.save_results(spec.job_idx, spec.pass_no, [], clear_bulk=True)
+            await self._save(spec, [], clear_bulk=True)
             return
         if len(remaining_items) == 1:
-            self.store.save_results(spec.job_idx, spec.pass_no, [
+            await self._save(spec, [
                 RowResult(remaining_items[0]["originalIndex"], "error", error=message)
             ])
             return
@@ -245,9 +328,55 @@ class ResumableRunner:
         await self._send_with_bisect(spec, remaining_items[:mid])
         await self._send_with_bisect(spec, remaining_items[mid:])
 
+    UNCONFIRMED_WRITE = (
+        "The target did not confirm this write (network / server error) and no duplicate-protection field is "
+        "configured, so it was NOT sent again: the record may already exist. Check the target before using Retry failed."
+    )
+
+    async def _resolve_unknown(self, spec: PassSpec, results: List[RowResult]) -> List[RowResult]:
+        """
+        Adapters mark a write whose outcome is ambiguous (timeout / 500 / 502 / 504 on an INSERT) with OUTCOME_UNKNOWN.
+        Such a row is never re-sent blindly (that is how duplicates happen): it is looked up by its correlation key.
+          found in the target     -> success (nothing is sent again)
+          looked up, not found    -> safe to send again (rejoins the normal transient-retry rounds)
+          lookup not possible     -> stays a failed row, with an explicit warning
+        """
+        unknown = {r.row_idx for r in results if r.state == "error" and OUTCOME_UNKNOWN in (r.error or "")}
+        if not unknown:
+            return results
+
+        resolved: Dict[int, str] = {}
+        looked_up = False
+        if spec.op_mode == "insert" and self._can_lookup(spec):
+            try:
+                resolved = await self._lookup_created(spec, sorted(unknown))
+                looked_up = True
+            except _PROPAGATE:
+                raise
+            except Exception:
+                logger.warning("[RUNNER] lookup of %d unconfirmed write(s) failed; they stay failed rows", len(unknown), exc_info=True)
+
+        out: List[RowResult] = []
+        for r in results:
+            if r.row_idx not in unknown:
+                out.append(r)
+            elif r.row_idx in resolved:
+                out.append(RowResult(r.row_idx, "success", target_id=resolved[r.row_idx]))
+            elif looked_up:
+                out.append(RowResult(r.row_idx, "error",
+                                     error="Temporary: the write was not confirmed and the record was not found in the target; sending it again."))
+            else:
+                out.append(RowResult(r.row_idx, "error", error=self.UNCONFIRMED_WRITE))
+        if looked_up:
+            await self.send_log(
+                f"[{spec.target_object}] {spec.pass_name}: {len(resolved)} unconfirmed write(s) were already in the target "
+                f"(not re-sent); {len(unknown) - len(resolved)} were not and will be sent again."
+            )
+        return out
+
     async def _send_with_row_retries(self, spec: PassSpec, items: List[Dict[str, Any]]) -> List[RowResult]:
         by_idx = {i["originalIndex"]: i for i in items}
-        results = await self._send(spec, items)
+        results = await self._resolve_unknown(spec, await self._send(spec, items))
         for round_no in range(1, self.MAX_ROW_RETRY_ROUNDS + 1):
             again = [r for r in results if r.state == "error" and TRANSIENT_ROW_RE.search(r.error or "")]
             if not again:
@@ -255,7 +384,7 @@ class ResumableRunner:
             await self.send_log(f"[{spec.target_object}] {spec.pass_name}: re-sending {len(again)} row(s) after a transient error (round {round_no}).")
             await asyncio.sleep(random.uniform(0.0, 2.0 ** round_no))
             retried = {r.row_idx: r for r in await self._send(spec, [by_idx[r.row_idx] for r in again])}
-            results = [retried.get(r.row_idx, r) for r in results]
+            results = await self._resolve_unknown(spec, [retried.get(r.row_idx, r) for r in results])
         return results
 
     async def _send(self, spec: PassSpec, items: List[Dict[str, Any]]) -> List[RowResult]:
@@ -272,6 +401,7 @@ class ResumableRunner:
         options = self._options(spec)
         options["onBulkJobCreated"] = lambda job_id: store.set_bulk(spec.job_idx, spec.pass_no, job_id, sorted(idxs))
         options["onRevertPending"] = lambda ids: store.add_pending_reverts(spec.job_idx, spec.pass_no, ids)
+        options["onRevertDone"] = lambda ids: store.remove_pending_reverts(spec.job_idx, spec.pass_no, ids)
         bulk = store.get_bulk(spec.job_idx, spec.pass_no)
         if bulk and bulk[1] == sorted(idxs):
             options["resumeBulkJobId"] = bulk[0]
