@@ -25,7 +25,7 @@ from app.services.id_mapping_service import IdMappingService
 from app.services.migrators.cross_crm_file_migrator import CrossCrmFileMigrator
 from app.services.crm_picklist_sync_service import MultiCrmPicklistSyncService
 from app.services.file_adapters.registry import supported_crms, effective_strategy
-from app.services.picklist_sync_service import PicklistSyncService
+from app.services.picklist_sync_service import PicklistSyncError, PicklistSyncService
 from app.services.migrators.salesforce_file_migrator import FileMigrationCheckpoint
 from app.services.resilience.retry import RetryingClient, ApiQuotaExhausted, CircuitOpen
 from app.services.store import RunStore, RunNotFound, RunForbidden
@@ -737,12 +737,48 @@ async def websocket_migration(ws: WebSocket):
                 segment_size = batch_size if target_crm == "salesforce" else min(batch_size, 100)
                 segment_size = max(1, segment_size)
 
+                guarded_picklists: dict = {}
+                if target_crm == "salesforce" and op_mode != "delete":
+                    try:
+                        guarded_picklists = await PicklistSyncService.load_active_picklist_values(
+                            client, target_creds, user_id, target_object, mappings,
+                        )
+                    except (PicklistSyncError, httpx.HTTPError) as exc:
+                        final_status = "failed"
+                        await websocket.send_json({
+                            "log": f"[{target_object}] FATAL: could not read target picklist values ({exc}). "
+                                   f"Aborting before data load to avoid creating inactive picklist values.",
+                            "status": "Failed",
+                        })
+                        await websocket.close()
+                        return
+
                 for pass_no, pass_name, pass_op, builder_opts in plan:
                     coerce_errors: list = []  # rows rejected by the payload builder (bad type / missing match key)
                     payload_data = PayloadBuilderService.build_payload(
                         source_records, mappings, {**builder_opts, "nullStrings": job.get("nullStrings")}, target_crm,
                         errors=coerce_errors,
                     )
+                    if guarded_picklists:
+                        payload_data, rejected = PicklistSyncService.reject_unknown_values(payload_data, guarded_picklists)
+                        if rejected:
+                            coerce_errors.extend({"originalIndex": r["originalIndex"], "message": r["message"]} for r in rejected)
+                            counts: dict = {}
+                            for r in rejected:
+                                for fld, val in r["bad"]:
+                                    counts.setdefault(fld, {}).setdefault(val, 0)
+                                    counts[fld][val] += 1
+                            for fld, vals in counts.items():
+                                sample = ", ".join(f"{v!r} x{n}" for v, n in list(vals.items())[:5])
+                                more = f" (+{len(vals) - 5} more)" if len(vals) > 5 else ""
+                                await send_log(
+                                    f"[{target_object}] Picklist '{fld}': values not in the target picklist "
+                                    f"(Sync Picklist is OFF): {sample}{more}"
+                                )
+                            await send_log(
+                                f"[{target_object}] {len(rejected)} record(s) not sent because of unsynced picklist "
+                                f"values; they are listed as failed. All other records continue."
+                            )
                     dedupe_key = ""
                     if pass_op in ("update", "upsert") and ext_id_field:
                         dedupe_key = "external_id" if target_crm == "zendesk" else ext_id_field

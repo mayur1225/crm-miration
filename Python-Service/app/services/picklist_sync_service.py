@@ -462,6 +462,86 @@ class PicklistSyncService:
         return await cls._add_to_standard_value_set(session, std_set, missing)
 
     @classmethod
+    async def load_active_picklist_values(
+        cls,
+        client: httpx.AsyncClient,
+        target_creds: Dict[str, Any],
+        user_id: str,
+        target_object: str,
+        mappings: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Active values in the target org for every mapped picklist whose Sync toggle is OFF.
+        Returns {target_field: {"multi": bool, "values": {lowercase: canonical}}}.
+        Raises PicklistSyncError / httpx.HTTPError if the target describe fails (fail closed).
+        """
+        pending = list(dict.fromkeys(
+            (m.get("targetField") or m.get("sfField"))
+            for m in mappings
+            if not m.get("syncPicklistValues") and (m.get("targetField") or m.get("sfField"))
+        ))
+        if not pending:
+            return {}
+
+        session = _SalesforceSession(client, target_creds, user_id, "target")
+        fields = await session.describe_fields(target_object, refresh=True)
+
+        guarded: Dict[str, Dict[str, Any]] = {}
+        for name in pending:
+            meta = fields.get(name)
+            if not meta or meta.get("type") not in PICKLIST_TYPES:
+                continue
+            guarded[name] = {
+                "multi": meta["type"] == "multipicklist",
+                "values": {
+                    str(v["value"]).strip().lower(): str(v["value"])
+                    for v in (meta.get("picklistValues") or [])
+                    if v.get("active", True) and v.get("value") is not None
+                },
+            }
+        return guarded
+
+    @staticmethod
+    def reject_unknown_values(
+        payload: List[Dict[str, Any]],
+        guarded: Dict[str, Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Splits the payload into (accepted, rejected). A row is rejected when a mapped picklist value is not
+        active in the target org. Rejected rows are never sent, so Salesforce cannot auto-create the value
+        as an inactive entry, and no field is ever altered. Rejections are returned as
+        {"originalIndex", "message", "field", "values"} so the caller records them as failed rows.
+        """
+        accepted: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+        for item in payload:
+            record = item["targetRecord"]
+            problems: List[str] = []
+            bad: List[Tuple[str, str]] = []
+            for field, spec in guarded.items():
+                raw = record.get(field)
+                if raw is None or str(raw).strip() == "":
+                    continue
+                tokens = [t.strip() for t in str(raw).split(";")] if spec["multi"] else [str(raw).strip()]
+                unknown = [t for t in tokens if t and t.lower() not in spec["values"]]
+                if unknown:
+                    bad.extend((field, t) for t in unknown)
+                    problems.append(
+                        f"[{field}] {', '.join(repr(t) for t in unknown)} "
+                        f"{'is' if len(unknown) == 1 else 'are'} not active in the target picklist "
+                        f"(enable Sync Picklist for this field to create it)."
+                    )
+            if problems:
+                rejected.append({
+                    "originalIndex": item["originalIndex"],
+                    "message": " ".join(problems),
+                    "bad": bad,
+                })
+            else:
+                accepted.append(item)
+        return accepted, rejected
+
+    @classmethod
     async def sync(
         cls,
         client: httpx.AsyncClient,
