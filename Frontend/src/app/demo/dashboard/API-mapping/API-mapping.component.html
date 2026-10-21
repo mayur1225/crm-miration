@@ -990,6 +990,49 @@
     .rv-steps .t small { display: none; }
     .rv-header-sub { display: none; }
   }
+
+  /* =====================================================================
+     RETRY PANEL LAYOUT FIX
+     Problem: hero + steps + notices + footer are fixed-height, so inside a 680px panel the
+     records area (.rv-main) was squeezed to a few rows. Now: bigger default size, the body
+     scrolls instead of squeezing, records always get a minimum height, summary can be collapsed.
+     ===================================================================== */
+  .rv.floating-review-panel {
+    width: min(1280px, 96vw); height: min(90vh, 860px);
+    max-width: 96vw; max-height: 94vh; min-width: 640px; min-height: 480px;
+  }
+  .rv.floating-review-panel.minimized { width: 280px; height: 48px; min-width: 280px; min-height: 48px; }
+  .rv .rv-body { overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; }
+  .rv .rv-main { min-height: 460px; grid-template-columns: clamp(240px, 24cqw, 320px) minmax(0, 1fr); }
+  .rv .rv-records { min-height: 420px; }
+  .rv .rv-scroll { min-height: 260px; }
+  .rv .rv-notices { max-height: 120px; }
+  .rv .rv-hero { padding: 10px 18px; gap: 14px; }
+  .rv .rv-ring { width: 56px; height: 56px; }
+  .rv-hero-toggle { border: 0; background: none; color: var(--rv-brand); font-size: .72rem; font-weight: 600; cursor: pointer; padding: 0; margin-left: auto; }
+  .rv-hero-toggle:hover { text-decoration: underline; }
+  .rv-hero.collapsed .rv-bar, .rv-hero.collapsed .rv-legend, .rv-hero.collapsed .rv-position, .rv-hero.collapsed .rv-steps { display: none; }
+  .rv-hero.collapsed { padding-top: 6px; padding-bottom: 6px; }
+  .rv-hero.collapsed .rv-ring { width: 36px; height: 36px; }
+  .rv-hero.collapsed .rv-ring-inner span { display: none; }
+
+  /* card view: show more of each record before the inner scrollbar kicks in */
+  .rv .rv-fields { max-height: clamp(220px, 46vh, 560px); grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+  .rv .rv-field .form-control { min-width: 0; text-overflow: ellipsis; }
+
+  /* table view: readable columns, wrapped error text, horizontal scroll only inside the records area */
+  .rv .rv-table { table-layout: auto; }
+  .rv .rv-table td { min-width: 150px; max-width: 280px; }
+  .rv .rv-table td:nth-child(1) { min-width: 50px; max-width: 50px; }
+  .rv .rv-table td:nth-child(2) { min-width: 300px; max-width: 360px; white-space: normal; word-break: break-word; }
+  .rv .rv-table td .form-control { min-width: 140px; width: 100%; text-overflow: ellipsis; }
+  .rv .rv-pager { background: #fff; position: sticky; bottom: 0; }
+
+  @container (max-width: 860px) {
+    .rv .rv-main { grid-template-columns: minmax(0, 1fr); }
+    .rv .rv-side { max-height: 220px; }
+    .rv .rv-records { min-height: 480px; }
+  }
 </style>
 
 @if (isGlobalLoading) {
@@ -2701,7 +2744,7 @@
   <div class="rv-body">
 
     <!-- ============ Hero: status + 3-step guide ============ -->
-    <section class="rv-hero">
+    <section class="rv-hero" [class.collapsed]="recoverySummaryCollapsed">
       <div class="rv-ring" [style.--pct]="successPct" [title]="successPct + '% of records succeeded'">
         <div class="rv-ring-inner"><b>{{ successPct }}%</b><span>done</span></div>
       </div>
@@ -2716,6 +2759,10 @@
           No failed records — you're ready to continue
           }
           <span class="rv-status" [attr.data-status]="activeRun.status">{{ activeRun.status | titlecase }}</span>
+          <button type="button" class="rv-hero-toggle" (click)="recoverySummaryCollapsed = !recoverySummaryCollapsed"
+            [title]="recoverySummaryCollapsed ? 'Show progress details' : 'Hide progress details to give the records more room'">
+            {{ recoverySummaryCollapsed ? 'Show details' : 'Hide details' }}
+          </button>
         </div>
 
         <div class="rv-bar" title="Succeeded / failed / skipped / waiting">
@@ -2833,7 +2880,7 @@
       <aside class="rv-side">
         <div class="rv-side-head">
           <span>Why records failed</span>
-          @if (failureSearch) { <button class="rv-link" (click)="clearFailureFilter()">Show all</button> }
+          @if (failureSearch || failureGroupKey) { <button class="rv-link" (click)="clearFailureFilter()">Show all</button> }
         </div>
 
         @if (failureGroups.length === 0) {
@@ -2841,8 +2888,8 @@
         }
         <div class="rv-groups">
           @for (g of failureGroups; track $index) {
-          <button class="rv-group" [attr.data-tone]="g._info.tone" [class.active]="failureSearch.trim() === g.message"
-            (click)="selectGroup(g)" [title]="g.message">
+          <button class="rv-group" [attr.data-tone]="g._info.tone" [class.active]="failureGroupKey === g.key"
+            (click)="selectGroup(g)" [title]="g.count + ' record' + (g.count === 1 ? '' : 's') + ' with this error: ' + g.message">
             <span class="rv-group-icon"><i class="feather" [ngClass]="g._info.icon"></i></span>
             <span class="rv-group-text">
               <span class="rv-group-title">{{ g._info.title }}</span>
@@ -2862,7 +2909,7 @@
 
         <div class="rv-bulk">
           <div class="rv-bulk-title"><i class="feather icon-edit-3"></i>
-            Fix {{ failureSearch.trim() ? 'all matching' : 'all' }} <b>{{ failureTotal }}</b> at once
+            Fix {{ (failureSearch.trim() || failureGroupKey) ? 'all matching' : 'all' }} <b>{{ failureTotal }}</b> at once
           </div>
           <label class="rv-mini-label">Column</label>
           <select class="form-select form-select-sm" [ngModel]="bulkField" (ngModelChange)="bulkField = $event; massPreview = null">
@@ -3000,8 +3047,8 @@
           </div>
           } @else if (failureRows.length === 0) {
           <div class="rv-empty">
-            <div class="rv-empty-icon"><i class="feather" [ngClass]="failureSearch ? 'icon-search' : 'icon-check-circle'"></i></div>
-            @if (failureSearch) {
+            <div class="rv-empty-icon"><i class="feather" [ngClass]="(failureSearch || failureGroupKey) ? 'icon-search' : 'icon-check-circle'"></i></div>
+            @if (failureSearch || failureGroupKey) {
             <h6>No failed records match this filter</h6>
             <p>Try a different search, or show every failed record.</p>
             <button class="rv-btn rv-btn-soft" (click)="clearFailureFilter()">Clear filter</button>

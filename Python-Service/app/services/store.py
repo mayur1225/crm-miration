@@ -7,6 +7,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -93,6 +94,41 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, default=str)
 
 
+# ---------------------------------------------------------------------------------------------
+# Error grouping. CRM messages embed row-specific data (record ids, emails, values, numbers), so grouping by the
+# raw text produced one "group" per row. error_pattern() replaces that data with placeholders so every row that
+# failed for the same reason lands in ONE group; field names and error codes are kept so different problems stay apart.
+# ---------------------------------------------------------------------------------------------
+_P_PICKLIST = re.compile(r"(bad value for restricted picklist field:)\s*.*", re.I | re.S)
+_P_TOO_LARGE = re.compile(r"(data value too large:)\s*.*?(\(max length=)", re.I | re.S)
+_P_FROM_STRING = re.compile(r'(from String )"[^"]*"', re.I)
+_P_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_P_URL = re.compile(r"https?://[^\s\"')]+")
+_P_UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+_P_SFID = re.compile(r"(?<![A-Za-z0-9_])(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{15}(?:[A-Za-z0-9]{3})?(?![A-Za-z0-9_])")
+_P_QUOTED = re.compile(r"'[^'\r\n]{1,200}'")
+_P_DATE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
+_P_NUM = re.compile(r"(?<![A-Za-z_\d])\d+(?:[.,]\d+)*(?![A-Za-z_\d])")
+
+
+@lru_cache(maxsize=8192)
+def error_pattern(text: Optional[str]) -> str:
+    """Row-independent form of an error message (also used as the group key)."""
+    s = str(text or "")
+    s = _P_PICKLIST.sub(r"\1 <value>", s)
+    s = _P_TOO_LARGE.sub(r"\1 <value> \2", s)
+    s = _P_FROM_STRING.sub(r"\1<value>", s)
+    s = _P_EMAIL.sub("<email>", s)
+    s = _P_URL.sub("<url>", s)
+    s = _P_UUID.sub("<id>", s)
+    s = _P_SFID.sub("<id>", s)
+    s = _P_QUOTED.sub("'<value>'", s)
+    s = _P_DATE.sub("<date>", s)
+    s = _P_NUM.sub("<n>", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:240]
+
+
 class RunStore:
     def __init__(self, user_id: str, run_id: str, path: str):
         self.user_id = str(user_id)   # owner: the folder the run lives in
@@ -101,6 +137,7 @@ class RunStore:
         self.path = path
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        self._conn.create_function("err_pat", 1, lambda v: error_pattern(v), deterministic=True)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(SCHEMA)
@@ -646,12 +683,16 @@ class RunStore:
         return out
 
     # ------------------------------------------------------------------ failed rows: read, edit, requeue
-    def failed_rows(self, job_idx: Optional[int], state: str, search: str, offset: int, limit: int) -> Tuple[int, List[Dict[str, Any]]]:
+    def failed_rows(self, job_idx: Optional[int], state: str, search: str, offset: int, limit: int,
+                    error_key: str = "") -> Tuple[int, List[Dict[str, Any]]]:
         conds = ["r.state='skipped' AND r.skip_reason LIKE 'parent_failed%'"] if state == "blocked" else ["r.state='error'"]
         params: List[Any] = []
         if job_idx is not None:
             conds.append("r.job_idx=?")
             params.append(job_idx)
+        if error_key and state != "blocked":
+            conds.append("err_pat(r.error)=?")
+            params.append(error_key)
         if search:
             like = f"%{search}%"
             conds.append("(r.error LIKE ? OR e.source_json LIKE ?)")
@@ -733,13 +774,14 @@ class RunStore:
         return {"total": total, "waitingTotal": waiting_total, "editedTotal": edited_total, "rows": out}
 
     def failure_groups(self, job_idx: Optional[int]) -> List[Dict[str, Any]]:
-        sql = "SELECT job_idx, substr(error, 1, 240) AS message, COUNT(*) AS n FROM row_state WHERE state='error'"
+        # One group per (job, error PATTERN): rows that failed for the same reason are counted together.
+        sql = "SELECT job_idx, err_pat(error) AS message, COUNT(*) AS n FROM row_state WHERE state='error'"
         params: List[Any] = []
         if job_idx is not None:
             sql += " AND job_idx=?"
             params.append(job_idx)
         sql += " GROUP BY job_idx, message ORDER BY n DESC LIMIT 30"
-        return [{"jobIdx": r["job_idx"], "message": r["message"], "count": r["n"]}
+        return [{"jobIdx": r["job_idx"], "message": r["message"], "key": r["message"], "count": r["n"]}
                 for r in self._conn.execute(sql, params).fetchall()]
 
     def apply_edits(self, edits: Sequence[Dict[str, Any]], editor: str) -> Dict[str, Any]:
@@ -810,8 +852,12 @@ class RunStore:
 
         return {"rowsChanged": changed_rows, "rowsRequeued": requeued, "rowsUnblocked": unblocked, "jobs": sorted(touched_jobs)}
 
-    def mass_update(self, job_idx: int, field: str, value: Any, error_contains: str, editor: str) -> Dict[str, Any]:
+    def mass_update(self, job_idx: int, field: str, value: Any, error_contains: str, editor: str,
+                    error_key: str = "") -> Dict[str, Any]:
         sql, params = "SELECT row_idx FROM row_state WHERE job_idx=? AND state='error'", [job_idx]
+        if error_key:
+            sql += " AND err_pat(error)=?"
+            params.append(error_key)
         if error_contains:
             sql += " AND error LIKE ?"
             params.append(f"%{error_contains}%")

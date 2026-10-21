@@ -3520,6 +3520,8 @@ onReviewPanelDragEnd(): void {
   failurePageSize = 50;
   readonly failurePageSizes = [25, 50, 100, 200];
   failureSearch = '';
+  /** Selected "Why records failed" group (error pattern). Filters server-side so ALL rows of that error match. */
+  failureGroupKey = '';
   failureJobIdx: number | null = null;
   isLoadingFailures = false;
   isSavingEdits = false;
@@ -3535,6 +3537,8 @@ onReviewPanelDragEnd(): void {
   }
 
   recoveryView: 'cards' | 'table' = 'cards';
+  /** Collapses the progress/steps block so the failed-records list gets the space. */
+  recoverySummaryCollapsed = false;
   bulkField = '';
   bulkValue = '';
 
@@ -3546,7 +3550,7 @@ onReviewPanelDragEnd(): void {
   queuedPage = 0;
   queuedFilter: 'all' | 'edited' = 'all';
   isLoadingQueued = false;
-  massPreview: { field: string; value: string; count: number; filter: string } | null = null;
+  massPreview: { field: string; value: string; count: number; filter: string; errorKey: string; search: string } | null = null;
   isApplyingMass = false;
   changeBanner: { title: string; rows: number; unblocked: number; field?: string; value?: string } | null = null;
 
@@ -3618,7 +3622,7 @@ onReviewPanelDragEnd(): void {
         limit: String(this.failurePageSize)
       });
       if (this.failureJobIdx !== null) q.set('jobIdx', String(this.failureJobIdx));
-      const search = this.activeGroup ? '' : this.failureSearch.trim();
+      const search = this.failureSearch.trim();
       if (search) q.set('search', search);
       if (this.queuedFilter === 'edited') q.set('editedOnly', 'true');
       const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/queued?${q}`);
@@ -3642,7 +3646,8 @@ onReviewPanelDragEnd(): void {
 
   requestMassUpdate(field: string, value: string): void {
     if (!field || !this.activeRun || this.failureJobIdx === null || !this.failureTotal) return;
-    this.massPreview = { field, value: value ?? '', count: this.failureTotal, filter: this.failureSearch.trim() };
+    const search = this.failureSearch.trim();
+    this.massPreview = { field, value: value ?? '', count: this.failureTotal, filter: this.failureGroupKey || search, errorKey: this.failureGroupKey, search };
   }
 
   cancelMassUpdate(): void {
@@ -3657,7 +3662,7 @@ onReviewPanelDragEnd(): void {
     try {
       const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/records/mass-update`, {
         method: 'POST',
-        body: JSON.stringify({ jobIdx: this.failureJobIdx, field: p.field, value: p.value, errorContains: p.filter })
+        body: JSON.stringify({ jobIdx: this.failureJobIdx, field: p.field, value: p.value, errorContains: p.search, errorKey: p.errorKey })
       });
       this.massPreview = null;
       this.bulkValue = '';
@@ -3695,8 +3700,8 @@ onReviewPanelDragEnd(): void {
   }
 
   get activeGroup(): any | null {
-    const s = this.failureSearch.trim();
-    return s ? this.failureGroups.find((g) => g.message === s) || null : null;
+    const k = this.failureGroupKey;
+    return k ? this.failureGroups.find((g) => g.key === k) || null : null;
   }
 
   explainError(message: string): { title: string; tone: string; icon: string; fix: string } {
@@ -3747,7 +3752,7 @@ onReviewPanelDragEnd(): void {
 
   selectGroup(g: any): void {
     this.massPreview = null;
-    if (this.failureSearch.trim() === g.message) {
+    if (this.failureGroupKey === g.key) {
       this.clearFailureFilter();
       return;
     }
@@ -3759,6 +3764,7 @@ onReviewPanelDragEnd(): void {
     this.massPreview = null;
     this.queuedPage = 0;
     this.failureSearch = '';
+    this.failureGroupKey = '';
     this.failurePage = 0;
     void this.loadFailures();
   }
@@ -3840,10 +3846,25 @@ onReviewPanelDragEnd(): void {
 
   private pendingRecovery: any = null;
 
-  private async restoreLastRun(): Promise<void> {
+  /**
+   * Reload the list behind the "Other runs need attention too" dropdown. recoverableRuns used to be fetched only
+   * once at page load, so a user who ran several migrations in this session never saw them (their list was stale),
+   * while a colleague opening the page fresh did. Call this whenever a run is created / finished / changed.
+   */
+  async refreshRecoverableRuns(): Promise<void> {
     try {
       const { runs } = await this.runApi('/api/runs/recoverable');
       this.recoverableRuns = runs || [];
+    } catch {
+      // keep the previous list on a transient error
+    } finally {
+      this.cdr.detectChanges();
+    }
+  }
+
+  private async restoreLastRun(): Promise<void> {
+    try {
+      await this.refreshRecoverableRuns();
       const candidate = this.recoverableRuns[0];
       if (!candidate) return;
 
@@ -3878,7 +3899,10 @@ onReviewPanelDragEnd(): void {
 
   async openRunRecovery(runId: string): Promise<void> {
     try {
-      const detail = await this.runApi(`/api/runs/${encodeURIComponent(runId)}`);
+      const [detail] = await Promise.all([
+        this.runApi(`/api/runs/${encodeURIComponent(runId)}`),
+        this.refreshRecoverableRuns()
+      ]);
       this.activeRun = detail;
       this.scheduleLockRefresh();
       this.runJobs = detail.jobColumns || [];
@@ -3890,6 +3914,7 @@ onReviewPanelDragEnd(): void {
       this.failureJobIdx = withErrors?.jobIdx ?? this.runJobs[0]?.jobIdx ?? null;
       this.failurePage = 0;
       this.failureSearch = '';
+      this.failureGroupKey = '';
       this.bulkField = '';
       this.bulkValue = '';
       this.recoveryTab = 'failed';
@@ -3944,10 +3969,18 @@ onReviewPanelDragEnd(): void {
       });
       if (this.failureJobIdx !== null) q.set('jobIdx', String(this.failureJobIdx));
       if (this.failureSearch.trim()) q.set('search', this.failureSearch.trim());
+      if (this.failureGroupKey) q.set('errorKey', this.failureGroupKey);
       const res = await this.runApi(`/api/runs/${encodeURIComponent(this.activeRun.runId)}/failures?${q}`);
       this.failureRows = (res.rows || []).map((r: any) => ({ ...r, _edited: {}, _orig: {}, _dirty: false, _info: this.explainError(r.error) }));
       this.failureTotal = res.total || 0;
       this.failureGroups = (res.groups || []).map((g: any) => ({ ...g, _info: this.explainError(g.message), _field: this.guessGroupField(g) }));
+      // The selected error group has no rows left (all fixed / re-queued): drop the filter instead of showing an empty list.
+      if (this.failureGroupKey && this.failureTotal === 0 && !this.failureGroups.some((g) => g.key === this.failureGroupKey)) {
+        this.failureGroupKey = '';
+        this.isLoadingFailures = false;
+        void this.loadFailures();
+        return;
+      }
       if (this.recoveryTab === 'queued') void this.loadQueued();
     } catch (e: any) {
       this.toastr.error(e?.message || 'Could not load failed records.', 'Recovery');
@@ -3980,6 +4013,7 @@ onReviewPanelDragEnd(): void {
 
   async onFailureJobChange(value: string): Promise<void> {
     this.failureJobIdx = value === '' ? null : Number(value);
+    this.failureGroupKey = '';
     this.massPreview = null;
     this.queuedPage = 0;
     this.failurePage = 0;
@@ -3990,7 +4024,8 @@ onReviewPanelDragEnd(): void {
     this.massPreview = null;
     this.queuedPage = 0;
     this.failureJobIdx = group.jobIdx;
-    this.failureSearch = group.message;
+    this.failureGroupKey = group.key;
+    this.failureSearch = '';
     this.failurePage = 0;
     void this.loadFailures();
   }
@@ -4197,8 +4232,11 @@ onReviewPanelDragEnd(): void {
 
   positionRecoveryPanel(): void {
     this.recoveryExpanded = false;
-    this.recoveryLeft = Math.max(20, (window.innerWidth - this.recoveryDefaultWidth) / 2);
-    this.recoveryTop = Math.max(20, (window.innerHeight - this.recoveryDefaultHeight) / 2);
+    // Match the CSS size (min(1280px, 96vw) x min(90vh, 860px)) so the panel starts centred and never off-screen.
+    const w = Math.min(1280, window.innerWidth * 0.96);
+    const h = Math.min(860, window.innerHeight * 0.9);
+    this.recoveryLeft = Math.max(12, (window.innerWidth - w) / 2);
+    this.recoveryTop = Math.max(12, (window.innerHeight - h) / 2);
   }
 
   startRecoveryPanelDrag(event: MouseEvent): void {
@@ -4843,6 +4881,7 @@ onReviewPanelDragEnd(): void {
             this.canRetryFailed = !!data.retryable;
             this.retryCount = errorCount;
             if (!data.retryable) this.forgetRun();
+            void this.refreshRecoverableRuns();
 
             let swalIcon: 'success' | 'warning' | 'error' = 'success';
             let swalTitle = 'Migration Complete!';

@@ -80,7 +80,7 @@ def get_run(run_id: str, current_user=Depends(get_current_user)) -> Dict[str, An
 
 @router.get("/api/runs/{run_id}/failures")
 def get_failures(
-    run_id: str, jobIdx: Optional[int] = None, state: str = "error", search: str = "",
+    run_id: str, jobIdx: Optional[int] = None, state: str = "error", search: str = "", errorKey: str = "",
     offset: int = 0, limit: int = 25, current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Failed rows (or rows blocked by a failed parent) with their editable source record, plus error groups."""
@@ -89,7 +89,7 @@ def get_failures(
     offset, limit = max(0, offset), min(max(1, limit), 200)
     store = _open_run(current_user.id, run_id)
     try:
-        total, rows = store.failed_rows(jobIdx, state, search.strip(), offset, limit)
+        total, rows = store.failed_rows(jobIdx, state, search.strip(), offset, limit, errorKey)
         return {"success": True, "total": total, "rows": rows, "groups": store.failure_groups(jobIdx)}
     finally:
         store.close()
@@ -124,6 +124,7 @@ class MassUpdatePayload(BaseModel):
     field: str
     value: Any = ""
     errorContains: str = ""
+    errorKey: str = ""   # group key from /failures "groups": limits the change to rows with that error pattern
 
 
 @router.patch("/api/runs/{run_id}/records")
@@ -144,7 +145,7 @@ def mass_update_records(run_id: str, payload: MassUpdatePayload, current_user=De
     store = _open_run(current_user.id, run_id)
     try:
         with _edit_lock(store):
-            result = store.mass_update(payload.jobIdx, payload.field, payload.value, payload.errorContains.strip(), _editor(current_user))
+            result = store.mass_update(payload.jobIdx, payload.field, payload.value, payload.errorContains.strip(), _editor(current_user), payload.errorKey)
         return {"success": True, **result}
     finally:
         store.close()
