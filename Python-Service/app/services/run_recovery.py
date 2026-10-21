@@ -11,20 +11,28 @@ Pure helpers for resuming / retrying runs safely (no web framework imports, unit
 """
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from app.services.org_identity import org_key, org_label
+from app.services.org_identity import org_aliases, org_label
+
+
+def _saved_aliases(meta: Dict[str, Any], side: str) -> set:
+    keys = set(meta.get(f"{side}OrgAliases") or [])
+    if meta.get(f"{side}Org"):
+        keys.add(meta[f"{side}Org"])
+    return keys
 
 
 def org_mismatch(meta: Dict[str, Any], source_crm: str, source_creds: Optional[Dict[str, Any]],
                  target_crm: str, target_creds: Dict[str, Any]) -> Optional[str]:
     """Message if the CURRENT connections are not the orgs the run was started on, else None."""
-    checks = [("target", meta.get("targetOrg"), org_key(target_crm, target_creds))]
-    if meta.get("sourceOrg") and source_creds is not None:
-        checks.append(("source", meta.get("sourceOrg"), org_key(source_crm, source_creds)))
-    for side, saved, current in checks:
-        if saved and current != saved:
+    checks = [("target", _saved_aliases(meta, "target"), org_aliases(target_crm, target_creds), meta.get("targetOrg"))]
+    if _saved_aliases(meta, "source") and source_creds is not None:
+        checks.append(("source", _saved_aliases(meta, "source"), org_aliases(source_crm, source_creds), meta.get("sourceOrg")))
+    for side, saved, current, saved_label in checks:
+        if saved and not (saved & set(current)):
             return (
                 f"You are connected to a different {side} org than this run was started on "
-                f"(run: {org_label(saved)}; now: {org_label(current)}). Log in to the original {side} org and try again."
+                f"(run: {org_label(saved_label or sorted(saved)[0])}; now: {org_label(current[0] if current else None)}). "
+                f"Log in to the original {side} org and try again."
             )
     return None
 

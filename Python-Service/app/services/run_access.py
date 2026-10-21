@@ -12,7 +12,7 @@ import os
 from typing import Any, Dict, List
 
 from app.services.crm_service import CrmService
-from app.services.org_identity import org_key
+from app.services.org_identity import org_aliases
 from app.services.store import BASE_RUNS_DIR, RunForbidden, RunNotFound, RunStore
 
 logger = logging.getLogger(__name__)
@@ -25,18 +25,29 @@ class RunAccess:
         out: Dict[str, Dict[str, Any]] = {}
         for row in CrmService.get_user_connections(user_id) or []:
             role = (row.get("connection_role") or "").lower()
-            out[role] = {"crm": (row.get("crm_type") or "").lower(), "key": org_key(row.get("crm_type"), row)}
+            aliases = org_aliases(row.get("crm_type"), row)
+            out[role] = {
+                "crm": (row.get("crm_type") or "").lower(),
+                "key": aliases[0] if aliases else None,
+                "aliases": aliases,
+            }
         return out
 
     @staticmethod
-    def _matches(meta: Dict[str, Any], orgs: Dict[str, Dict[str, Any]]) -> bool:
-        tgt_key = meta.get("targetOrg")
-        if not tgt_key:
+    def _run_aliases(meta: Dict[str, Any], side: str) -> set:
+        keys = set(meta.get(f"{side}OrgAliases") or [])
+        if meta.get(f"{side}Org"):
+            keys.add(meta[f"{side}Org"])
+        return keys
+
+    @classmethod
+    def _matches(cls, meta: Dict[str, Any], orgs: Dict[str, Dict[str, Any]]) -> bool:
+        """Same org = the run and the user's connection share at least one identity alias."""
+        tgt = cls._run_aliases(meta, "target")
+        if not tgt or not (tgt & set((orgs.get("target") or {}).get("aliases") or [])):
             return False
-        if (orgs.get("target") or {}).get("key") != tgt_key:
-            return False
-        src_key = meta.get("sourceOrg")  # None for CSV sources
-        if src_key and (orgs.get("source") or {}).get("key") != src_key:
+        src = cls._run_aliases(meta, "source")  # empty for CSV sources
+        if src and not (src & set((orgs.get("source") or {}).get("aliases") or [])):
             return False
         return True
 
@@ -78,7 +89,7 @@ class RunAccess:
             try:
                 meta = store.run_meta()
                 mine = store.user_id == str(user_id)
-                if meta.get("targetOrg"):
+                if cls._run_aliases(meta, "target"):
                     if not cls._matches(meta, orgs):
                         logger.info("[RECOVERY] skip %s: started on %s / %s, you are connected to %s / %s",
                                     run_id, meta.get("sourceOrg"), meta.get("targetOrg"),

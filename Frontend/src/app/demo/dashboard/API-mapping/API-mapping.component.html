@@ -2807,15 +2807,15 @@
     </section>
 
     <!-- ============ Notices ============ -->
-    @if (activeRun.stopReason || (activeRun.insertAtRiskRows > 0 && activeRun.status !== 'running') || (!activeRun.isMine && activeRun.status !== 'running') || activeRun.status === 'running' || recoverableRuns.length > 1) {
+    @if (activeRun.stopReason || (activeRun.insertAtRiskRows > 0 && activeRun.status !== 'running') || (!activeRun.isMine && activeRun.status !== 'running') || activeRun.status === 'running' || hasOtherRuns) {
     <div class="rv-notices">
-      @if (recoverableRuns.length > 1) {
+      @if (hasOtherRuns) {
       <div class="rv-notice info">
         <i class="feather icon-layers"></i>
         <div class="flex-grow-1">
           <b>Other runs need attention too.</b>
           <select class="form-select form-select-sm mt-1" (change)="openRunRecovery($any($event.target).value)">
-            @for (r of recoverableRuns; track r.runId) {
+            @for (r of recoverableOptions; track r.runId) {
             <option [value]="r.runId" [selected]="r.runId === activeRun.runId">
               {{ r.runId }} · {{ r.status }} · {{ r.isMine ? 'you' : (r.startedBy?.name || 'another user') }}
             </option>

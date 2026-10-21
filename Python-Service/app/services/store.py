@@ -922,6 +922,14 @@ class RunStore:
             "SELECT DISTINCT row_idx FROM row_state WHERE job_idx=? AND state='pending' ORDER BY row_idx", (job_idx,)).fetchall()
         return [r["row_idx"] for r in rows]
 
+    def settled_row_idxs(self, job_idx: int, pass_no: int) -> set:
+        """Rows of this pass that already finished (success / skipped): never re-checked, never re-sent."""
+        rows = self._conn.execute(
+            "SELECT row_idx FROM row_state WHERE job_idx=? AND pass_no=? AND state IN ('success','skipped')",
+            (job_idx, pass_no),
+        ).fetchall()
+        return {r["row_idx"] for r in rows}
+
     def edited_fields(self, job_idx: int) -> Dict[int, set]:
         out: Dict[int, set] = {}
         for r in self._conn.execute("SELECT row_idx, field FROM row_edit WHERE job_idx=?", (job_idx,)).fetchall():

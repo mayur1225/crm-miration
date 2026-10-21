@@ -3511,6 +3511,7 @@ onReviewPanelDragEnd(): void {
   private recoveryDragOffset = { x: 0, y: 0 };
 
   recoverableRuns: any[] = [];
+  lastRunMode = '';
   activeRun: any = null;
   runJobs: any[] = [];
   failureRows: any[] = [];
@@ -3846,11 +3847,16 @@ onReviewPanelDragEnd(): void {
 
   private pendingRecovery: any = null;
 
-  /**
-   * Reload the list behind the "Other runs need attention too" dropdown. recoverableRuns used to be fetched only
-   * once at page load, so a user who ran several migrations in this session never saw them (their list was stale),
-   * while a colleague opening the page fresh did. Call this whenever a run is created / finished / changed.
-   */
+  get hasOtherRuns(): boolean {
+    return this.recoverableRuns.some((r) => r.runId !== this.activeRun?.runId);
+  }
+
+  /** Dropdown options: the recoverable runs, plus the open run if the server list does not contain it. */
+  get recoverableOptions(): any[] {
+    const list = this.recoverableRuns;
+    return this.activeRun && !list.some((r) => r.runId === this.activeRun.runId) ? [this.activeRun, ...list] : list;
+  }
+
   async refreshRecoverableRuns(): Promise<void> {
     try {
       const { runs } = await this.runApi('/api/runs/recoverable');
@@ -4786,6 +4792,7 @@ onReviewPanelDragEnd(): void {
   private openMigrationSocket(payload: any): void {
     this.canResume = false;
     this.canRetryFailed = false;
+    void this.refreshRecoverableRuns();
     if (!payload.mode) {
       // a brand-new run: Resume / Retry must never target the previous one
       this.currentRunId = null;
@@ -4813,6 +4820,7 @@ onReviewPanelDragEnd(): void {
           this.currentRunId = data.runId;
           this.rememberRun(data.runId);
         }
+        if (data.mode) this.lastRunMode = data.mode;
 
         if (data.status === 'Interrupted' || data.status === 'Cancelled') {
           this.isGlobalLoading = false;
@@ -4896,6 +4904,20 @@ onReviewPanelDragEnd(): void {
               swalTitle = 'Migration Complete (Some Records Skipped)';
             }
 
+            const retrySummary = data.retrySummary;
+            if (retrySummary) {
+              if (retrySummary.recovered > 0 && errorCount === 0) {
+                swalIcon = 'success';
+                swalTitle = 'Retry Complete!';
+              } else if (retrySummary.recovered > 0) {
+                swalIcon = 'warning';
+                swalTitle = 'Retry Finished, Some Still Failing';
+              } else {
+                swalIcon = 'error';
+                swalTitle = 'Retry Finished, Nothing Recovered';
+              }
+            }
+
             Swal.fire({
               title: swalTitle,
               html: `
@@ -4915,6 +4937,7 @@ onReviewPanelDragEnd(): void {
                       <span class="small fw-bold text-danger-emphasis text-uppercase">Rejected</span>
                     </div>
                   </div>
+                  ${retrySummary ? `<p class="small mb-2"><b>This retry:</b> ${retrySummary.recovered} of ${retrySummary.attempted} record(s) recovered, ${retrySummary.stillFailing} still failing. The totals above include records migrated earlier.${retrySummary.recovered === 0 && retrySummary.stillFailing > 0 ? ' The same errors persist: fix the values in the recovery panel, or add the missing picklist values in the target, then retry again.' : ''}</p>` : ''}
                   <p class="text-muted small mb-0">Check the terminal logs or download the reports below to review the details.</p>
                 </div>
               `,

@@ -154,6 +154,7 @@ class ResumableRunner:
                     f"[{spec.target_object}] {spec.pass_name}: {len(dup_skips)} record(s) shared the same "
                     f"'{spec.ext_id_field}' value within this batch -- keeping the last one, skipping the rest."
                 )
+        baseline = self._pass_counts(spec)  # what was already finished before THIS invocation (retry / resume)
         seed_rows += [(i["originalIndex"], source_key(spec.source_records[i["originalIndex"]]), "pending", None) for i in active]
         precheck = list(spec.precheck_errors or [])
         seed_rows += [
@@ -205,10 +206,20 @@ class ResumableRunner:
             await self._send_with_bisect(spec, [by_idx[i] for i in rows])
 
             counts = self._pass_counts(spec)
-            await self.send_log(
-                f"[{spec.target_object}] {spec.pass_name}: {counts['done']:,}/{total:,} processed "
-                f"({counts['success']:,} ok, {counts['error']:,} failed, {counts['skipped']:,} skipped)."
-            )
+            if baseline["done"] > 0:
+                ok = counts["success"] - baseline["success"]
+                failed = counts["error"] - baseline["error"]
+                skipped = counts["skipped"] - baseline["skipped"]
+                await self.send_log(
+                    f"[{spec.target_object}] {spec.pass_name}: {ok + failed + skipped:,}/{max(total - baseline['done'], 0):,} "
+                    f"remaining record(s) processed ({ok:,} ok, {failed:,} failed, {skipped:,} skipped); "
+                    f"{baseline['done']:,} finished earlier are kept."
+                )
+            else:
+                await self.send_log(
+                    f"[{spec.target_object}] {spec.pass_name}: {counts['done']:,}/{total:,} processed "
+                    f"({counts['success']:,} ok, {counts['error']:,} failed, {counts['skipped']:,} skipped)."
+                )
 
     # ------------------------------------------------------------------ reconcile after a crash
     async def _reconcile(self, spec: PassSpec, by_idx: Dict[int, Dict[str, Any]]) -> None:

@@ -30,7 +30,7 @@ from app.services.migrators.salesforce_file_migrator import FileMigrationCheckpo
 from app.services.resilience.retry import RetryingClient, ApiQuotaExhausted, CircuitOpen
 from app.services.store import RunStore, RunNotFound, RunForbidden
 from app.services.run_access import RunAccess
-from app.services.org_identity import org_key
+from app.services.org_identity import org_aliases, org_key
 from app.services import run_recovery
 from app.services.resumable_runner import (
     ResumableRunner, PassSpec, RunInterrupted, DiskSpaceLow, CheckpointWriteFailed,
@@ -431,6 +431,8 @@ async def websocket_migration(ws: WebSocket):
     lock_owner = uuid.uuid4().hex
     final_status = "interrupted"
     lock_held = False
+    retry_baseline_success = 0
+    retry_attempted = 0
 
     try:
         await websocket.send_json({"log": "System: Multi-Object Engine Initialized.", "status": "Initializing..."})
@@ -539,7 +541,9 @@ async def websocket_migration(ws: WebSocket):
         # ---------------- never continue a run against a DIFFERENT org ----------------
         run_meta = store.run_meta()
         if mode in ("resume", "retry_failed", "restart"):
-            mismatch = run_recovery.org_mismatch(run_meta, source_crm, source_creds, target_crm, target_creds)
+            mismatch = await asyncio.to_thread(
+                run_recovery.org_mismatch, run_meta, source_crm, source_creds, target_crm, target_creds
+            )
             if mismatch:
                 if mode == "resume":
                     _note_stop(store, "org_mismatch", mismatch)  # lock is released and status restored in `finally`
@@ -558,16 +562,24 @@ async def websocket_migration(ws: WebSocket):
             _supersede_parent(user_id, store)
 
         # ---------------- org identity, ownership, hand-over ----------------
-        if mode in ("start", "restart") or not run_meta.get("targetOrg"):
+        if mode in ("start", "restart") or not (run_meta.get("targetOrg") or run_meta.get("targetOrgAliases")):
+            _src_aliases = await asyncio.to_thread(org_aliases, source_crm, source_creds) if source_creds else []
+            _tgt_aliases = await asyncio.to_thread(org_aliases, target_crm, target_creds)
             store.set_run_meta(
                 startedBy={"id": str(user_id), "name": user_name or user_email, "email": user_email},
                 sourceCrm=source_crm, targetCrm=target_crm,
-                sourceOrg=org_key(source_crm, source_creds) if source_creds else None,
-                targetOrg=org_key(target_crm, target_creds),
+                sourceOrg=_src_aliases[0] if _src_aliases else None,
+                targetOrg=_tgt_aliases[0] if _tgt_aliases else None,
+                sourceOrgAliases=_src_aliases,
+                targetOrgAliases=_tgt_aliases,
                 jobTargets=[q.get("targetObject") for q in execution_queue],
                 keyedJobs=[i for i, q in enumerate(execution_queue) if q.get("correlationField")],
             )
         store.add_participant(user_id, user_name or user_email, mode)
+        if mode == "retry_failed":
+            _c = store.counts()
+            retry_baseline_success = _c.get("success", 0)
+            retry_attempted = _c.get("pending", 0)
 
         if store.user_id != str(user_id) and mode in ("resume", "retry_failed"):
             for j, q in enumerate(execution_queue):
@@ -625,10 +637,35 @@ async def websocket_migration(ws: WebSocket):
                     await websocket.close()
                     return
 
+                # ---------------- picklist sync (only for fields whose Sync toggle is ON; also on retry / resume) ----------------
+                if source_crm == "salesforce" and target_crm == "salesforce" and not job.get("isPass3Patch", False):
+                    picklist_sync_mappings = [m for m in mappings if m.get("syncPicklistValues")]
+                    if picklist_sync_mappings:
+                        sync_result = await PicklistSyncService.sync(
+                            client, source_creds, target_creds, user_id,
+                            source_object, target_object, picklist_sync_mappings, send_log,
+                        )
+                        if sync_result["failed"]:
+                            final_status = "failed"
+                            await websocket.send_json({
+                                "log": f"[{target_object}] FATAL: picklist sync failed for "
+                                       f"{', '.join(sync_result['failed'])}. Aborting before data load.",
+                                "status": "Failed",
+                            })
+                            await websocket.close()
+                            return
+
                 # ---------------- extract once, then freeze ----------------
                 if store.is_extracted(job_index):
                     source_records = store.load_extracted(job_index)
-                    await send_log(f"[{target_object}] Using {len(source_records)} frozen source record(s) from the checkpoint.")
+                    if mode == "retry_failed":
+                        _pending = len(store.pending_row_idxs(job_index))
+                        await send_log(
+                            f"[{target_object}] Retry: re-sending {_pending} failed/corrected record(s); "
+                            f"{max(len(source_records) - _pending, 0)} already migrated record(s) are kept."
+                        )
+                    else:
+                        await send_log(f"[{target_object}] Using {len(source_records)} frozen source record(s) from the checkpoint.")
                     if store.take_refresh_flag(job_index):
                         # Retry / edit: parents may have been created since this job was frozen. Re-link references.
                         async def _remap(rows, _m=mappings):
@@ -644,23 +681,6 @@ async def websocket_migration(ws: WebSocket):
                             logger.exception("Reference refresh failed for run %s job %s", store.run_id, job_index)
                             await send_log(f"[{target_object}] WARNING: could not refresh reference links ({exc}); sending the saved values.")
                 else:
-                    if source_crm == "salesforce" and target_crm == "salesforce":
-                        picklist_sync_mappings = [m for m in mappings if m.get("syncPicklistValues")]
-                        if picklist_sync_mappings:
-                            sync_result = await PicklistSyncService.sync(
-                                client, source_creds, target_creds, user_id,
-                                source_object, target_object, picklist_sync_mappings, send_log,
-                            )
-                            if sync_result["failed"]:
-                                final_status = "failed"
-                                await websocket.send_json({
-                                    "log": f"[{target_object}] FATAL: picklist sync failed for "
-                                           f"{', '.join(sync_result['failed'])}. Aborting before data load.",
-                                    "status": "Failed",
-                                })
-                                await websocket.close()
-                                return
-
                     source_records, actual_query_used = [], None
                     session_id = job.get("sessionId")
                     if source_crm == "csv":
@@ -760,7 +780,11 @@ async def websocket_migration(ws: WebSocket):
                         errors=coerce_errors,
                     )
                     if guarded_picklists:
-                        payload_data, rejected = PicklistSyncService.reject_unknown_values(payload_data, guarded_picklists)
+                        _settled = store.settled_row_idxs(job_index, pass_no)
+                        _locked = [i for i in payload_data if i["originalIndex"] in _settled]
+                        _open = [i for i in payload_data if i["originalIndex"] not in _settled]
+                        _open, rejected = PicklistSyncService.reject_unknown_values(_open, guarded_picklists)
+                        payload_data = sorted(_locked + _open, key=lambda i: i["originalIndex"])
                         if rejected:
                             coerce_errors.extend({"originalIndex": r["originalIndex"], "message": r["message"]} for r in rejected)
                             counts: dict = {}
@@ -902,6 +926,18 @@ async def websocket_migration(ws: WebSocket):
                 logger.exception("Failed to generate/persist migration reports for run %s", store.run_id)
                 report_urls = {}
 
+            retry_summary = None
+            if mode == "retry_failed":
+                retry_summary = {
+                    "attempted": retry_attempted,
+                    "recovered": max(0, len(safe_success_data) - retry_baseline_success),
+                    "stillFailing": len(formatted_errors),
+                }
+                await websocket.send_json({
+                    "log": f"Retry result: {retry_summary['recovered']} of {retry_summary['attempted']} record(s) recovered, "
+                           f"{retry_summary['stillFailing']} still failing.",
+                    "status": "Finalizing",
+                })
             final_status = "completed"
             store.clear_stop_reason()
             store.set_status("completed")
@@ -915,6 +951,7 @@ async def websocket_migration(ws: WebSocket):
                 "reportUrls": report_urls,
                 "runId": store.run_id,
                 "retryable": len(formatted_errors) > 0,
+                "retrySummary": retry_summary,
             })
         await websocket.close()
 
