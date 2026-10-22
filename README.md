@@ -51,3 +51,36 @@ docker run -p 3000:3000 test-backend
 1. To build and start everything at once:-  docker-compose up --build
 2. To run them in the background:- docker-compose up -d --build
 3. To stop and remove all of them at once:- docker-compose down
+
+# URL Configurations
+ANGULAR_FRONTEND_URL=http://localhost:4200
+FASTAPI_BACKEND_URL=http://localhost:8000
+
+LOCAL_AI_URL="http://127.0.0.1:11434/api"
+LOCAL_AI_MODEL="mxbai-embed-large"
+
+ENVIRONMENT=development
+DISABLE_SSL_VERIFY=true
+SUPABASE_SSL_VERIFY=false
+
+SUPABASE_URL=https://tikxlmehnlxpjmcgvplv.supabase.co
+SUPABASE_KEY=
+
+# Salesforce OAuth Credentials
+SF_CLIENT_ID=
+SF_CLIENT_SECRET=
+
+# Zendesk OAuth Credentials
+ZD_CLIENT_ID=zdg-sureshift_migrator
+ZD_CLIENT_SECRET=
+
+ZOHO_CLIENT_ID=
+ZOHO_CLIENT_SECRET=
+
+MS_CLIENT_ID="your-microsoft-app-client-id"
+MS_CLIENT_SECRET="your-microsoft-app-client-secret"
+
+#HubSpot OAuth Credentials
+HS_CLIENT_ID=
+HS_CLIENT_SECRET=
+HS_REDIRECT_URI=http://localhost:8000/api/crm/auth/hubspot/callback
